@@ -785,6 +785,35 @@ test('progress ledger requires a lifecycle event for every archived plan revisio
   assert.equal((await repository.verifyGoalRepository(fixture.root, fixture)).state, 'TAMPERED');
 });
 
+test('progress ledger chronology rejects older revision task events after the next lifecycle event', async (testContext) => {
+  const { fixture, repository } = await createPlannedFixture(testContext);
+  await installTestEvidence(fixture);
+  await repository.recordGoalEvent(fixture.root, progressInput('Started implementation', { event_type: 'task-start' }), fixture);
+  await repository.recordGoalEvent(fixture.root, progressInput('Completed implementation', {
+    event_type: 'task-complete',
+    evidence_refs: ['EVID-0001'],
+  }), fixture);
+  const revisionOne = parseCanonicalJson(await readFile(join(fixture.root, '.goal-lock', 'plan.json')), 'test plan');
+  await repository.revisePlan(fixture.root, {
+    next_task_id: revisionOne.next_task_id,
+    tasks: revisionOne.tasks,
+    deferred: revisionOne.deferred,
+  }, 'aligned', fixture);
+  await rewriteTestProgressLedger(fixture, [
+    { plan_revision: 1 },
+    { plan_revision: 2 },
+    { plan_revision: 1, event_type: 'task-start', task_id: 'TASK-0001' },
+    {
+      plan_revision: 1,
+      event_type: 'task-complete',
+      task_id: 'TASK-0001',
+      evidence_refs: ['EVID-0001'],
+    },
+  ]);
+
+  assert.equal((await repository.verifyGoalRepository(fixture.root, fixture)).state, 'TAMPERED');
+});
+
 test('task status replay rejects task-complete while the task is pending', async (testContext) => {
   const { fixture, repository } = await createPlannedFixture(testContext);
   await installTestEvidence(fixture);

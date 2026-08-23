@@ -385,6 +385,27 @@ async function verifyChangeState(reader, rootNames, lock) {
   return { count: records.size, pending, records };
 }
 
+/** 限制账本绑定只向前推进；跨目标版本仅预留相邻版本入口，具体生命周期由后续任务定义。 */
+function verifyProgressChronology(previousEvent, event) {
+  if (previousEvent === null) return;
+  const previousGoalVersion = previousEvent.goal.goal_version;
+  const goalVersion = event.goal.goal_version;
+  if (goalVersion < previousGoalVersion || goalVersion > previousGoalVersion + 1) {
+    throw integrityError(
+      'PROGRESS_CHRONOLOGY_INVALID',
+      'Progress event goal versions must advance monotonically without skips.',
+    );
+  }
+  if (goalVersion !== previousGoalVersion) return;
+  if (event.plan_revision < previousEvent.plan_revision
+    || (event.plan_revision > previousEvent.plan_revision && event.event_type !== 'plan-revision')) {
+    throw integrityError(
+      'PROGRESS_CHRONOLOGY_INVALID',
+      'Progress events cannot return to an earlier plan revision, and revision advances require a lifecycle event.',
+    );
+  }
+}
+
 async function verifyProgressLedger(reader, rootNames, lock, goalHistory, planState, evidenceState) {
   if (!rootNames.includes('progress.jsonl')) {
     if (lock.progress_head !== null) throw integrityError('PROGRESS_STATE_MISSING', 'Lock progress head requires a progress ledger.');
@@ -441,6 +462,7 @@ async function verifyProgressLedger(reader, rootNames, lock, goalHistory, planSt
     if (event.evidence_refs.some((evidenceId) => !evidenceState.recordsById.has(evidenceId))) {
       throw integrityError('PROGRESS_EVIDENCE_UNKNOWN', 'Progress event references unknown evidence.');
     }
+    verifyProgressChronology(terminal, event);
     terminal = event;
     events.push(event);
     eventsByPlan.get(planKey).push(event);
