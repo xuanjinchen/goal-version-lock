@@ -124,11 +124,14 @@ function completePlan(revision = 1) {
 }
 
 function validateCompletePlan(plan) {
-  return goalContracts.validatePlanContract(plan, {
-    goal: goalV1(),
-    goal_digest: activeGoalReference().goal_digest,
-  });
+  return goalContracts.validatePlan(plan, activeGoalReference());
 }
+
+test('plan public API exports validatePlan with the fixed goal-reference signature', () => {
+  assert.equal(typeof goalContracts.validatePlan, 'function');
+  assert.equal(Object.hasOwn(goalContracts, 'validatePlanContract'), false);
+  assert.deepEqual(goalContracts.validatePlan(completePlan(), activeGoalReference()), completePlan());
+});
 
 test('plan contract accepts a complete goal-bound plan without mutating input', () => {
   const input = completePlan();
@@ -164,7 +167,6 @@ test('plan contract enforces unique stable task references and criterion coverag
     ['duplicate deferred task', (plan) => { plan.deferred.push({ id: 'TASK-0003', reason: 'Duplicate' }); }],
     ['scheduled and deferred task', (plan) => { plan.deferred[0].id = 'TASK-0002'; }],
     ['acceptance criteria required', (plan) => { plan.tasks[0].acceptance_criteria = []; }],
-    ['acceptance criterion exists', (plan) => { plan.tasks[0].acceptance_criteria = ['AC-002']; }],
     ['dependency exists', (plan) => { plan.tasks[1].dependencies = ['TASK-9999']; }],
     ['dependency cycle', (plan) => { plan.tasks[0].dependencies = ['TASK-0002']; }],
     ['deferred reason', (plan) => { plan.deferred[0].reason = ' '; }],
@@ -197,6 +199,19 @@ test('plan contract enforces normalized paths, verification text, statuses, and 
   noExecutableTask.tasks[0].status = 'complete';
   noExecutableTask.next_task_id = null;
   assert.deepEqual(validateCompletePlan(noExecutableTask), noExecutableTask);
+});
+
+test('plan executable dependencies must all be complete before selecting the next task', () => {
+  const waiting = completePlan();
+  waiting.next_task_id = 'TASK-0002';
+  waiting.tasks[1].status = 'pending';
+  assert.throws(() => validateCompletePlan(waiting), /next_task_id|depend|executable/i);
+
+  const ready = completePlan();
+  ready.next_task_id = 'TASK-0002';
+  ready.tasks[0].status = 'complete';
+  ready.tasks[1].status = 'pending';
+  assert.deepEqual(validateCompletePlan(ready), ready);
 });
 
 function planCandidate(outcome = 'Implement the locked state transition') {
@@ -359,6 +374,59 @@ test('plan revision rejects draft, tampered, and change-pending repositories', a
     revisePlan(pending.root, planCandidate(), 'aligned', pending),
     (error) => error instanceof GoalLockError && error.kind === 'state',
   );
+});
+
+test('plan revision rejects unsupported change status as tampered state', async (testContext) => {
+  const fixture = createGoalLockFixture(testContext);
+  const { initializeGoal, lockInitialGoal, revisePlan, verifyGoalRepository } = await goalRepository();
+  await initializeGoal(fixture.root, goalV1(), fixture);
+  await lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 92d74f6bf766', fixture);
+  await mkdir(join(fixture.root, '.goal-lock', 'changes'));
+  await writeFile(join(fixture.root, '.goal-lock', 'changes', 'CR-0001.json'), canonicalBytes({
+    ...structuralChange(),
+    status: 'open',
+  }));
+
+  assert.equal((await verifyGoalRepository(fixture.root, fixture)).state, 'TAMPERED');
+  await assert.rejects(
+    revisePlan(fixture.root, planCandidate(), 'aligned', fixture),
+    (error) => error instanceof GoalLockError && error.kind === 'integrity',
+  );
+});
+
+test('plan revision refuses a baseline replaced after semantic verification', async (testContext) => {
+  const fixture = createGoalLockFixture(testContext);
+  const { initializeGoal, lockInitialGoal, revisePlan } = await goalRepository();
+  await initializeGoal(fixture.root, goalV1(), fixture);
+  await lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 92d74f6bf766', fixture);
+  const directory = join(fixture.root, '.goal-lock');
+  const lockBefore = await readFile(join(directory, 'lock.json'));
+  let armed = false;
+  let rootReads = 0;
+  fixture.workspaceFaults = {};
+  fixture.workspaceFaults.beforeVerifyInputs = () => {
+    if (armed) return;
+    armed = true;
+    fixture.workspaceFaults.afterDirectoryRead = async ({ relativePath }) => {
+      if (relativePath !== '.goal-lock') return;
+      rootReads += 1;
+      if (rootReads === 2) {
+        await writeFile(join(directory, 'current.json'), canonicalBytes({
+          ...goalV1(),
+          objective: 'Directly replaced after verification',
+        }));
+      }
+    };
+  };
+
+  await assert.rejects(
+    revisePlan(fixture.root, planCandidate(), 'aligned', fixture),
+    (error) => error instanceof GoalLockError && error.kind === 'integrity',
+  );
+
+  assert.equal(rootReads, 2);
+  assert.equal(existsSync(join(directory, 'plan.json')), false);
+  assert.deepEqual(await readFile(join(directory, 'lock.json')), lockBefore);
 });
 
 function structuralProgressEvent(eventId = 'EVT-000001', eventDigest = '1'.repeat(64)) {

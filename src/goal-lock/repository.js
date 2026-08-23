@@ -2,11 +2,12 @@ import { lstat, readdir, readFile, realpath, rmdir } from 'node:fs/promises';
 import path from 'node:path';
 
 import { canonicalBytes, parseCanonicalJson, sha256 } from './canonical.js';
-import { GoalLockError, normalizeRelativePath, validateGoalContract, validateLockRecord, validatePlanContract } from './contracts.js';
+import { GoalLockError, normalizeRelativePath, validateGoalContract, validateLockRecord, validatePlan } from './contracts.js';
 import { commitGoalFiles, withGoalLock } from './transaction.js';
 import { createWorkspaceReader } from './workspace.js';
 
 const ACTIVE_WRITE = Symbol('active goal writer');
+const RETURN_VERIFIED_SNAPSHOT = Symbol('return verified repository snapshot');
 
 function stateError(code, message) {
   return new GoalLockError(code, 'state', 3, message);
@@ -237,7 +238,9 @@ function validateChangeEnvelope(value, expectedId) {
   if (value.schema_version !== 1) throw integrityError('CHANGE_STATE_INVALID', 'Change request schema_version must equal 1.');
   structuralIdentifier(value.id, STRUCTURAL_IDENTIFIERS.change, `${label}.id`);
   if (value.id !== expectedId) throw integrityError('CHANGE_STATE_INVALID', 'Change request ID does not match its filename.');
-  structuralText(value.status, `${label}.status`);
+  if (!['proposed', 'approved', 'rejected', 'superseded'].includes(value.status)) {
+    throw integrityError('CHANGE_STATE_INVALID', 'Change request status is unsupported.');
+  }
   validateGoalReference(value.base_goal, `${label}.base_goal`);
   requiredFields(value.candidate_goal, `${label}.candidate_goal`, ['schema_version', 'goal_id', 'goal_version', 'objective', 'scope', 'non_goals', 'constraints', 'acceptance_criteria', 'authorization_boundary', 'assumptions', 'predecessor', 'accepted_change_id']);
   structuralDigest(value.candidate_digest, `${label}.candidate_digest`);
@@ -285,9 +288,24 @@ async function readCanonicalObject(reader, relativePath, label) {
   }
 }
 
+function validatePlanCriteria(plan, goal) {
+  const criterionIds = new Set(goal.acceptance_criteria.map((criterion) => criterion.id));
+  for (const task of plan.tasks) {
+    if (task.acceptance_criteria.some((criterionId) => !criterionIds.has(criterionId))) {
+      throw inputError('INVALID_PLAN_REFERENCE', 'Plan acceptance criteria must belong to the bound goal.');
+    }
+  }
+  return plan;
+}
+
 function validateRepositoryPlan(value, goalRecord, label) {
   try {
-    return validatePlanContract(value, { goal: goalRecord.goal, goal_digest: goalRecord.digest });
+    const plan = validatePlan(value, {
+      goal_id: goalRecord.goal.goal_id,
+      goal_version: goalRecord.goal.goal_version,
+      goal_digest: goalRecord.digest,
+    });
+    return validatePlanCriteria(plan, goalRecord.goal);
   } catch (error) {
     throw repositoryIntegrity('PLAN_STATE_INVALID', `${label} violates the plan contract.`, error);
   }
@@ -296,16 +314,19 @@ function validateRepositoryPlan(value, goalRecord, label) {
 async function verifyPlanState(reader, rootNames, current, goalHistory) {
   const present = rootNames.includes('plan.json');
   let currentPlan = null;
+  let currentRecord = null;
+  const archives = [];
   if (present) {
     const plan = await readCanonicalObject(reader, '.goal-lock/plan.json', 'goal plan');
     currentPlan = validateRepositoryPlan(plan.value, current, 'Current plan');
+    currentRecord = { ...plan, value: currentPlan };
   }
   const historyRoot = await reader.readDirectory('.goal-lock/history');
   if (!historyRoot.names.includes('plans')) {
     if (currentPlan && currentPlan.plan_revision !== 1) {
       throw integrityError('PLAN_STATE_INVALID', 'A current plan without archives must be revision 1.');
     }
-    return { present };
+    return { present, current: currentRecord, archives };
   }
   const planHistory = await reader.readDirectory('.goal-lock/history/plans');
   const revisionsByVersion = new Map();
@@ -326,6 +347,7 @@ async function verifyPlanState(reader, rootNames, current, goalHistory) {
     const revisions = revisionsByVersion.get(goalVersion) ?? [];
     revisions.push(planRevision);
     revisionsByVersion.set(goalVersion, revisions);
+    archives.push({ ...record, value: validated, target: `.goal-lock/history/plans/${name}` });
   }
   for (const revisions of revisionsByVersion.values()) {
     revisions.sort((left, right) => left - right);
@@ -340,7 +362,7 @@ async function verifyPlanState(reader, rootNames, current, goalHistory) {
   if (currentPlan && currentPlan.plan_revision !== activeRevisions.length + 1) {
     throw integrityError('PLAN_STATE_INVALID', 'Current plan revision must immediately follow its archived revisions.');
   }
-  return { present };
+  return { present, current: currentRecord, archives };
 }
 
 async function verifyChangeState(reader, rootNames, lock) {
@@ -484,7 +506,7 @@ async function verifyGoalHistory(reader, current, lock) {
     if (version > 1 && (goal.predecessor.goal_version !== version - 1 || goal.predecessor.goal_digest !== predecessor.digest)) {
       throw integrityError('GOAL_HISTORY_CHAIN_BROKEN', 'Goal history predecessor chain is broken.');
     }
-    predecessor = { digest: input.digest, goal };
+    predecessor = { bytes: input.bytes, digest: input.digest, goal };
     goals.set(version, predecessor);
     activeHistory = input;
   }
@@ -557,7 +579,10 @@ export async function verifyGoalRepository(root, context = {}) {
         throw integrityError('GOAL_LOCK_MISSING', 'Only a pristine version-one draft may omit the goal lock.');
       }
       await reader.verifyInputs();
-      return { state: 'DRAFT', evidence: verificationEvidence(reader, current, { plan: false, changes: 0, progress_events: 0, evidence_records: 0 }) };
+      const result = { state: 'DRAFT', evidence: verificationEvidence(reader, current, { plan: false, changes: 0, progress_events: 0, evidence_records: 0 }) };
+      return context[RETURN_VERIFIED_SNAPSHOT] === true
+        ? { result, reader, current, rootNames, lockInput: null, planState: null, history: null }
+        : result;
     }
 
     const lockInput = await readLock(reader);
@@ -574,10 +599,13 @@ export async function verifyGoalRepository(root, context = {}) {
       progress_events: progressState.count,
       evidence_records: evidenceState.count,
     };
-    return {
+    const result = {
       state: changeState.pending ? 'CHANGE_PENDING' : 'LOCKED',
       evidence: verificationEvidence(reader, current, optional),
     };
+    return context[RETURN_VERIFIED_SNAPSHOT] === true
+      ? { result, reader, current, rootNames, lockInput, planState, history }
+      : result;
   } catch (error) {
     const failure = repositoryIntegrity('GOAL_REPOSITORY_TAMPERED', 'Goal repository integrity verification failed.', error);
     if (context.mutating) throw failure;
@@ -694,51 +722,49 @@ export async function revisePlan(root, candidate, classification, context = {}) 
   validatePlanCandidate(candidate);
 
   return withGoalLock(root, 'plan', async () => {
-    const verification = await verifyGoalRepository(root, { ...context, mutating: true, [ACTIVE_WRITE]: true });
+    const snapshot = await verifyGoalRepository(root, {
+      ...context,
+      mutating: true,
+      [ACTIVE_WRITE]: true,
+      [RETURN_VERIFIED_SNAPSHOT]: true,
+    });
+    const verification = snapshot.result;
     if (verification.state !== 'LOCKED') {
       throw stateError('PLAN_STATE_REJECTED', `Planning requires LOCKED state, not ${verification.state}.`);
     }
 
-    const reader = await createWorkspaceReader(root, context);
-    const rootState = await reader.readDirectory('.goal-lock');
-    const current = await readCurrentGoal(reader);
-    const lockInput = await readLock(reader);
-    const priorPlan = rootState.names.includes('plan.json')
-      ? await readCanonicalObject(reader, '.goal-lock/plan.json', 'goal plan')
-      : null;
+    // 事务预条件必须复用同一验证快照，不能用第二次读取覆盖已信任的基线。
+    const { reader, current, lockInput, planState, history } = snapshot;
+    const priorPlan = planState.current;
     const planRevision = priorPlan ? priorPlan.value.plan_revision + 1 : 1;
-    const plan = validatePlanContract({
+    const goalReference = {
+      goal_id: current.goal.goal_id,
+      goal_version: current.goal.goal_version,
+      goal_digest: current.digest,
+    };
+    const plan = validatePlanCriteria(validatePlan({
       schema_version: 1,
-      goal: {
-        goal_id: current.goal.goal_id,
-        goal_version: current.goal.goal_version,
-        goal_digest: current.digest,
-      },
+      goal: goalReference,
       plan_revision: planRevision,
       next_task_id: candidate.next_task_id,
       tasks: candidate.tasks,
       deferred: candidate.deferred,
-    }, { goal: current.goal, goal_digest: current.digest });
+    }, goalReference), current.goal);
     const planBytes = canonicalBytes(plan);
 
     const historyGoalTarget = `.goal-lock/history/goals/v${String(current.goal.goal_version).padStart(4, '0')}.json`;
-    const historyGoal = await reader.readFile(historyGoalTarget);
+    const historyGoal = history.activeHistory;
     // 当前目标及其历史只作为事务所有权前提，相同字节不会被替换。
     const entries = [
       { target: '.goal-lock/current.json', expected: { kind: 'sha256', digest: current.digest }, content: current.bytes },
       { target: historyGoalTarget, expected: { kind: 'sha256', digest: historyGoal.digest }, content: historyGoal.bytes },
     ];
-    const historyRoot = await reader.readDirectory('.goal-lock/history');
-    if (historyRoot.names.includes('plans')) {
-      const planHistory = await reader.readDirectory('.goal-lock/history/plans');
-      for (const name of planHistory.names) {
-        const archive = await reader.readFile(`.goal-lock/history/plans/${name}`);
-        entries.push({
-          target: `.goal-lock/history/plans/${name}`,
-          expected: { kind: 'sha256', digest: archive.digest },
-          content: archive.bytes,
-        });
-      }
+    for (const archive of planState.archives) {
+      entries.push({
+        target: archive.target,
+        expected: { kind: 'sha256', digest: archive.digest },
+        content: archive.bytes,
+      });
     }
     if (priorPlan) {
       const archiveTarget = `.goal-lock/history/plans/v${String(current.goal.goal_version).padStart(4, '0')}-r${String(priorPlan.value.plan_revision).padStart(4, '0')}.json`;

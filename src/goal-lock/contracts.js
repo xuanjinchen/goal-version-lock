@@ -195,24 +195,27 @@ export function validateGoalContract(value, options = {}) {
   });
 }
 
-export function validatePlanContract(value, options = {}) {
+export function validatePlan(value, goalReference) {
   const fields = ['schema_version', 'goal', 'plan_revision', 'next_task_id', 'tasks', 'deferred'];
   exactKeys(value, 'plan', fields);
   if (value.schema_version !== 1) fail('INVALID_CONTRACT', 'input', 2, 'schema_version must equal 1');
 
-  const activeGoal = validateGoalContract(options.goal);
-  const activeDigest = digest(options.goal_digest, 'goal_digest');
+  exactKeys(goalReference, 'goal reference', ['goal_id', 'goal_version', 'goal_digest']);
+  const expectedGoal = {
+    goal_id: identifier(goalReference.goal_id, 'goal_id', 'goal reference.goal_id'),
+    goal_version: positiveInteger(goalReference.goal_version, 'goal reference.goal_version'),
+    goal_digest: digest(goalReference.goal_digest, 'goal reference.goal_digest'),
+  };
   exactKeys(value.goal, 'goal', ['goal_id', 'goal_version', 'goal_digest']);
   const goal = {
     goal_id: identifier(value.goal.goal_id, 'goal_id', 'goal.goal_id'),
     goal_version: positiveInteger(value.goal.goal_version, 'goal.goal_version'),
     goal_digest: digest(value.goal.goal_digest, 'goal.goal_digest'),
   };
-  if (goal.goal_id !== activeGoal.goal_id) fail('INVALID_CONTRACT', 'input', 2, 'goal.goal_id does not match the current goal');
-  if (goal.goal_version !== activeGoal.goal_version) fail('INVALID_CONTRACT', 'input', 2, 'goal.goal_version does not match the current goal');
-  if (goal.goal_digest !== activeDigest) fail('INVALID_CONTRACT', 'input', 2, 'goal.goal_digest does not match the current goal');
+  if (goal.goal_id !== expectedGoal.goal_id) fail('INVALID_CONTRACT', 'input', 2, 'goal.goal_id does not match the current goal');
+  if (goal.goal_version !== expectedGoal.goal_version) fail('INVALID_CONTRACT', 'input', 2, 'goal.goal_version does not match the current goal');
+  if (goal.goal_digest !== expectedGoal.goal_digest) fail('INVALID_CONTRACT', 'input', 2, 'goal.goal_digest does not match the current goal');
 
-  const criterionIds = new Set(activeGoal.acceptance_criteria.map((criterion) => criterion.id));
   const taskIds = new Set();
   const tasks = array(value.tasks, 'tasks').map((task, index) => {
     const label = `tasks[${index}]`;
@@ -224,9 +227,6 @@ export function validatePlanContract(value, options = {}) {
       .map((criterionId) => identifier(criterionId, 'acceptance_criterion_id', `${label}.acceptance_criteria`));
     const uniqueCriteria = new Set(acceptanceCriteria);
     if (uniqueCriteria.size !== acceptanceCriteria.length) fail('INVALID_CONTRACT', 'input', 2, `${label}.acceptance_criteria contains duplicates`);
-    for (const criterionId of acceptanceCriteria) {
-      if (!criterionIds.has(criterionId)) fail('INVALID_CONTRACT', 'input', 2, `${label}.acceptance_criteria references a criterion outside the goal`);
-    }
     const dependencies = array(task.dependencies, `${label}.dependencies`)
       .map((dependencyId) => identifier(dependencyId, 'task_id', `${label}.dependencies`));
     if (new Set(dependencies).size !== dependencies.length) fail('INVALID_CONTRACT', 'input', 2, `${label}.dependencies contains duplicates`);
@@ -277,7 +277,12 @@ export function validatePlanContract(value, options = {}) {
     return { id, reason: requiredText(item.reason, `${label}.reason`) };
   });
 
-  const executableIds = new Set(tasks.filter((task) => ['pending', 'in_progress'].includes(task.status)).map((task) => task.id));
+  const tasksById = new Map(tasks.map((task) => [task.id, task]));
+  // 状态可执行还要求全部前置任务已完成，不能把等待依赖的任务选为下一步。
+  const executableIds = new Set(tasks
+    .filter((task) => ['pending', 'in_progress'].includes(task.status)
+      && task.dependencies.every((dependencyId) => tasksById.get(dependencyId).status === 'complete'))
+    .map((task) => task.id));
   let nextTaskId = null;
   if (value.next_task_id !== null) {
     nextTaskId = identifier(value.next_task_id, 'task_id', 'next_task_id');
