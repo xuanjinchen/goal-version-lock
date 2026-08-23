@@ -258,8 +258,9 @@ export async function createWorkspaceReader(root, context = {}) {
   };
 }
 
-function gitError(cause) {
-  return integrityError('GOAL_IO_GIT', 'Git workspace state could not be captured safely.', cause);
+function gitError() {
+  // Git 的 stderr、路径和底层异常都不进入公开错误对象，调用方只能依据稳定错误码处理。
+  return integrityError('GOAL_IO_GIT', 'Git workspace state could not be captured safely.');
 }
 
 function compareNames(left, right) {
@@ -302,34 +303,41 @@ function gitBytes(result) {
   return bytes;
 }
 
-async function invokeGit(runGit, args, { unavailableRoot = null, allowFailure = false } = {}) {
+async function invokeGit(runGit, args, { unavailableRoot = null } = {}) {
   try {
     return gitBytes(await runGit([...args]));
   } catch (error) {
-    if (allowFailure && typeof error?.code === 'number') return null;
     if (unavailableRoot !== null) {
       if (error?.code === 'ENOENT') return null;
       if (typeof error?.code === 'number' && error.code !== 0) {
         let marker;
         try {
           marker = await optionalLstat(path.join(unavailableRoot, '.git'));
-        } catch (inspectionError) {
-          throw gitError(inspectionError);
+        } catch {
+          throw gitError();
         }
         if (marker === null) return null;
       }
     }
-    throw gitError(error);
+    throw gitError();
+  }
+}
+
+async function observeGit(runGit, args) {
+  try {
+    return { bytes: gitBytes(await runGit([...args])), error: null };
+  } catch (error) {
+    return { bytes: null, error };
   }
 }
 
 function decodeGitPaths(bytes) {
   if (bytes.length === 0) return [];
-  if (bytes.at(-1) !== 0) throw gitError(new TypeError('Git path output was not NUL terminated.'));
+  if (bytes.at(-1) !== 0) throw gitError();
   try {
     return UTF8_DECODER.decode(bytes.subarray(0, -1)).split('\0');
-  } catch (error) {
-    throw gitError(error);
+  } catch {
+    throw gitError();
   }
 }
 
@@ -364,10 +372,23 @@ async function fingerprintFiles(reader, names) {
   return entries;
 }
 
+async function resolveGitHead(runGit) {
+  const observed = await observeGit(runGit, ['rev-parse', '--verify', 'HEAD']);
+  if (observed.bytes !== null) return observed.bytes;
+  if (typeof observed.error?.code !== 'number') throw gitError();
+
+  const symbolicHead = (await invokeGit(runGit, ['symbolic-ref', '--quiet', 'HEAD'])).toString('utf8').trim();
+  if (!/^refs\/heads\/[^\0\r\n]+$/.test(symbolicHead)) throw gitError();
+  const ref = await observeGit(runGit, ['show-ref', '--verify', '--quiet', symbolicHead]);
+  // 只有符号 HEAD 指向确实不存在的分支（show-ref=1）才是 unborn；损坏 ref 与其他 Git 故障全部关闭。
+  if (ref.bytes !== null || ref.error?.code !== 1) throw gitError();
+  return null;
+}
+
 async function captureGitState(runGit) {
-  const headOutput = await invokeGit(runGit, ['rev-parse', '--verify', 'HEAD'], { allowFailure: true });
+  const headOutput = await resolveGitHead(runGit);
   const head = headOutput === null ? EMPTY_TREE_SENTINEL : headOutput.toString('ascii').trim();
-  if (!/^[a-f0-9]{40,64}$/.test(head)) throw gitError(new TypeError('Git HEAD was malformed.'));
+  if (!/^[a-f0-9]{40,64}$/.test(head)) throw gitError();
   const diff = await invokeGit(runGit, [
     'diff', '--binary', headOutput === null ? EMPTY_TREE_SENTINEL : 'HEAD', '--', '.',
     ':(exclude).goal-lock', ':(exclude).goal-lock/**',
@@ -397,32 +418,28 @@ function sameGitState(left, right) {
     && left.tracked.every((entry, index) => entry === right.tracked[index]);
 }
 
-/** 生成绑定 Git 状态或显式交付清单真实字节的工作区摘要。 */
-export async function workspaceFingerprint(root, inventory, context = {}) {
-  const reader = await createWorkspaceReader(root, context);
-  const runGit = context.runGit ?? defaultGitRunner(reader.root);
-  const probe = await invokeGit(runGit, ['rev-parse', '--is-inside-work-tree'], { unavailableRoot: reader.root });
-  if (probe?.toString('ascii').trim() === 'true') {
-    const topLevel = await invokeGit(runGit, ['rev-parse', '--show-toplevel']);
-    if (!samePath(topLevel.toString('utf8').trim(), reader.root)) {
-      throw integrityError('WORKSPACE_GIT_ROOT_INVALID', 'Workspace root must equal the Git repository top level.');
-    }
-    const before = await captureGitState(runGit);
-    const files = await fingerprintFiles(reader, before.untracked);
-    await reader.verifyInputs();
-    const after = await captureGitState(runGit);
-    // Git 负责 tracked/index 快照，安全 reader 负责未跟踪文件；两侧都必须在最终复验后仍等于首次捕获。
-    if (!sameGitState(before, after)) {
-      throw integrityError('WORKSPACE_INPUT_CHANGED', 'Git workspace inputs changed during fingerprint capture.');
-    }
-    return sha256(framedManifest({
-      mode: 'git',
-      head: before.head,
-      diff_size: before.diff.length,
-      files: files.map(({ name, mode, size }) => ({ name, mode, size })),
-    }, [before.diff, ...files.map((file) => file.bytes)]));
+async function gitFingerprint(reader, runGit) {
+  const topLevel = await invokeGit(runGit, ['rev-parse', '--show-toplevel']);
+  if (!samePath(topLevel.toString('utf8').trim(), reader.root)) {
+    throw integrityError('WORKSPACE_GIT_ROOT_INVALID', 'Workspace root must equal the Git repository top level.');
   }
+  const before = await captureGitState(runGit);
+  const files = await fingerprintFiles(reader, before.untracked);
+  await reader.verifyInputs();
+  const after = await captureGitState(runGit);
+  // Git 负责 tracked/index 快照，安全 reader 负责未跟踪文件；两侧都必须在最终复验后仍等于首次捕获。
+  if (!sameGitState(before, after)) {
+    throw integrityError('WORKSPACE_INPUT_CHANGED', 'Git workspace inputs changed during fingerprint capture.');
+  }
+  return sha256(framedManifest({
+    mode: 'git',
+    head: before.head,
+    diff_size: before.diff.length,
+    files: files.map(({ name, mode, size }) => ({ name, mode, size })),
+  }, [before.diff, ...files.map((file) => file.bytes)]));
+}
 
+async function inventoryFingerprint(reader, inventory) {
   const names = normalizeInventory(inventory);
   const files = await fingerprintFiles(reader, names);
   await reader.verifyInputs();
@@ -430,4 +447,29 @@ export async function workspaceFingerprint(root, inventory, context = {}) {
     mode: 'inventory',
     files: files.map(({ name, mode, size }) => ({ name, mode, size })),
   }, files.map((file) => file.bytes)));
+}
+
+/** 生成只接受真实 Git 根的工作区摘要。 */
+export async function gitWorkspaceFingerprint(root) {
+  const reader = await createWorkspaceReader(root);
+  const runGit = defaultGitRunner(reader.root);
+  const probe = await invokeGit(runGit, ['rev-parse', '--is-inside-work-tree'], { unavailableRoot: reader.root });
+  if (probe?.toString('ascii').trim() !== 'true') throw gitError();
+  return gitFingerprint(reader, runGit);
+}
+
+/** 生成只绑定显式交付清单的非 Git 工作区摘要。 */
+export async function inventoryWorkspaceFingerprint(root, inventory) {
+  return inventoryFingerprint(await createWorkspaceReader(root), inventory);
+}
+
+/** 优先选择 Git，并在 Git 不可用或非 Git 根时回退到显式清单。 */
+export async function workspaceFingerprint(root, inventory, context = {}) {
+  const reader = await createWorkspaceReader(root, context);
+  const runGit = context.runGit ?? defaultGitRunner(reader.root);
+  const probe = await invokeGit(runGit, ['rev-parse', '--is-inside-work-tree'], { unavailableRoot: reader.root });
+  if (probe?.toString('ascii').trim() === 'true') {
+    return gitFingerprint(reader, runGit);
+  }
+  return inventoryFingerprint(reader, inventory);
 }

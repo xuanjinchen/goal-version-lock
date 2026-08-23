@@ -1112,8 +1112,9 @@ function validateGoalEventInput(input) {
       || input.semantic_summary.trim() !== input.semantic_summary)) {
     throw inputError('INVALID_EVENT_INPUT', 'Final audit semantic_summary must be non-empty normalized text.');
   }
-  if (input.event_type === 'plan-revision') {
-    throw inputError('INVALID_EVENT_INPUT', 'Plan revision lifecycle events are owned by plan revision commits.');
+  if (input.kind === 'progress' && ['plan-revision', 'final-audit'].includes(input.event_type)) {
+    // final-audit 与 plan-revision 都携带派生权威状态，只能由各自受控事务构造。
+    throw inputError('INVALID_EVENT_INPUT', 'Derived lifecycle events are owned by their repository mutations.');
   }
   return input;
 }

@@ -2253,7 +2253,7 @@ test('task status audit events never silently complete the active task', async (
     }), fixture),
     (error) => error instanceof GoalLockError && error.kind === 'input',
   );
-  for (const eventType of ['verification-result', 'goal-change', 'evidence-invalidation', 'recovery', 'final-audit']) {
+  for (const eventType of ['verification-result', 'goal-change', 'evidence-invalidation', 'recovery']) {
     await repository.recordGoalEvent(fixture.root, progressInput(`Recorded ${eventType}`, {
       event_type: eventType,
       task_id: eventType === 'verification-result' ? 'TASK-0001' : null,
@@ -4223,10 +4223,26 @@ test('Git fingerprint supports an unborn HEAD, rejects links, and fails closed o
   );
 });
 
+test('Git fingerprint rejects a corrupt HEAD ref instead of treating it as unborn', async (testContext) => {
+  const fixture = createGoalLockFixture(testContext);
+  const { workspaceFingerprint } = await workspaceReader();
+  await writeDelivery(fixture.root, 'tracked.txt', 'committed\n');
+  git(fixture.root, ['add', '--', 'tracked.txt']);
+  git(fixture.root, ['commit', '--quiet', '-m', 'base']);
+  const headRef = git(fixture.root, ['symbolic-ref', 'HEAD']).toString('utf8').trim();
+  await writeDelivery(fixture.root, `.git/${headRef}`, 'not-an-object-id\n');
+
+  await assert.rejects(
+    workspaceFingerprint(fixture.root, undefined, fixture),
+    (error) => error instanceof GoalLockError && error.code === 'GOAL_IO_GIT',
+  );
+});
+
 test('Git fingerprint uses argument-array execution and redacts Git failures', async (testContext) => {
   const fixture = createGoalLockFixture(testContext);
   const { workspaceFingerprint } = await workspaceReader();
   const calls = [];
+  let failure;
   await assert.rejects(
     workspaceFingerprint(fixture.root, undefined, {
       ...fixture,
@@ -4236,11 +4252,18 @@ test('Git fingerprint uses argument-array execution and redacts Git failures', a
         throw new Error('secret stderr and /private/path');
       },
     }),
-    (error) => error instanceof GoalLockError
-      && error.code === 'GOAL_IO_GIT'
-      && !error.message.includes('secret')
-      && !JSON.stringify(error).includes('/private/path'),
+    (error) => {
+      failure = error;
+      return error instanceof GoalLockError
+        && error.code === 'GOAL_IO_GIT'
+        && !error.message.includes('secret')
+        && !JSON.stringify(error).includes('/private/path');
+    },
   );
+  assert.equal(failure.cause, undefined);
+  assert.equal(Object.values(Object.getOwnPropertyDescriptors(failure)).some((descriptor) => (
+    String(descriptor.value).includes('secret stderr') || String(descriptor.value).includes('/private/path')
+  )), false);
   assert.equal(calls.every((args) => Array.isArray(args) && args.every((arg) => typeof arg === 'string')), true);
 
   const unavailable = createGoalLockFixture(testContext, { git: false });
@@ -4257,6 +4280,30 @@ test('Git fingerprint uses argument-array execution and redacts Git failures', a
       runGit: async () => { throw Object.assign(new Error('bad repository'), { code: 128 }); },
     }),
     (error) => error instanceof GoalLockError && error.code === 'GOAL_IO_GIT',
+  );
+});
+
+test('public Git and inventory fingerprint APIs expose their fixed signatures and real behavior', async (testContext) => {
+  const {
+    gitWorkspaceFingerprint,
+    inventoryWorkspaceFingerprint,
+    workspaceFingerprint,
+  } = await workspaceReader();
+  assert.equal(gitWorkspaceFingerprint.length, 1);
+  assert.equal(inventoryWorkspaceFingerprint.length, 2);
+
+  const gitFixture = createGoalLockFixture(testContext);
+  await writeDelivery(gitFixture.root, 'delivery.txt', 'Git delivery\n');
+  assert.equal(
+    await gitWorkspaceFingerprint(gitFixture.root),
+    await workspaceFingerprint(gitFixture.root, undefined, gitFixture),
+  );
+
+  const inventoryFixture = createGoalLockFixture(testContext, { git: false });
+  await writeDelivery(inventoryFixture.root, 'delivery.txt', 'inventory delivery\n');
+  assert.equal(
+    await inventoryWorkspaceFingerprint(inventoryFixture.root, ['delivery.txt']),
+    await workspaceFingerprint(inventoryFixture.root, ['delivery.txt'], inventoryFixture),
   );
 });
 
@@ -4400,6 +4447,30 @@ test('final audit computes its own fingerprint and rejects caller-supplied trust
     }, lateRace.fixture),
     (error) => error instanceof GoalLockError && error.kind === 'integrity',
   );
+});
+
+test('final audit cannot be forged through the ordinary progress input path', async (testContext) => {
+  const completed = await createCompletionFixture(testContext, { audit: false });
+  const { workspaceFingerprint } = await workspaceReader();
+  const fingerprint = await workspaceFingerprint(completed.fixture.root, undefined, completed.fixture);
+  const ledgerPath = join(completed.fixture.root, '.goal-lock', 'progress.jsonl');
+  const before = await readFile(ledgerPath);
+
+  await assert.rejects(
+    completed.repository.recordGoalEvent(completed.fixture.root, progressInput(
+      `Final audit sha256:${fingerprint}: caller supplied this fingerprint`,
+      { event_type: 'final-audit', task_id: null },
+    ), completed.fixture),
+    (error) => error instanceof GoalLockError && error.kind === 'input',
+  );
+  assert.deepEqual(await readFile(ledgerPath), before);
+  const gate = await completed.repository.gateGoalCompletion(
+    completed.fixture.root,
+    undefined,
+    completed.fixture,
+  );
+  assert.equal(gate.state, 'BLOCKED');
+  assert.equal(gate.checklist.find((item) => item.condition === 'final_audit').passed, false);
 });
 
 test('completion gate passes only current audited Git and explicit-inventory workspaces', async (testContext) => {
