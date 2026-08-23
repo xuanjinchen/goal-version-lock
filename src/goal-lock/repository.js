@@ -436,8 +436,15 @@ async function verifyProgressLedger(reader, rootNames, lock, goalHistory, planSt
     if (event.task_id !== null && !plan.tasks.some((task) => task.id === event.task_id)) {
       throw integrityError('PROGRESS_TASK_UNKNOWN', 'Progress event references an unknown task.');
     }
-    if (event.evidence_refs.some((evidenceId) => !evidenceState.knownIds.has(evidenceId))) {
-      throw integrityError('PROGRESS_EVIDENCE_UNKNOWN', 'Progress event references unknown evidence.');
+    const evidenceCreationMatches = evidenceState.records.filter(
+      (record) => evidenceCreationEventMatchesRecord(event, record),
+    );
+    if (evidenceCreationMatches.length > 1
+      || evidenceCreationMatches.length === 0 && !ordinaryEvidenceReferencesResolve(evidenceState, event)) {
+      throw integrityError(
+        'PROGRESS_EVIDENCE_REFERENCE_INVALID',
+        'Progress evidence references must resolve uniquely within the event goal, plan, and task.',
+      );
     }
     verifyProgressChronology(terminal, event);
     terminal = event;
@@ -453,16 +460,7 @@ async function verifyProgressLedger(reader, rootNames, lock, goalHistory, planSt
   }
   verifyProgressPlanState(plans, eventsByPlan);
   for (const record of evidenceState.records) {
-    const matches = events.filter((event) => event.event_type === 'verification-result'
-      && event.evidence_refs.length === 1
-      && event.evidence_refs[0] === record.value.evidence_id
-      && event.summary === evidenceEventSummary(record.value, record.digest)
-      && event.recorded_at === record.value.recorded_at
-      && event.plan_revision === record.value.plan_revision
-      && event.task_id === record.value.task_id
-      && event.goal.goal_id === record.value.goal.goal_id
-      && event.goal.goal_version === record.value.goal.goal_version
-      && event.goal.goal_digest === record.value.goal.goal_digest);
+    const matches = events.filter((event) => evidenceCreationEventMatchesRecord(event, record));
     if (matches.length !== 1) {
       throw integrityError(
         'EVIDENCE_EVENT_MISMATCH',
@@ -525,6 +523,34 @@ function evidenceEventSummary(evidence, evidenceDigest) {
   return `Recorded evidence ${evidence.acceptance_criterion_id}/${evidence.evidence_id} sha256:${evidenceDigest} as ${evidence.state}`;
 }
 
+function evidenceCreationEventMatchesRecord(event, record) {
+  return event.event_type === 'verification-result'
+    && event.evidence_refs.length === 1
+    && event.evidence_refs[0] === record.value.evidence_id
+    && event.summary === evidenceEventSummary(record.value, record.digest)
+    && event.recorded_at === record.value.recorded_at
+    && event.plan_revision === record.value.plan_revision
+    && event.task_id === record.value.task_id
+    && event.goal.goal_id === record.value.goal.goal_id
+    && event.goal.goal_version === record.value.goal.goal_version
+    && event.goal.goal_digest === record.value.goal.goal_digest;
+}
+
+function ordinaryEvidenceReferencesResolve(evidenceState, event) {
+  if (event.evidence_refs.length === 0) return true;
+  if (event.task_id === null) return false;
+  // bare ID 只在事件的目标、计划和任务范围内解析；自动证据事件另由 qualified summary 消除歧义。
+  return event.evidence_refs.every((evidenceId) => (
+    (evidenceState.recordsById.get(evidenceId) ?? []).filter((record) => (
+      record.value.goal.goal_id === event.goal.goal_id
+      && record.value.goal.goal_version === event.goal.goal_version
+      && record.value.goal.goal_digest === event.goal.goal_digest
+      && record.value.plan_revision === event.plan_revision
+      && record.value.task_id === event.task_id
+    )).length === 1
+  ));
+}
+
 function plansByReference(planState) {
   const plans = new Map(planState.archives.map((archive) => [
     `${archive.value.goal.goal_version}/${archive.value.plan_revision}`,
@@ -544,10 +570,10 @@ async function verifyEvidenceState(reader, rootNames, lock, goalHistory, planSta
     if (Object.keys(lock.evidence_heads).length > 0) throw integrityError('EVIDENCE_STATE_MISSING', 'Lock evidence heads require evidence state.');
     return {
       count: 0,
-      knownIds: new Set(),
       latestByCriterion: new Map(),
       publicLatest: {},
       records: [],
+      recordsById: new Map(),
       recordsByCriterion: new Map(),
     };
   }
@@ -558,8 +584,8 @@ async function verifyEvidenceState(reader, rootNames, lock, goalHistory, planSta
   const plans = plansByReference(planState);
   let count = 0;
   const records = [];
-  const knownIds = new Set();
   const latestByCriterion = new Map();
+  const recordsById = new Map();
   const recordsByCriterion = new Map();
   for (const criterion of evidenceRoot.names) {
     if (!/^AC-[0-9]{3}$/.test(criterion)) {
@@ -617,7 +643,9 @@ async function verifyEvidenceState(reader, rootNames, lock, goalHistory, planSta
       };
       criterionRecords.push(normalizedRecord);
       records.push(normalizedRecord);
-      knownIds.add(evidenceId);
+      const idRecords = recordsById.get(evidenceId) ?? [];
+      idRecords.push(normalizedRecord);
+      recordsById.set(evidenceId, idRecords);
       count += 1;
     }
     recordsByCriterion.set(criterion, criterionRecords);
@@ -637,7 +665,7 @@ async function verifyEvidenceState(reader, rootNames, lock, goalHistory, planSta
     }
     publicLatest[criterion] = { ...latest.value, digest: latest.digest };
   }
-  return { count, knownIds, latestByCriterion, publicLatest, records, recordsByCriterion };
+  return { count, latestByCriterion, publicLatest, records, recordsById, recordsByCriterion };
 }
 
 async function readCurrentGoal(reader) {
@@ -1280,8 +1308,11 @@ export async function recordGoalEvent(root, input, context = {}) {
     if (event.task_id !== null && !plan.tasks.some((task) => task.id === event.task_id)) {
       throw inputError('INVALID_EVENT_REFERENCE', 'Progress event task_id must reference the current plan.');
     }
-    if (event.evidence_refs.some((evidenceId) => !evidenceState.knownIds.has(evidenceId))) {
-      throw inputError('INVALID_EVENT_REFERENCE', 'Progress event evidence_refs must reference existing evidence.');
+    if (!ordinaryEvidenceReferencesResolve(evidenceState, event)) {
+      throw inputError(
+        'INVALID_EVENT_REFERENCE',
+        'Progress event evidence_refs must resolve uniquely within the current goal, plan, and task.',
+      );
     }
     const updatedPlan = planAfterTaskEvent(plan, event.event_type, event.task_id, current.goal);
     const updatedPlanBytes = canonicalBytes(updatedPlan);

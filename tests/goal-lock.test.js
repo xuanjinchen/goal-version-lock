@@ -900,6 +900,24 @@ async function createPlannedFixture(testContext) {
   return { fixture, repository };
 }
 
+async function createTwoCriterionFixture(testContext, { sharedTask = false } = {}) {
+  const fixture = createGoalLockFixture(testContext);
+  const repository = await goalRepository();
+  const goal = goalV1();
+  goal.acceptance_criteria.push({
+    id: 'AC-002',
+    outcome: 'Independent verification is retained',
+    verification: 'Inspect the second evidence chain',
+  });
+  await repository.initializeGoal(fixture.root, goal, fixture);
+  await repository.lockInitialGoal(fixture.root, approvalPhraseForGoal(goal), fixture);
+  const candidate = planCandidate();
+  if (sharedTask) candidate.tasks[0].acceptance_criteria = ['AC-001', 'AC-002'];
+  else candidate.tasks[1].acceptance_criteria = ['AC-002'];
+  await repository.revisePlan(fixture.root, candidate, 'aligned', fixture);
+  return { fixture, repository };
+}
+
 test('evidence public API validates the fixed complete envelope without mutating input', () => {
   assert.equal(typeof goalContracts.validateEvidence, 'function');
   assert.equal(Object.hasOwn(goalContracts, 'validateEvidenceContract'), false);
@@ -1051,6 +1069,161 @@ test('evidence IDs and supersession are contiguous per criterion while preservin
   assert.equal(verified.state, 'LOCKED');
   assert.equal(verified.evidence.latest['AC-001'].state, 'stale');
   assert.equal(verified.evidence.latest['AC-002'].state, 'fail');
+});
+
+test('evidence references reject a task-complete backed only by another task criterion', async (testContext) => {
+  const { fixture, repository } = await createTwoCriterionFixture(testContext);
+  const directory = join(fixture.root, '.goal-lock');
+  await repository.recordGoalEvent(fixture.root, evidenceInput({
+    acceptance_criterion_id: 'AC-002',
+    task_id: 'TASK-0002',
+  }), fixture);
+  await repository.recordGoalEvent(
+    fixture.root,
+    progressInput('Started task one', { event_type: 'task-start' }),
+    fixture,
+  );
+  const planBefore = await readFile(join(directory, 'plan.json'));
+  const ledgerBefore = await readFile(join(directory, 'progress.jsonl'));
+  const lockBefore = await readFile(join(directory, 'lock.json'));
+
+  await assert.rejects(
+    repository.recordGoalEvent(fixture.root, progressInput('Cross-owned completion', {
+      event_type: 'task-complete',
+      evidence_refs: ['EVID-0001'],
+    }), fixture),
+    (error) => error instanceof GoalLockError && error.kind === 'input',
+  );
+
+  assert.deepEqual(await readFile(join(directory, 'plan.json')), planBefore);
+  assert.deepEqual(await readFile(join(directory, 'progress.jsonl')), ledgerBefore);
+  assert.deepEqual(await readFile(join(directory, 'lock.json')), lockBefore);
+});
+
+test('evidence references reject a bare ID shared by two criteria of the same task', async (testContext) => {
+  const { fixture, repository } = await createTwoCriterionFixture(testContext, { sharedTask: true });
+  const directory = join(fixture.root, '.goal-lock');
+  await repository.recordGoalEvent(fixture.root, evidenceInput(), fixture);
+  await repository.recordGoalEvent(fixture.root, evidenceInput({
+    acceptance_criterion_id: 'AC-002',
+  }), fixture);
+  assert.equal((await repository.verifyGoalRepository(fixture.root, fixture)).state, 'LOCKED');
+  await repository.recordGoalEvent(
+    fixture.root,
+    progressInput('Started shared task', { event_type: 'task-start' }),
+    fixture,
+  );
+  const planBefore = await readFile(join(directory, 'plan.json'));
+  const ledgerBefore = await readFile(join(directory, 'progress.jsonl'));
+  const lockBefore = await readFile(join(directory, 'lock.json'));
+
+  await assert.rejects(
+    repository.recordGoalEvent(fixture.root, progressInput('Ambiguous completion', {
+      event_type: 'task-complete',
+      evidence_refs: ['EVID-0001'],
+    }), fixture),
+    (error) => error instanceof GoalLockError && error.kind === 'input',
+  );
+
+  assert.deepEqual(await readFile(join(directory, 'plan.json')), planBefore);
+  assert.deepEqual(await readFile(join(directory, 'progress.jsonl')), ledgerBefore);
+  assert.deepEqual(await readFile(join(directory, 'lock.json')), lockBefore);
+});
+
+test('evidence references reject task-null ambiguity for overlapping criterion-local IDs', async (testContext) => {
+  const { fixture, repository } = await createTwoCriterionFixture(testContext);
+  const directory = join(fixture.root, '.goal-lock');
+  await repository.recordGoalEvent(fixture.root, evidenceInput(), fixture);
+  await repository.recordGoalEvent(fixture.root, evidenceInput({
+    acceptance_criterion_id: 'AC-002',
+    task_id: 'TASK-0002',
+  }), fixture);
+  const ledgerBefore = await readFile(join(directory, 'progress.jsonl'));
+  const lockBefore = await readFile(join(directory, 'lock.json'));
+
+  await assert.rejects(
+    repository.recordGoalEvent(fixture.root, progressInput('Ambiguous audit reference', {
+      task_id: null,
+      evidence_refs: ['EVID-0001'],
+    }), fixture),
+    (error) => error instanceof GoalLockError && error.kind === 'input',
+  );
+
+  assert.deepEqual(await readFile(join(directory, 'progress.jsonl')), ledgerBefore);
+  assert.deepEqual(await readFile(join(directory, 'lock.json')), lockBefore);
+});
+
+test('evidence references resolve an overlapping bare ID uniquely through the owning task', async (testContext) => {
+  const { fixture, repository } = await createTwoCriterionFixture(testContext);
+  await repository.recordGoalEvent(fixture.root, evidenceInput(), fixture);
+  await repository.recordGoalEvent(fixture.root, evidenceInput({
+    acceptance_criterion_id: 'AC-002',
+    task_id: 'TASK-0002',
+  }), fixture);
+  await repository.recordGoalEvent(
+    fixture.root,
+    progressInput('Started task one', { event_type: 'task-start' }),
+    fixture,
+  );
+
+  await repository.recordGoalEvent(fixture.root, progressInput('Uniquely owned completion', {
+    event_type: 'task-complete',
+    evidence_refs: ['EVID-0001'],
+  }), fixture);
+
+  const plan = parseCanonicalJson(
+    await readFile(join(fixture.root, '.goal-lock', 'plan.json')),
+    'test plan',
+  );
+  assert.equal(plan.tasks[0].status, 'complete');
+  assert.equal((await repository.verifyGoalRepository(fixture.root, fixture)).state, 'LOCKED');
+});
+
+test('evidence replay rejects a re-digested cross-owned task-complete reference', async (testContext) => {
+  const { fixture, repository } = await createTwoCriterionFixture(testContext);
+  const directory = join(fixture.root, '.goal-lock');
+  await repository.recordGoalEvent(fixture.root, evidenceInput({
+    acceptance_criterion_id: 'AC-002',
+    task_id: 'TASK-0002',
+  }), fixture);
+  await repository.recordGoalEvent(
+    fixture.root,
+    progressInput('Started task one', { event_type: 'task-start' }),
+    fixture,
+  );
+  const ledgerPath = join(directory, 'progress.jsonl');
+  const ledgerBefore = await readFile(ledgerPath);
+  const events = ledgerBefore.toString('utf8').trimEnd().split('\n').map(JSON.parse);
+  const terminal = events.at(-1);
+  const payload = {
+    schema_version: 1,
+    event_id: 'EVT-000004',
+    recorded_at: '2026-08-23T00:00:00.000Z',
+    goal: terminal.goal,
+    plan_revision: 1,
+    task_id: 'TASK-0001',
+    event_type: 'task-complete',
+    summary: 'Cross-owned completion injected into the ledger',
+    evidence_refs: ['EVID-0001'],
+    previous_event_digest: terminal.event_digest,
+  };
+  const injected = {
+    ...payload,
+    event_digest: independentSha256(canonicalBytes(payload)),
+  };
+  await writeFile(ledgerPath, Buffer.concat([ledgerBefore, canonicalBytes(injected)]));
+  await rewriteTestPlan(fixture, (plan) => {
+    plan.tasks[0].status = 'complete';
+    plan.next_task_id = 'TASK-0002';
+  });
+  await rewriteTestLock(fixture, (lock) => {
+    lock.state_revision += 1;
+    lock.progress_head = { event_id: injected.event_id, digest: injected.event_digest };
+  });
+
+  const result = await repository.verifyGoalRepository(fixture.root, fixture);
+
+  assert.equal(result.state, 'TAMPERED');
 });
 
 test('evidence recording rejects derived fields, unknown bindings, and inexact supersession without partial state', async (testContext) => {
