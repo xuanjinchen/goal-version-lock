@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { link, lstat, mkdir, readFile, readdir, rename, rm, symlink, unlink, writeFile } from 'node:fs/promises';
+import { chmod, link, lstat, mkdir, readFile, readdir, rename, rm, symlink, unlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { test } from 'node:test';
 
@@ -4112,6 +4112,454 @@ test('approval phrase builders bind the stable identifiers and digest fingerprin
     approvalPhraseForChange({ id: 'CR-0001', candidate_goal: { goal_version: 2 }, proposal_digest: 'abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd' }),
     'APPROVE CR-0001 GOAL VERSION 2 abcdefabcdef',
   );
+});
+
+function git(root, args) {
+  return execFileSync('git', args, { cwd: root });
+}
+
+async function writeDelivery(root, relativePath, bytes) {
+  const segments = relativePath.split('/');
+  if (segments.length > 1) await mkdir(join(root, ...segments.slice(0, -1)), { recursive: true });
+  await writeFile(join(root, ...segments), bytes);
+}
+
+test('Git fingerprint binds HEAD plus staged, unstaged, deleted, renamed, binary, Unicode, and untracked bytes', async (testContext) => {
+  const fixture = createGoalLockFixture(testContext);
+  const { workspaceFingerprint } = await workspaceReader();
+  await writeDelivery(fixture.root, '.gitignore', 'ignored.txt\n');
+  await writeDelivery(fixture.root, 'unstaged.txt', 'base\n');
+  await writeDelivery(fixture.root, 'staged.txt', 'base\n');
+  await writeDelivery(fixture.root, 'deleted.txt', 'base\n');
+  await writeDelivery(fixture.root, 'renamed.txt', 'base\n');
+  await writeDelivery(fixture.root, 'binary.bin', Buffer.from([0, 1, 2, 3]));
+  git(fixture.root, ['add', '--', '.']);
+  git(fixture.root, ['commit', '--quiet', '-m', 'base']);
+  const clean = await workspaceFingerprint(fixture.root, undefined, fixture);
+  git(fixture.root, ['commit', '--quiet', '--allow-empty', '-m', 'new head']);
+  const newHead = await workspaceFingerprint(fixture.root, undefined, fixture);
+  assert.notEqual(newHead, clean);
+
+  const mutations = [
+    async () => writeDelivery(fixture.root, 'unstaged.txt', 'changed unstaged\n'),
+    async () => {
+      await writeDelivery(fixture.root, 'staged.txt', 'changed staged\n');
+      git(fixture.root, ['add', '--', 'staged.txt']);
+    },
+    async () => unlink(join(fixture.root, 'deleted.txt')),
+    async () => { git(fixture.root, ['mv', '--', 'renamed.txt', 'renamed-\u6587\u4ef6.txt']); },
+    async () => writeDelivery(fixture.root, 'binary.bin', Buffer.from([0, 255, 2, 3, 0])),
+    async () => writeDelivery(fixture.root, '\u4ea4\u4ed8-\ud83d\ude80.txt', Buffer.from('\u771f\u5b9e UTF-8 \u5b57\u8282\n')),
+    async () => writeDelivery(fixture.root, 'untracked.txt', Buffer.from('untracked bytes\n')),
+  ];
+  let previous = newHead;
+  for (const mutate of mutations) {
+    await mutate();
+    const current = await workspaceFingerprint(fixture.root, undefined, fixture);
+    assert.match(current, /^[a-f0-9]{64}$/);
+    assert.notEqual(current, previous);
+    previous = current;
+  }
+  await writeDelivery(fixture.root, 'untracked.txt', Buffer.from('changed bytes!!!\n'));
+  const changedUntracked = await workspaceFingerprint(fixture.root, undefined, fixture);
+  assert.notEqual(changedUntracked, previous);
+  previous = changedUntracked;
+
+  await writeDelivery(fixture.root, 'ignored.txt', 'ignored one\n');
+  await mkdir(join(fixture.root, '.goal-lock'), { recursive: true });
+  await writeDelivery(fixture.root, '.goal-lock/bookkeeping.json', '{"revision":1}\n');
+  const excluded = await workspaceFingerprint(fixture.root, undefined, fixture);
+  await writeDelivery(fixture.root, 'ignored.txt', 'ignored two\n');
+  await writeDelivery(fixture.root, '.goal-lock/bookkeeping.json', '{"revision":2}\n');
+  assert.equal(await workspaceFingerprint(fixture.root, undefined, fixture), excluded);
+});
+
+test('Git fingerprint supports an unborn HEAD, rejects links, and fails closed on capture races', async (testContext) => {
+  const { workspaceFingerprint } = await workspaceReader();
+  const unborn = createGoalLockFixture(testContext);
+  await writeDelivery(unborn.root, 'delivery.txt', 'unborn delivery\n');
+  assert.match(await workspaceFingerprint(unborn.root, undefined, unborn), /^[a-f0-9]{64}$/);
+
+  const linked = createGoalLockFixture(testContext);
+  await writeDelivery(linked.root, 'source.txt', 'same inode\n');
+  await link(join(linked.root, 'source.txt'), join(linked.root, 'linked.txt'));
+  await assert.rejects(
+    workspaceFingerprint(linked.root, undefined, linked),
+    (error) => error instanceof GoalLockError && error.kind === 'integrity',
+  );
+
+  const raced = createGoalLockFixture(testContext);
+  await writeDelivery(raced.root, 'delivery.txt', 'before\n');
+  let changed = false;
+  raced.workspaceFaults = {
+    afterFileRead: async ({ relativePath }) => {
+      if (!changed && relativePath === 'delivery.txt') {
+        changed = true;
+        await writeDelivery(raced.root, relativePath, 'after\n');
+      }
+    },
+  };
+  await assert.rejects(
+    workspaceFingerprint(raced.root, undefined, raced),
+    (error) => error instanceof GoalLockError && error.kind === 'integrity',
+  );
+
+  const trackedRace = createGoalLockFixture(testContext);
+  await writeDelivery(trackedRace.root, 'tracked.txt', 'before\n');
+  git(trackedRace.root, ['add', '--', 'tracked.txt']);
+  git(trackedRace.root, ['commit', '--quiet', '-m', 'tracked base']);
+  let changedTracked = false;
+  trackedRace.runGit = async (args) => {
+    const output = git(trackedRace.root, args);
+    if (!changedTracked && args[0] === 'ls-files' && args[1] === '--stage') {
+      changedTracked = true;
+      await writeDelivery(trackedRace.root, 'tracked.txt', 'after\n');
+    }
+    return output;
+  };
+  await assert.rejects(
+    workspaceFingerprint(trackedRace.root, undefined, trackedRace),
+    (error) => error instanceof GoalLockError && error.kind === 'integrity',
+  );
+});
+
+test('Git fingerprint uses argument-array execution and redacts Git failures', async (testContext) => {
+  const fixture = createGoalLockFixture(testContext);
+  const { workspaceFingerprint } = await workspaceReader();
+  const calls = [];
+  await assert.rejects(
+    workspaceFingerprint(fixture.root, undefined, {
+      ...fixture,
+      runGit: async (args) => {
+        calls.push(args);
+        if (calls.length === 1) return Buffer.from('true\n');
+        throw new Error('secret stderr and /private/path');
+      },
+    }),
+    (error) => error instanceof GoalLockError
+      && error.code === 'GOAL_IO_GIT'
+      && !error.message.includes('secret')
+      && !JSON.stringify(error).includes('/private/path'),
+  );
+  assert.equal(calls.every((args) => Array.isArray(args) && args.every((arg) => typeof arg === 'string')), true);
+
+  const unavailable = createGoalLockFixture(testContext, { git: false });
+  await writeDelivery(unavailable.root, 'delivery.txt', 'inventory fallback\n');
+  assert.match(await workspaceFingerprint(unavailable.root, ['delivery.txt'], {
+    ...unavailable,
+    runGit: async () => { throw Object.assign(new Error('missing'), { code: 'ENOENT' }); },
+  }), /^[a-f0-9]{64}$/);
+
+  const brokenRepository = createGoalLockFixture(testContext);
+  await assert.rejects(
+    workspaceFingerprint(brokenRepository.root, ['delivery.txt'], {
+      ...brokenRepository,
+      runGit: async () => { throw Object.assign(new Error('bad repository'), { code: 128 }); },
+    }),
+    (error) => error instanceof GoalLockError && error.code === 'GOAL_IO_GIT',
+  );
+});
+
+test('explicit-inventory fingerprint binds sorted delivery names, modes, sizes, and bytes', async (testContext) => {
+  const fixture = createGoalLockFixture(testContext, { git: false });
+  const { workspaceFingerprint } = await workspaceReader();
+  await writeDelivery(fixture.root, 'dist/a.txt', Buffer.from('alpha\n'));
+  await writeDelivery(fixture.root, 'dist/\u6587\u4ef6.bin', Buffer.from([0, 1, 255, 0]));
+  const inventory = ['dist/a.txt', 'dist/\u6587\u4ef6.bin'];
+  const first = await workspaceFingerprint(fixture.root, inventory, fixture);
+  await writeDelivery(fixture.root, 'dist/\u6587\u4ef6.bin', Buffer.from([0, 2, 255, 0]));
+  const second = await workspaceFingerprint(fixture.root, inventory, fixture);
+  assert.match(first, /^[a-f0-9]{64}$/);
+  assert.notEqual(second, first);
+  if (process.platform !== 'win32') {
+    await chmod(join(fixture.root, 'dist', 'a.txt'), 0o755);
+    assert.notEqual(await workspaceFingerprint(fixture.root, inventory, fixture), second);
+  }
+});
+
+test('explicit-inventory fingerprint rejects omitted, empty, unsorted, duplicate, unsafe, missing, directory, and linked entries', async (testContext) => {
+  const fixture = createGoalLockFixture(testContext, { git: false });
+  const { workspaceFingerprint } = await workspaceReader();
+  await writeDelivery(fixture.root, 'a.txt', 'alpha\n');
+  await writeDelivery(fixture.root, 'b.txt', 'beta\n');
+  await mkdir(join(fixture.root, 'directory'));
+  await link(join(fixture.root, 'a.txt'), join(fixture.root, 'linked.txt'));
+  const invalid = [
+    undefined,
+    [],
+    ['b.txt', 'a.txt'],
+    ['a.txt', 'a.txt'],
+    ['../escape.txt'],
+    ['missing.txt'],
+    ['directory'],
+    ['linked.txt'],
+  ];
+  for (const inventory of invalid) {
+    await assert.rejects(
+      workspaceFingerprint(fixture.root, inventory, fixture),
+      (error) => error instanceof GoalLockError,
+      JSON.stringify(inventory),
+    );
+  }
+});
+
+test('explicit-inventory fingerprint fails closed when an entry changes during capture', async (testContext) => {
+  const fixture = createGoalLockFixture(testContext, { git: false });
+  const { workspaceFingerprint } = await workspaceReader();
+  await writeDelivery(fixture.root, 'delivery.txt', 'before\n');
+  let changed = false;
+  fixture.workspaceFaults = {
+    afterFileRead: async ({ relativePath }) => {
+      if (!changed && relativePath === 'delivery.txt') {
+        changed = true;
+        await writeDelivery(fixture.root, relativePath, 'after\n');
+      }
+    },
+  };
+  await assert.rejects(
+    workspaceFingerprint(fixture.root, ['delivery.txt'], fixture),
+    (error) => error instanceof GoalLockError && error.kind === 'integrity',
+  );
+});
+
+async function createCompletionFixture(testContext, { git: withGit = true, evidenceState = 'pass', audit = true } = {}) {
+  const fixture = createGoalLockFixture(testContext, { git: withGit });
+  const repository = await goalRepository();
+  await writeDelivery(fixture.root, 'delivery.txt', 'accepted delivery\n');
+  await repository.initializeGoal(fixture.root, goalV1(), fixture);
+  await repository.lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 92d74f6bf766', fixture);
+  await repository.revisePlan(fixture.root, planCandidate(), 'aligned', fixture);
+  await repository.recordGoalEvent(fixture.root, evidenceInput({ state: evidenceState }), fixture);
+  await repository.recordGoalEvent(fixture.root, progressInput('Started task one', { event_type: 'task-start' }), fixture);
+  await repository.recordGoalEvent(fixture.root, progressInput('Completed task one', {
+    event_type: 'task-complete',
+    evidence_refs: ['EVID-0001'],
+  }), fixture);
+  await repository.recordGoalEvent(fixture.root, evidenceInput({
+    task_id: 'TASK-0002',
+    state: evidenceState,
+    supersedes: 'EVID-0001',
+  }), fixture);
+  await repository.recordGoalEvent(fixture.root, progressInput('Started task two', {
+    event_type: 'task-start',
+    task_id: 'TASK-0002',
+  }), fixture);
+  await repository.recordGoalEvent(fixture.root, progressInput('Completed task two', {
+    event_type: 'task-complete',
+    task_id: 'TASK-0002',
+    evidence_refs: ['EVID-0002'],
+  }), fixture);
+  const inventory = withGit ? undefined : ['delivery.txt'];
+  if (audit) {
+    await repository.recordGoalEvent(fixture.root, {
+      kind: 'final-audit',
+      semantic_summary: 'Reviewed the final semantic diff against the locked goal.',
+      inventory,
+    }, fixture);
+  }
+  return { fixture, repository, inventory };
+}
+
+test('final audit computes its own fingerprint and rejects caller-supplied trusted fingerprint fields', async (testContext) => {
+  const completed = await createCompletionFixture(testContext, { audit: false });
+  const { workspaceFingerprint } = await workspaceReader();
+  const expected = await workspaceFingerprint(completed.fixture.root, undefined, completed.fixture);
+  await assert.rejects(
+    completed.repository.recordGoalEvent(completed.fixture.root, {
+      kind: 'final-audit',
+      semantic_summary: 'Reviewed final semantics.',
+      inventory: undefined,
+      workspace_fingerprint: '0'.repeat(64),
+    }, completed.fixture),
+    (error) => error instanceof GoalLockError && error.kind === 'input',
+  );
+  const receipt = await completed.repository.recordGoalEvent(completed.fixture.root, {
+    kind: 'final-audit',
+    semantic_summary: 'Reviewed final semantics.',
+    inventory: undefined,
+  }, completed.fixture);
+  assert.equal(receipt.workspace_fingerprint, expected);
+  const ledger = await readFile(join(completed.fixture.root, '.goal-lock', 'progress.jsonl'), 'utf8');
+  assert.match(ledger, new RegExp(expected));
+
+  const lateRace = await createCompletionFixture(testContext, { audit: false });
+  let verifications = 0;
+  lateRace.fixture.workspaceFaults = {
+    beforeVerifyInputs: async () => {
+      verifications += 1;
+      if (verifications === 3) {
+        await writeDelivery(lateRace.fixture.root, 'delivery.txt', 'changed after fingerprint capture\n');
+      }
+    },
+  };
+  await assert.rejects(
+    lateRace.repository.recordGoalEvent(lateRace.fixture.root, {
+      kind: 'final-audit',
+      semantic_summary: 'This audit must not accept a late workspace change.',
+      inventory: undefined,
+    }, lateRace.fixture),
+    (error) => error instanceof GoalLockError && error.kind === 'integrity',
+  );
+});
+
+test('completion gate passes only current audited Git and explicit-inventory workspaces', async (testContext) => {
+  for (const withGit of [true, false]) {
+    const { fixture, repository, inventory } = await createCompletionFixture(testContext, { git: withGit });
+    const result = await repository.gateGoalCompletion(fixture.root, inventory, fixture);
+    assert.equal(result.state, 'COMPLETE');
+    assert.match(result.workspace_fingerprint, /^[a-f0-9]{64}$/);
+    assert.equal(result.goal.goal_digest, activeGoalReference().goal_digest);
+    assert.equal(result.checklist.every((item) => item.passed === true), true);
+    assert.deepEqual(
+      result.checklist.map((item) => item.condition),
+      [...result.checklist.map((item) => item.condition)].sort(),
+    );
+    assert.equal(Object.hasOwn(result, 'code_correct'), false);
+    assert.equal(Object.hasOwn(result, 'authenticated_identity'), false);
+    assert.equal(Object.hasOwn(result, 'irreversible'), false);
+  }
+});
+
+test('completion gate invalidates a prior final audit after a workspace change until a new audit is recorded', async (testContext) => {
+  const { fixture, repository } = await createCompletionFixture(testContext);
+  assert.equal((await repository.gateGoalCompletion(fixture.root, undefined, fixture)).state, 'COMPLETE');
+  await writeDelivery(fixture.root, 'delivery.txt', 'changed after audit\n');
+  const changed = await repository.gateGoalCompletion(fixture.root, undefined, fixture);
+  assert.equal(changed.state, 'BLOCKED');
+  assert.equal(changed.checklist.find((item) => item.condition === 'workspace_fingerprint').passed, false);
+  await repository.recordGoalEvent(fixture.root, {
+    kind: 'final-audit',
+    semantic_summary: 'Reviewed the changed final semantic diff.',
+    inventory: undefined,
+  }, fixture);
+  assert.equal((await repository.gateGoalCompletion(fixture.root, undefined, fixture)).state, 'COMPLETE');
+});
+
+test('completion gate checklist independently blocks incomplete tasks, evidence states, absent audit, repository damage, and capture races', async (testContext) => {
+  const cases = [
+    ['each pending task status', async () => createPlannedFixture(testContext), 'tasks'],
+    ['fail evidence', async () => createCompletionFixture(testContext, { evidenceState: 'fail' }), 'evidence'],
+    ['stale evidence', async () => createCompletionFixture(testContext, { evidenceState: 'stale' }), 'evidence'],
+    ['absent final audit', async () => createCompletionFixture(testContext, { audit: false }), 'final_audit'],
+    ['invalid goal chain', async () => {
+      const value = await createCompletionFixture(testContext);
+      await writeDelivery(value.fixture.root, '.goal-lock/history/goals/v0001.json', canonicalBytes({
+        ...goalV1(),
+        objective: 'tampered objective',
+      }));
+      return value;
+    }, 'active_goal'],
+    ['mismatched plan', async () => {
+      const value = await createCompletionFixture(testContext);
+      await rewriteTestPlan(value.fixture, (plan) => { plan.goal.goal_digest = 'f'.repeat(64); });
+      return value;
+    }, 'plan'],
+    ['broken ledger', async () => {
+      const value = await createCompletionFixture(testContext);
+      await writeDelivery(value.fixture.root, '.goal-lock/progress.jsonl', 'broken\n');
+      return value;
+    }, 'progress_ledger'],
+  ];
+  for (const [label, build, condition] of cases) {
+    const value = await build();
+    const result = await value.repository.gateGoalCompletion(value.fixture.root, value.inventory, value.fixture);
+    assert.equal(result.state, 'BLOCKED', label);
+    assert.equal(result.checklist.find((item) => item.condition === condition).passed, false, label);
+  }
+
+  const proposed = await createCompletionFixture(testContext);
+  await proposed.repository.proposeGoalChange(proposed.fixture.root, changeProposalInput(), proposed.fixture);
+  const pending = await proposed.repository.gateGoalCompletion(proposed.fixture.root, undefined, proposed.fixture);
+  assert.equal(pending.state, 'BLOCKED');
+  assert.equal(pending.checklist.find((item) => item.condition === 'change_requests').passed, false);
+
+  const raced = await createCompletionFixture(testContext);
+  let changed = false;
+  raced.fixture.workspaceFaults = {
+    afterFileRead: async ({ relativePath }) => {
+      if (!changed && relativePath === 'delivery.txt') {
+        changed = true;
+        await writeDelivery(raced.fixture.root, 'delivery.txt', 'raced during gate\n');
+      }
+    },
+  };
+  const raceResult = await raced.repository.gateGoalCompletion(raced.fixture.root, undefined, raced.fixture);
+  assert.equal(raceResult.state, 'BLOCKED');
+  assert.equal(raceResult.checklist.find((item) => item.condition === 'workspace_fingerprint').passed, false);
+
+  const lateRace = await createCompletionFixture(testContext);
+  let verifications = 0;
+  lateRace.fixture.workspaceFaults = {
+    beforeVerifyInputs: async () => {
+      verifications += 1;
+      if (verifications === 3) {
+        await writeDelivery(lateRace.fixture.root, 'delivery.txt', 'changed during final repository revalidation\n');
+      }
+    },
+  };
+  const lateRaceResult = await lateRace.repository.gateGoalCompletion(
+    lateRace.fixture.root,
+    undefined,
+    lateRace.fixture,
+  );
+  assert.equal(lateRaceResult.state, 'BLOCKED');
+  assert.equal(lateRaceResult.checklist.find((item) => item.condition === 'workspace_fingerprint').passed, false);
+});
+
+test('completion gate blocks every non-complete task status plus missing and old-goal evidence', async (testContext) => {
+  const taskStatuses = [
+    ['pending', async () => createPlannedFixture(testContext)],
+    ['in_progress', async () => {
+      const value = await createPlannedFixture(testContext);
+      await value.repository.recordGoalEvent(value.fixture.root, progressInput('Started', { event_type: 'task-start' }), value.fixture);
+      return value;
+    }],
+    ['blocked', async () => {
+      const value = await createPlannedFixture(testContext);
+      await value.repository.recordGoalEvent(value.fixture.root, progressInput('Started', { event_type: 'task-start' }), value.fixture);
+      await value.repository.recordGoalEvent(value.fixture.root, progressInput('Blocked', { event_type: 'blocker' }), value.fixture);
+      return value;
+    }],
+    ['stale', async () => {
+      const value = await createPlannedFixture(testContext);
+      await rewriteTestPlan(value.fixture, (plan) => { plan.tasks[0].status = 'stale'; });
+      return value;
+    }],
+  ];
+  for (const [status, build] of taskStatuses) {
+    const value = await build();
+    const result = await value.repository.gateGoalCompletion(value.fixture.root, undefined, value.fixture);
+    assert.equal(result.state, 'BLOCKED', status);
+    assert.equal(result.checklist.find((item) => item.condition === 'tasks').passed, false, status);
+  }
+
+  const missingPlan = createGoalLockFixture(testContext);
+  const repository = await goalRepository();
+  await repository.initializeGoal(missingPlan.root, goalV1(), missingPlan);
+  await repository.lockInitialGoal(missingPlan.root, 'APPROVE GOAL GL-ALPHA VERSION 1 92d74f6bf766', missingPlan);
+  const noPlan = await repository.gateGoalCompletion(missingPlan.root, undefined, missingPlan);
+  assert.equal(noPlan.checklist.find((item) => item.condition === 'plan').passed, false);
+
+  const missingEvidence = await createCompletionFixture(testContext);
+  await rm(join(missingEvidence.fixture.root, '.goal-lock', 'evidence'), { recursive: true });
+  const withoutEvidence = await missingEvidence.repository.gateGoalCompletion(
+    missingEvidence.fixture.root,
+    undefined,
+    missingEvidence.fixture,
+  );
+  assert.equal(withoutEvidence.checklist.find((item) => item.condition === 'evidence').passed, false);
+
+  const oldGoalEvidence = await createCompletionFixture(testContext);
+  const evidencePath = join(oldGoalEvidence.fixture.root, '.goal-lock', 'evidence', 'AC-001', 'EVID-0002.json');
+  const evidence = parseCanonicalJson(await readFile(evidencePath), 'test old-goal evidence');
+  evidence.goal.goal_digest = 'f'.repeat(64);
+  await writeFile(evidencePath, canonicalBytes(evidence));
+  const oldGoal = await oldGoalEvidence.repository.gateGoalCompletion(
+    oldGoalEvidence.fixture.root,
+    undefined,
+    oldGoalEvidence.fixture,
+  );
+  assert.equal(oldGoal.checklist.find((item) => item.condition === 'evidence').passed, false);
 });
 
 test('goal lock errors expose immutable classification metadata', () => {

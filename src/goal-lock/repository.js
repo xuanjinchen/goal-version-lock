@@ -13,7 +13,7 @@ import {
   validateProgressEvent,
 } from './contracts.js';
 import { commitGoalFiles, withGoalLock } from './transaction.js';
-import { createWorkspaceReader } from './workspace.js';
+import { createWorkspaceReader, workspaceFingerprint } from './workspace.js';
 
 const ACTIVE_WRITE = Symbol('active goal writer');
 const RETURN_VERIFIED_SNAPSHOT = Symbol('return verified repository snapshot');
@@ -1096,13 +1096,21 @@ function validateGoalEventInput(input) {
   }
   const fields = input.kind === 'evidence'
     ? ['kind', 'acceptance_criterion_id', 'task_id', 'method', 'observed_result', 'artifact_refs', 'workspace_fingerprint', 'state', 'supersedes']
-    : ['kind', 'event_type', 'task_id', 'summary', 'evidence_refs'];
+    : input.kind === 'final-audit'
+      ? ['kind', 'semantic_summary', 'inventory']
+      : ['kind', 'event_type', 'task_id', 'summary', 'evidence_refs'];
   const keys = Object.keys(input);
   if (keys.length !== fields.length || fields.some((field) => !Object.hasOwn(input, field))) {
     throw inputError('INVALID_EVENT_INPUT', `Goal ${input.kind === 'evidence' ? 'evidence' : 'progress'} input contains missing or derived fields.`);
   }
-  if (!['evidence', 'progress'].includes(input.kind)) {
-    throw inputError('INVALID_EVENT_INPUT', 'Goal event kind must equal evidence or progress.');
+  if (!['evidence', 'progress', 'final-audit'].includes(input.kind)) {
+    throw inputError('INVALID_EVENT_INPUT', 'Goal event kind must equal evidence, progress, or final-audit.');
+  }
+  if (input.kind === 'final-audit'
+    && (typeof input.semantic_summary !== 'string'
+      || input.semantic_summary.length === 0
+      || input.semantic_summary.trim() !== input.semantic_summary)) {
+    throw inputError('INVALID_EVENT_INPUT', 'Final audit semantic_summary must be non-empty normalized text.');
   }
   if (input.event_type === 'plan-revision') {
     throw inputError('INVALID_EVENT_INPUT', 'Plan revision lifecycle events are owned by plan revision commits.');
@@ -1165,6 +1173,17 @@ function appendProgressEvents(progressState, events) {
       : { kind: 'absent' },
     content,
   };
+}
+
+async function fingerprintAcrossRepositoryRevalidation(root, inventory, reader, context) {
+  const before = await workspaceFingerprint(root, inventory, context);
+  await reader.verifyInputs();
+  const after = await workspaceFingerprint(root, inventory, context);
+  // 仓库复验位于两次完整指纹之间，任一侧的 delivery 或 goal 输入变化都不能被签发为同一审计快照。
+  if (before !== after) {
+    throw integrityError('WORKSPACE_INPUT_CHANGED', 'Workspace inputs changed across repository revalidation.');
+  }
+  return after;
 }
 
 function nextLockForEvent(lockInput, event) {
@@ -1379,6 +1398,45 @@ export async function recordGoalEvent(root, input, context = {}) {
       goal_version: current.goal.goal_version,
       goal_digest: current.digest,
     };
+    if (input.kind === 'final-audit') {
+      const fingerprint = await fingerprintAcrossRepositoryRevalidation(
+        root,
+        input.inventory,
+        reader,
+        context,
+      );
+      const event = buildProgressEvent(progressState, goalReference, plan.plan_revision, {
+        event_type: 'final-audit',
+        task_id: null,
+        summary: `Final audit sha256:${fingerprint}: ${input.semantic_summary}`,
+        evidence_refs: [],
+      }, context);
+      const entries = verifiedHistoryEntries(current, history, planState);
+      entries.push({
+        target: '.goal-lock/plan.json',
+        expected: { kind: 'sha256', digest: planState.current.digest },
+        content: planState.current.bytes,
+      });
+      entries.push(appendProgressEntry(progressState, event));
+      entries.push({
+        target: '.goal-lock/lock.json',
+        expected: { kind: 'sha256', digest: lockInput.digest },
+        content: canonicalBytes(nextLockForEvent(lockInput, event)),
+      });
+      // 已夹持复验的指纹与 progress head 同事务安装，调用方无法注入可信摘要。
+      await commitGoalFiles(root, entries, context);
+      return {
+        state: 'LOCKED',
+        event_id: event.event_id,
+        event_digest: event.event_digest,
+        event_type: event.event_type,
+        workspace_fingerprint: fingerprint,
+        goal_id: current.goal.goal_id,
+        goal_version: current.goal.goal_version,
+        goal_digest: current.digest,
+        plan_revision: plan.plan_revision,
+      };
+    }
     if (input.kind === 'evidence') {
       const criterion = current.goal.acceptance_criteria.find(
         (candidate) => candidate.id === input.acceptance_criterion_id,
@@ -1504,6 +1562,108 @@ export async function recordGoalEvent(root, input, context = {}) {
       task_id: event.task_id,
     };
   }, context);
+}
+
+const COMPLETION_CONDITIONS = Object.freeze([
+  'active_goal',
+  'change_requests',
+  'evidence',
+  'final_audit',
+  'plan',
+  'progress_ledger',
+  'tasks',
+  'workspace_fingerprint',
+].sort());
+
+function completionChecklist(results) {
+  return COMPLETION_CONDITIONS.map((condition) => ({
+    condition,
+    passed: results[condition] === true,
+  }));
+}
+
+function failedRepositoryCondition(code) {
+  if (code.startsWith('PLAN_')) return 'plan';
+  if (code.startsWith('PROGRESS_')) return 'progress_ledger';
+  if (code.startsWith('EVIDENCE_')) return 'evidence';
+  if (code.startsWith('CHANGE_')) return 'change_requests';
+  return 'active_goal';
+}
+
+function auditedFingerprint(event) {
+  if (event?.event_type !== 'final-audit') return null;
+  const match = /^Final audit sha256:([a-f0-9]{64}): .+$/s.exec(event.summary);
+  return match?.[1] ?? null;
+}
+
+/** 仅证明当前 goal 状态、证据和语义审计满足门禁，不扩张为代码正确性或不可逆完成声明。 */
+export async function gateGoalCompletion(root, inventory, context = {}) {
+  const results = Object.fromEntries(COMPLETION_CONDITIONS.map((condition) => [condition, false]));
+  const snapshot = await verifyGoalRepository(root, {
+    ...context,
+    [RETURN_VERIFIED_SNAPSHOT]: true,
+  });
+  if (!snapshot.result) {
+    const issueCode = snapshot.evidence?.issues?.[0]?.code ?? 'GOAL_REPOSITORY_TAMPERED';
+    results[failedRepositoryCondition(issueCode)] = false;
+    return {
+      state: 'BLOCKED',
+      goal: snapshot.evidence?.goal ?? null,
+      workspace_fingerprint: null,
+      checklist: completionChecklist(results),
+    };
+  }
+
+  const {
+    result,
+    current,
+    planState,
+    progressState,
+    evidenceState,
+    changeState,
+    reader,
+  } = snapshot;
+  results.active_goal = result.state !== 'DRAFT';
+  results.change_requests = changeState !== undefined && !changeState.pending;
+  results.plan = planState?.current !== null && planState?.current !== undefined;
+  results.progress_ledger = progressState !== undefined;
+  const plan = planState?.current?.value;
+  results.tasks = Boolean(plan) && plan.tasks.every((task) => task.status === 'complete');
+  results.evidence = Boolean(plan) && current.goal.acceptance_criteria.every((criterion) => {
+    const latest = evidenceState.latestByCriterion.get(criterion.id)?.value;
+    return latest?.state === 'pass'
+      && latest.goal.goal_id === current.goal.goal_id
+      && latest.goal.goal_version === current.goal.goal_version
+      && latest.goal.goal_digest === current.digest
+      && latest.plan_revision === plan.plan_revision;
+  });
+  const auditFingerprint = auditedFingerprint(progressState?.terminal);
+  results.final_audit = auditFingerprint !== null
+    && progressState.terminal.goal.goal_id === current.goal.goal_id
+    && progressState.terminal.goal.goal_version === current.goal.goal_version
+    && progressState.terminal.goal.goal_digest === current.digest
+    && progressState.terminal.plan_revision === plan?.plan_revision;
+
+  let fingerprint = null;
+  if (results.active_goal && results.plan && results.progress_ledger) {
+    try {
+      fingerprint = await fingerprintAcrossRepositoryRevalidation(root, inventory, reader, context);
+      results.workspace_fingerprint = results.final_audit && fingerprint === auditFingerprint;
+    } catch {
+      results.workspace_fingerprint = false;
+    }
+  }
+  const checklist = completionChecklist(results);
+  return {
+    state: checklist.every((item) => item.passed) ? 'COMPLETE' : 'BLOCKED',
+    goal: {
+      goal_id: current.goal.goal_id,
+      goal_version: current.goal.goal_version,
+      goal_digest: current.digest,
+    },
+    workspace_fingerprint: fingerprint,
+    checklist,
+  };
 }
 
 export async function proposeGoalChange(root, input, context = {}) {
