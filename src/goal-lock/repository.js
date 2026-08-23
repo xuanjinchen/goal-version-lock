@@ -36,6 +36,10 @@ function stateError(code, message) {
   return new GoalLockError(code, 'state', 3, message);
 }
 
+function approvalError(code, message) {
+  return new GoalLockError(code, 'approval', 5, message);
+}
+
 function inputError(code, message) {
   return new GoalLockError(code, 'input', 2, message);
 }
@@ -410,7 +414,7 @@ function verifyProgressChronology(previousEvent, event) {
   }
 }
 
-async function verifyProgressLedger(reader, rootNames, lock, goalHistory, planState, evidenceState) {
+async function verifyProgressLedger(reader, rootNames, lock, goalHistory, planState, evidenceState, changeState) {
   if (!rootNames.includes('progress.jsonl')) {
     if (lock.progress_head !== null) throw integrityError('PROGRESS_STATE_MISSING', 'Lock progress head requires a progress ledger.');
     if (planState.present) throw integrityError('PROGRESS_STATE_MISSING', 'A current plan requires its automatic progress ledger event.');
@@ -485,7 +489,7 @@ async function verifyProgressLedger(reader, rootNames, lock, goalHistory, planSt
     || terminal.event_digest !== lock.progress_head.digest) {
     throw integrityError('PROGRESS_HEAD_MISMATCH', 'Lock progress head does not match the terminal progress event.');
   }
-  verifyProgressPlanState(plans, eventsByPlan);
+  verifyProgressPlanState(plans, eventsByPlan, changeState);
   for (const record of evidenceState.records) {
     const matches = events.filter((event) => evidenceCreationEventMatchesRecord(event, record));
     if (matches.length !== 1) {
@@ -498,15 +502,13 @@ async function verifyProgressLedger(reader, rootNames, lock, goalHistory, planSt
   return { count, events, input, terminal };
 }
 
-function verifyProgressPlanState(plans, eventsByPlan) {
+function verifyProgressPlanState(plans, eventsByPlan, changeState) {
   const orderedPlans = [...plans.values()].sort((left, right) => (
     left.goal.goal_version - right.goal.goal_version
     || left.plan_revision - right.plan_revision
   ));
-  let previousGoalVersion = null;
   let previousStatuses = new Map();
   for (const plan of orderedPlans) {
-    if (plan.goal.goal_version !== previousGoalVersion) previousStatuses = new Map();
     const planKey = `${plan.goal.goal_version}/${plan.plan_revision}`;
     const planEvents = eventsByPlan.get(planKey);
     const lifecycleCount = planEvents.filter((event) => event.event_type === 'plan-revision').length;
@@ -517,11 +519,22 @@ function verifyProgressPlanState(plans, eventsByPlan) {
       );
     }
 
-    // 每个 revision 只继承上一 revision 的共享任务终态；首次出现的任务必须从 pending 回放。
+    // 新目标版本继承未受影响任务的终态；批准 CR 列出的任务例外地从 stale 开始，首次出现的任务仍从 pending 回放。
+    const approvedChange = plan.goal.goal_version > 1
+      ? [...changeState.records.values()].find((record) => (
+        record.value.status === 'approved'
+        && record.value.candidate_digest === plan.goal.goal_digest
+      ))
+      : null;
+    const invalidatedTasks = new Set(approvedChange?.value.affected_tasks ?? []);
     const replayedStatuses = new Map(plan.tasks.map((task) => [
       task.id,
-      previousStatuses.get(task.id) ?? 'pending',
+      invalidatedTasks.has(task.id) ? 'stale' : (previousStatuses.get(task.id) ?? 'pending'),
     ]));
+    if (plan.goal.goal_version > 1 && plan.plan_revision === 1
+      && planEvents.filter((event) => event.event_type === 'goal-change').length !== 1) {
+      throw integrityError('PROGRESS_GOAL_CHANGE_INVALID', 'Each approved goal version requires exactly one goal-change event.');
+    }
     for (const event of planEvents) {
       const transition = TASK_STATUS_TRANSITIONS[event.event_type];
       if (!transition) continue;
@@ -540,7 +553,6 @@ function verifyProgressPlanState(plans, eventsByPlan) {
         'Replayed task statuses do not match the bound plan revision.',
       );
     }
-    previousGoalVersion = plan.goal.goal_version;
     previousStatuses = replayedStatuses;
   }
 }
@@ -847,6 +859,7 @@ export async function verifyGoalRepository(root, context = {}) {
       history.goals,
       planState,
       evidenceState,
+      changeState,
     );
     verifyLockBindings(current, lockInput.lock, history.activeHistory, changeState);
     await reader.verifyInputs();
@@ -1135,6 +1148,22 @@ function appendProgressEntry(progressState, event) {
       ? { kind: 'sha256', digest: progressState.input.digest }
       : { kind: 'absent' },
     content: nextBytes,
+  };
+}
+
+function appendProgressEvents(progressState, events) {
+  const priorBytes = progressState.input?.bytes ?? Buffer.alloc(0);
+  const content = Buffer.concat([priorBytes, ...events.map((event) => canonicalBytes(event))]);
+  // 批量事件仍以已验证账本为不可变前缀，批准事务只能在尾部一次性追加其全部派生事件。
+  if (!content.subarray(0, priorBytes.length).equals(priorBytes)) {
+    throw integrityError('PROGRESS_PREFIX_MISMATCH', 'Progress ledger replacement did not preserve the verified prefix.');
+  }
+  return {
+    target: '.goal-lock/progress.jsonl',
+    expected: progressState.input
+      ? { kind: 'sha256', digest: progressState.input.digest }
+      : { kind: 'absent' },
+    content,
   };
 }
 
@@ -1644,5 +1673,204 @@ export async function rejectGoalChange(root, changeRequestId, reason, context = 
       status: 'rejected',
       reason,
     };
+  }, context);
+}
+
+export async function approveGoalChange(root, approval, context = {}) {
+  return withGoalLock(root, 'change-approve', async () => {
+    const snapshot = await verifyGoalRepository(root, {
+      ...context,
+      mutating: true,
+      [ACTIVE_WRITE]: true,
+      [RETURN_VERIFIED_SNAPSHOT]: true,
+    });
+    const proposed = snapshot.changeState.open;
+    if (!proposed || snapshot.result.state !== 'CHANGE_PENDING') {
+      throw approvalError('APPROVAL_STALE', 'Change approval requires one current proposed change request.');
+    }
+    if (approval !== proposed.value.approval_phrase) {
+      throw approvalError('APPROVAL_REJECTED', 'Change approval must exactly match the current proposal confirmation phrase.');
+    }
+
+    const { current, history, planState, progressState, evidenceState, lockInput } = snapshot;
+    const candidate = proposed.value.candidate_goal;
+    const candidateBytes = canonicalBytes(candidate);
+    const candidateDigest = sha256(candidateBytes);
+    if (candidateDigest !== proposed.value.candidate_digest) {
+      throw integrityError('CHANGE_CANDIDATE_MISMATCH', 'Approved change request candidate bytes do not match its recorded digest.');
+    }
+    const goalReference = {
+      goal_id: candidate.goal_id,
+      goal_version: candidate.goal_version,
+      goal_digest: candidateDigest,
+    };
+    const priorPlan = planState.current?.value ?? null;
+    const tasks = (priorPlan?.tasks ?? []).map((task) => ({
+      ...task,
+      status: proposed.value.affected_tasks.includes(task.id) ? 'stale' : task.status,
+    }));
+    const plan = validatePlanCriteria(validatePlan({
+      schema_version: 1,
+      goal: goalReference,
+      plan_revision: 1,
+      next_task_id: nextExecutableTaskId(tasks, null),
+      tasks,
+      deferred: priorPlan?.deferred ?? [],
+    }, goalReference), candidate);
+    const planBytes = canonicalBytes(plan);
+
+    const events = [];
+    let pendingProgress = { count: progressState.count, terminal: progressState.terminal };
+    const appendEvent = (input, recordedAt) => {
+      const event = buildProgressEvent(pendingProgress, goalReference, plan.plan_revision, input, context, recordedAt);
+      events.push(event);
+      pendingProgress = { count: pendingProgress.count + 1, terminal: event };
+      return event;
+    };
+    appendEvent({
+      event_type: 'plan-revision',
+      task_id: null,
+      summary: 'Recorded plan revision 1',
+      evidence_refs: [],
+    });
+    appendEvent({
+      event_type: 'goal-change',
+      task_id: null,
+      summary: `Approved goal change ${proposed.value.id}`,
+      evidence_refs: [],
+    });
+
+    const staleEvidence = [];
+    for (const criterionId of proposed.value.affected_criteria) {
+      const priorRecords = evidenceState.recordsByCriterion.get(criterionId) ?? [];
+      const latest = priorRecords.at(-1);
+      if (latest) {
+        if (priorRecords.length >= 9999) {
+          throw stateError('EVIDENCE_SEQUENCE_EXHAUSTED', 'Evidence sequence exhausted its four-digit identifier space.');
+        }
+        const task = plan.tasks.find((candidateTask) => (
+          candidateTask.id === latest.value.task_id
+          && candidateTask.acceptance_criteria.includes(criterionId)
+        ));
+        if (!task) {
+          throw stateError('EVIDENCE_INVALIDATION_TASK_MISSING', 'Affected evidence must retain its owning task in the new plan.');
+        }
+        const recordedAt = (context.now ?? (() => new Date().toISOString()))();
+        const evidence = validateEvidence({
+          ...latest.value,
+          evidence_id: `EVID-${String(priorRecords.length + 1).padStart(4, '0')}`,
+          goal: goalReference,
+          plan_revision: plan.plan_revision,
+          task_id: task.id,
+          state: 'stale',
+          supersedes: latest.value.evidence_id,
+          recorded_at: recordedAt,
+        }, goalReference);
+        const bytes = canonicalBytes(evidence);
+        const digest = sha256(bytes);
+        staleEvidence.push({ criterionId, evidence, bytes, digest });
+        appendEvent({
+          event_type: 'verification-result',
+          task_id: task.id,
+          summary: evidenceEventSummary(evidence, digest),
+          evidence_refs: [evidence.evidence_id],
+        }, recordedAt);
+      }
+      appendEvent({
+        event_type: 'evidence-invalidation',
+        task_id: null,
+        summary: `Invalidated evidence ${criterionId} for approved goal change ${proposed.value.id}`,
+        evidence_refs: [],
+      });
+    }
+
+    const approved = validateChangeRequest({ ...proposed.value, status: 'approved' });
+    const approvedBytes = canonicalBytes(approved);
+    const approvedDigest = sha256(approvedBytes);
+    const nextEvidenceHeads = { ...lockInput.lock.evidence_heads };
+    for (const record of staleEvidence) {
+      nextEvidenceHeads[record.criterionId] = {
+        evidence_id: record.evidence.evidence_id,
+        digest: record.digest,
+      };
+    }
+    const nextWithoutDigest = {
+      schema_version: 1,
+      goal_id: candidate.goal_id,
+      goal_version: candidate.goal_version,
+      goal_digest: candidateDigest,
+      approval_type: 'explicit-change',
+      proposal_digest: proposed.value.proposal_digest,
+      approved_at: (context.now ?? (() => new Date().toISOString()))(),
+      predecessor_digest: current.digest,
+      state_revision: lockInput.lock.state_revision + 1,
+      progress_head: { event_id: pendingProgress.terminal.event_id, digest: pendingProgress.terminal.event_digest },
+      change_head: { change_request_id: approved.id, digest: approvedDigest },
+      evidence_heads: nextEvidenceHeads,
+    };
+    const nextLock = validateLockRecord({
+      ...nextWithoutDigest,
+      record_digest: sha256(canonicalBytes(nextWithoutDigest)),
+    });
+
+    const entries = [];
+    for (const [goalVersion, goalRecord] of history.goals) {
+      entries.push({
+        target: `.goal-lock/history/goals/v${String(goalVersion).padStart(4, '0')}.json`,
+        expected: { kind: 'sha256', digest: goalRecord.digest },
+        content: goalRecord.bytes,
+      });
+    }
+    for (const archive of planState.archives) {
+      entries.push({ target: archive.target, expected: { kind: 'sha256', digest: archive.digest }, content: archive.bytes });
+    }
+    entries.push({
+      target: '.goal-lock/current.json',
+      expected: { kind: 'sha256', digest: current.digest },
+      content: candidateBytes,
+    });
+    entries.push({
+      target: `.goal-lock/history/goals/v${String(candidate.goal_version).padStart(4, '0')}.json`,
+      expected: { kind: 'absent' },
+      content: candidateBytes,
+    });
+    if (planState.current) {
+      entries.push({
+        target: `.goal-lock/history/plans/v${String(current.goal.goal_version).padStart(4, '0')}-r${String(priorPlan.plan_revision).padStart(4, '0')}.json`,
+        expected: { kind: 'absent' },
+        content: planState.current.bytes,
+      });
+      entries.push({ target: '.goal-lock/plan.json', expected: { kind: 'sha256', digest: planState.current.digest }, content: planBytes });
+    } else {
+      entries.push({ target: '.goal-lock/plan.json', expected: { kind: 'absent' }, content: planBytes });
+    }
+    for (const record of evidenceState.records) {
+      entries.push({ target: record.target, expected: { kind: 'sha256', digest: record.digest }, content: record.bytes });
+    }
+    for (const record of staleEvidence) {
+      entries.push({
+        target: `.goal-lock/evidence/${record.criterionId}/${record.evidence.evidence_id}.json`,
+        expected: { kind: 'absent' },
+        content: record.bytes,
+      });
+    }
+    entries.push(appendProgressEvents(progressState, events));
+    for (const record of snapshot.changeState.records.values()) {
+      entries.push({
+        target: record.target,
+        expected: { kind: 'sha256', digest: record.digest },
+        content: record.value.id === approved.id ? approvedBytes : record.bytes,
+      });
+    }
+    entries.push({ target: '.goal-lock/lock.json', expected: { kind: 'sha256', digest: lockInput.digest }, content: canonicalBytes(nextLock) });
+
+    // 目标、历史、计划、证据、账本、CR 与索引必须共用一次安装；任一文件失败时事务恢复整个已验证快照。
+    await snapshot.reader.verifyInputs();
+    await commitGoalFiles(root, entries, context);
+    const verification = await verifyGoalRepository(root, { ...context, [ACTIVE_WRITE]: true });
+    if (verification.state !== 'LOCKED') {
+      throw integrityError('APPROVED_CHANGE_VERIFICATION_FAILED', 'Approved goal change did not verify as locked.');
+    }
+    return { state: 'LOCKED', goal_version: candidate.goal_version };
   }, context);
 }
