@@ -735,6 +735,21 @@ async function proposeChangeForApproval(testContext, overrides = {}, withEvidenc
   return { fixture, repository, receipt };
 }
 
+async function goalLockByteSnapshot(directory, relative = '') {
+  const snapshot = new Map();
+  for (const name of await readdir(join(directory, relative))) {
+    const child = relative.length === 0 ? name : `${relative}/${name}`;
+    const target = join(directory, child);
+    const metadata = await lstat(target);
+    if (metadata.isDirectory()) {
+      for (const [path, bytes] of await goalLockByteSnapshot(directory, child)) snapshot.set(path, bytes);
+    } else {
+      snapshot.set(child, await readFile(target));
+    }
+  }
+  return snapshot;
+}
+
 test('exact change approval rejects generic, inexact, stale, competing, and tampered proposals', async (testContext) => {
   for (const approval of [
     'APPROVE',
@@ -911,32 +926,33 @@ test('selective invalidation preserves unaffected plan and evidence state and cr
   assert.equal((await repository.verifyGoalRepository(fixture.root, fixture)).state, 'LOCKED');
 });
 
-test('exact change approval rolls back every installed file when any installation fails', async (testContext) => {
+test('exact change approval rolls back the full repository at every actual installation point', async (testContext) => {
   const targets = [
-    '.goal-lock/history/goals/v0001.json',
     '.goal-lock/current.json',
     '.goal-lock/history/goals/v0002.json',
     '.goal-lock/history/plans/v0001-r0001.json',
     '.goal-lock/plan.json',
-    '.goal-lock/evidence/AC-001/EVID-0001.json',
     '.goal-lock/evidence/AC-001/EVID-0002.json',
     '.goal-lock/progress.jsonl',
     '.goal-lock/changes/CR-0001.json',
     '.goal-lock/lock.json',
   ];
-  for (const target of targets) {
+  for (const [index, target] of targets.entries()) {
     const { fixture, repository, receipt } = await proposeChangeForApproval(testContext, {}, true);
-    const before = await readFile(join(fixture.root, '.goal-lock', 'current.json'));
-    fixture.transactionFaults.finalReadBack = ({ targets: committed }) => {
-      if (!committed.includes(target)) throw new Error(`approval target missing from commit at ${target}`);
-      throw new Error(`approval final verification failure at ${target}`);
+    const directory = join(fixture.root, '.goal-lock');
+    const before = await goalLockByteSnapshot(directory);
+    const installed = [];
+    fixture.transactionFaults.install = ({ target: installedTarget }) => {
+      installed.push(installedTarget);
+      if (installedTarget === target) throw new Error(`approval install failure at ${target}`);
     };
     await assert.rejects(
       repository.approveGoalChange(fixture.root, 'CR-0001', receipt.approval_required, fixture),
-      new RegExp(`approval final verification failure at ${target.replace(/[.]/g, '\\.')}`),
+      new RegExp(`approval install failure at ${target.replace(/[.]/g, '\\.')}`),
       target,
     );
-    assert.deepEqual(await readFile(join(fixture.root, '.goal-lock', 'current.json')), before, target);
+    assert.deepEqual(installed, targets.slice(0, index + 1), target);
+    assert.deepEqual(await goalLockByteSnapshot(directory), before, target);
     assert.equal((await repository.verifyGoalRepository(fixture.root, fixture)).state, 'CHANGE_PENDING', target);
   }
 });
