@@ -53,8 +53,12 @@ function resolveGoalTarget(root, target) {
   if (segments.some((segment) => segment === '' || segment === '.' || segment === '..')) {
     throw pathIntegrity('Transaction targets must not contain empty, dot, or parent segments.');
   }
-  const basename = segments.at(-1);
-  if (basename === '.write-lock.json' || basename.endsWith('.stage') || basename.endsWith('.backup')) {
+  // 保留名在任意层级都代表内部所有权状态，不能借“作为目录”绕过末段检查。
+  const hasInternalSegment = segments.slice(1).some((segment) => segment === '.write-lock.json'
+    || segment.endsWith('.stage')
+    || segment.endsWith('.backup')
+    || segment.endsWith('.detached'));
+  if (hasInternalSegment) {
     throw pathIntegrity('Transaction targets must not name internal ownership artifacts.');
   }
   const absolute = path.resolve(root, ...segments);
@@ -195,11 +199,14 @@ async function rollbackEntries(prepared, context) {
     try {
       await invokeFault(context, 'rollback', { index, target: entry.target });
       if (entry.installed) {
-        const installed = await readTransactionFile(entry.absolute, 'Installed transaction target');
-        if (!sameIdentity(installed.snapshot, entry.staged.snapshot) || installed.digest !== entry.staged.digest) {
-          throw transactionIntegrity(`Rollback cannot prove installed target ownership: ${entry.target}`);
+        const installed = await optionalTransactionFile(entry.absolute, 'Installed transaction target');
+        if (installed) {
+          if (!sameIdentity(installed.snapshot, entry.staged.snapshot) || installed.digest !== entry.staged.digest) {
+            throw transactionIntegrity(`Rollback cannot prove installed target ownership: ${entry.target}`);
+          }
+          await unlink(entry.absolute);
         }
-        await unlink(entry.absolute);
+        // 安装名已消失时仍继续验证备份并用独占 link 恢复；名称被抢占则保留证据而不覆盖。
         entry.installed = false;
       }
       if (entry.detached) {
@@ -318,8 +325,8 @@ export async function recoverGoalLock(root, proof, context = {}) {
   await link(lockPath, recoveryPath);
   let detached = false;
   try {
-    const isolated = await readRegularFile(recoveryPath, 'Recovery lock evidence');
-    const current = await readRegularFile(lockPath, 'Cooperative lock');
+    const isolated = await readRegularFile(recoveryPath, 'Recovery lock evidence', { expectedLinks: 2n });
+    const current = await readRegularFile(lockPath, 'Cooperative lock', { expectedLinks: 2n });
     assertOwner(isolated, { digest: initial.digest, snapshot: initial.snapshot, token: owner.token });
     assertOwner(current, { digest: initial.digest, snapshot: initial.snapshot, token: owner.token });
     // 只有同一 inode 的隔离副本验证完成后才转移路径所有权，失败时绝不覆盖后来出现的锁。
@@ -338,16 +345,23 @@ export async function recoverGoalLock(root, proof, context = {}) {
     let restorationError;
     try {
       if (detached && !(await optionalLstat(lockPath))) {
+        const recoveryEvidence = await readRegularFile(recoveryPath, 'Recovery lock evidence');
+        assertOwner(recoveryEvidence, { digest: initial.digest, snapshot: initial.snapshot, token: owner.token });
         await link(recoveryPath, lockPath);
-        const restored = await readRegularFile(lockPath, 'Restored cooperative lock');
+        const restored = await readRegularFile(lockPath, 'Restored cooperative lock', { expectedLinks: 2n });
         assertOwner(restored, { digest: initial.digest, snapshot: initial.snapshot, token: owner.token });
+        const linkedEvidence = await readRegularFile(recoveryPath, 'Recovery lock evidence', { expectedLinks: 2n });
+        assertOwner(linkedEvidence, { digest: initial.digest, snapshot: initial.snapshot, token: owner.token });
         await unlink(recoveryPath);
+        const restoredOwner = await readRegularFile(lockPath, 'Restored cooperative lock');
+        assertOwner(restoredOwner, { digest: initial.digest, snapshot: initial.snapshot, token: owner.token });
       } else if (!detached) {
-        const evidence = await readRegularFile(recoveryPath, 'Recovery lock evidence');
-        const current = await readRegularFile(lockPath, 'Cooperative lock');
+        const evidence = await readRegularFile(recoveryPath, 'Recovery lock evidence', { expectedLinks: 2n });
+        const current = await readRegularFile(lockPath, 'Cooperative lock', { expectedLinks: 2n });
         // 未发生路径转移时，仅删除仍与当前锁同 inode 的临时硬链接，无法证明则保留证据。
         if (sameIdentity(evidence.snapshot, current.snapshot) && evidence.digest === current.digest) {
           await unlink(recoveryPath);
+          await readRegularFile(lockPath, 'Cooperative lock');
         } else {
           throw lockIntegrity('Recovery evidence ownership became uncertain.');
         }
@@ -517,22 +531,26 @@ async function invokeFault(context, phase, details) {
   if (typeof fault === 'function') await fault(details);
 }
 
-async function readRegularFile(target, label) {
+async function readRegularFile(target, label, { expectedLinks = 1n } = {}) {
   const namedBefore = await lstat(target, { bigint: true });
-  if (namedBefore.isSymbolicLink() || !namedBefore.isFile()) {
-    throw lockIntegrity(`${label} must be a regular file.`);
+  // 对外可见锁只能有一个名称；恢复流程必须显式声明其短暂创建的精确硬链接数。
+  if (namedBefore.isSymbolicLink() || !namedBefore.isFile() || namedBefore.nlink !== expectedLinks) {
+    throw lockIntegrity(`${label} must be a regular file with the expected link count.`);
   }
 
   const handle = await open(target, 'r');
   try {
     const openedBefore = await handle.stat({ bigint: true });
-    if (!sameIdentity(namedBefore, openedBefore) || !openedBefore.isFile()) {
+    if (!sameIdentity(namedBefore, openedBefore) || !openedBefore.isFile() || openedBefore.nlink !== expectedLinks) {
       throw lockIntegrity(`${label} identity changed while opening.`);
     }
     const bytes = await handle.readFile();
     const openedAfter = await handle.stat({ bigint: true });
     const namedAfter = await lstat(target, { bigint: true });
-    if (!sameSnapshot(openedBefore, openedAfter) || !sameSnapshot(openedAfter, namedAfter)) {
+    if (!sameSnapshot(openedBefore, openedAfter)
+      || !sameSnapshot(openedAfter, namedAfter)
+      || openedAfter.nlink !== expectedLinks
+      || namedAfter.nlink !== expectedLinks) {
       throw lockIntegrity(`${label} identity changed while reading.`);
     }
     return { bytes, digest: sha256(bytes), snapshot: namedAfter };

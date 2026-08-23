@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { mkdir, readFile, readdir, symlink, unlink, writeFile } from 'node:fs/promises';
+import { link, lstat, mkdir, readFile, readdir, symlink, unlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { test } from 'node:test';
 
@@ -209,6 +209,40 @@ test('cooperative lock rejects non-regular and linked lock paths', async (testCo
   );
 });
 
+test('cooperative lock rejects an external hard-linked existing owner', async (testContext) => {
+  const fixture = createGoalLockFixture(testContext);
+  const directory = join(fixture.root, '.goal-lock');
+  const lockPath = join(directory, '.write-lock.json');
+  const externalPath = join(fixture.root, 'external-owner.json');
+  const ownerBytes = canonicalBytes({
+    protocol: 'goal-version-lock-write-v1', token: 'external-owner', pid: 9999, command: 'record', created_at: '2026-08-22T00:00:00.000Z',
+  });
+  await mkdir(directory);
+  await writeFile(externalPath, ownerBytes);
+  await link(externalPath, lockPath);
+
+  await assert.rejects(
+    withGoalLock(fixture.root, 'init', async () => {}, fixture),
+    (error) => error instanceof GoalLockError && error.kind === 'integrity',
+  );
+  assert.deepEqual(await readFile(lockPath), ownerBytes);
+  assert.equal((await lstat(lockPath, { bigint: true })).nlink, 2n);
+});
+
+test('cooperative lock release refuses an external hard link added by its callback', async (testContext) => {
+  const fixture = createGoalLockFixture(testContext);
+  const lockPath = join(fixture.root, '.goal-lock', '.write-lock.json');
+  const externalPath = join(fixture.root, 'external-owner.json');
+
+  await assert.rejects(withGoalLock(fixture.root, 'record', async () => {
+    await link(lockPath, externalPath);
+  }, fixture), (error) => error instanceof GoalLockError && error.kind === 'integrity');
+
+  assert.equal(existsSync(lockPath), true);
+  assert.equal(existsSync(externalPath), true);
+  assert.equal((await lstat(lockPath, { bigint: true })).nlink, 2n);
+});
+
 test('transaction completes every target preflight before creating files', async (testContext) => {
   const fixture = createGoalLockFixture(testContext);
 
@@ -305,6 +339,23 @@ test('transaction rejects escaping and internal ownership targets', async (testC
   }
 });
 
+test('transaction rejects internal ownership artifact names in ancestor segments', async (testContext) => {
+  const targets = [
+    '.goal-lock/.write-lock.json/child.json',
+    '.goal-lock/.current.example.0.stage/child.json',
+    '.goal-lock/.current.example.0.backup/child.json',
+    '.goal-lock/.current.example.0.detached/child.json',
+  ];
+
+  for (const target of targets) {
+    const fixture = createGoalLockFixture(testContext);
+    await assert.rejects(commitGoalFiles(fixture.root, [
+      { target, expected: { kind: 'absent' }, content: Buffer.from('unsafe') },
+    ], fixture), (error) => error instanceof GoalLockError && error.kind === 'integrity');
+    assert.equal(existsSync(join(fixture.root, '.goal-lock')), false);
+  }
+});
+
 test('transaction rejects linked target parents before mutation', async (testContext) => {
   const fixture = createGoalLockFixture(testContext);
   const directory = join(fixture.root, '.goal-lock');
@@ -388,6 +439,25 @@ test('transaction read-back failure rolls back a verified installation', async (
 
   assert.deepEqual(await readFile(target), original);
   assert.deepEqual(await readdir(directory), ['current.json']);
+});
+
+test('transaction restores the original when the installed target disappears during verification', async (testContext) => {
+  for (const phase of ['readBack', 'finalReadBack']) {
+    const fixture = createGoalLockFixture(testContext);
+    const directory = join(fixture.root, '.goal-lock');
+    const target = join(directory, 'current.json');
+    const original = Buffer.from('accepted');
+    await mkdir(directory);
+    await writeFile(target, original);
+    fixture.transactionFaults[phase] = async () => { await unlink(target); };
+
+    await assert.rejects(commitGoalFiles(fixture.root, [
+      { target: '.goal-lock/current.json', expected: { kind: 'sha256', digest: sha256(original) }, content: Buffer.from('candidate') },
+    ], fixture), (error) => error instanceof Error && !(error instanceof AggregateError));
+
+    assert.deepEqual(await readFile(target), original);
+    assert.deepEqual(await readdir(directory), ['current.json']);
+  }
 });
 
 test('transaction final read-back detects a changed installed target', async (testContext) => {
@@ -511,6 +581,27 @@ test('recover removes an exact canonical lock only after its process is dead', a
   });
   assert.equal(Object.hasOwn(receipt, 'token'), false);
   assert.equal(existsSync(lockPath), false);
+});
+
+test('recover refuses an externally hard-linked lock', async (testContext) => {
+  const fixture = createGoalLockFixture(testContext);
+  const directory = join(fixture.root, '.goal-lock');
+  const lockPath = join(directory, '.write-lock.json');
+  const externalPath = join(fixture.root, 'external-owner.json');
+  const lockBytes = canonicalBytes({
+    protocol: 'goal-version-lock-write-v1', token: 'stale-owner', pid: 9999, command: 'record', created_at: '2026-08-22T00:00:00.000Z',
+  });
+  await mkdir(directory);
+  await writeFile(externalPath, lockBytes);
+  await link(externalPath, lockPath);
+
+  await assert.rejects(recoverGoalLock(fixture.root, {
+    owner_token: 'stale-owner',
+    lock_digest: sha256(lockBytes),
+  }, fixture), (error) => error instanceof GoalLockError && error.kind === 'integrity');
+
+  assert.deepEqual(await readFile(lockPath), lockBytes);
+  assert.equal((await lstat(lockPath, { bigint: true })).nlink, 2n);
 });
 
 test('recover rejects a missing lock without creating recovery state', async (testContext) => {
