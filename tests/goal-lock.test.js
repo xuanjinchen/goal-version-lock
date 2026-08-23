@@ -490,6 +490,30 @@ test('safe workspace preserves the first trusted snapshot when a path is read tw
   await assert.rejects(reader.readDirectory('.goal-lock/history'), (error) => error instanceof GoalLockError && error.kind === 'integrity');
 });
 
+test('safe workspace final verification rejects a replaced nested parent around the same file inode', async (testContext) => {
+  const fixture = createGoalLockFixture(testContext);
+  const history = join(fixture.root, '.goal-lock', 'history');
+  const goals = join(history, 'goals');
+  const detachedGoals = join(history, 'detached-goals');
+  const target = join(goals, 'v0001.json');
+  await mkdir(goals, { recursive: true });
+  await writeFile(target, '{"version":1}\n');
+  const { createWorkspaceReader } = await workspaceReader();
+  const reader = await createWorkspaceReader(fixture.root, fixture);
+  await reader.readFile('.goal-lock/history/goals/v0001.json');
+  const before = await lstat(target, { bigint: true });
+
+  await rename(goals, detachedGoals);
+  await mkdir(goals);
+  await rename(join(detachedGoals, 'v0001.json'), target);
+  await rm(detachedGoals, { recursive: true });
+  const after = await lstat(target, { bigint: true });
+  assert.equal(after.dev, before.dev);
+  assert.equal(after.ino, before.ino);
+
+  await assert.rejects(reader.verifyInputs(), (error) => error instanceof GoalLockError && error.kind === 'integrity');
+});
+
 test('verifies goal history for draft and locked version one without adopting observed bytes', async (testContext) => {
   const draftFixture = createGoalLockFixture(testContext);
   const { initializeGoal, lockInitialGoal, verifyGoalRepository } = await goalRepository();

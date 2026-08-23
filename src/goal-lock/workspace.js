@@ -107,12 +107,13 @@ export async function createWorkspaceReader(root, context = {}) {
   const captured = new Map();
 
   function captureInput(record) {
-    // 重读只能确认首次信任的快照，不能以较新的观察值覆盖信任基线。
+    // 重读只能确认首次信任的目标和父链，不能以较新的路径观察值覆盖信任基线。
     const trusted = captured.get(record.path);
     if (trusted
       && (trusted.kind !== record.kind
         || trusted.digest !== record.digest
-        || !sameSnapshot(trusted.snapshot, record.snapshot))) {
+        || !sameSnapshot(trusted.snapshot, record.snapshot)
+        || !sameParents(trusted.parents, record.parents))) {
       throw integrityError('WORKSPACE_INPUT_CHANGED', 'Workspace input changed after its first trusted read.');
     }
     if (!trusted) captured.set(record.path, record);
@@ -162,6 +163,7 @@ export async function createWorkspaceReader(root, context = {}) {
         bytes,
         digest: sha256(bytes),
         snapshot: namedAfter,
+        parents: parentsAfter,
       };
       if (capture) captureInput(record);
       return { bytes: Buffer.from(bytes), digest: record.digest };
@@ -199,7 +201,7 @@ export async function createWorkspaceReader(root, context = {}) {
         throw integrityError('WORKSPACE_DIRECTORY_RACED', 'Workspace directory changed while being read.');
       }
       const digest = sha256(canonicalBytes(names));
-      const record = { path: relativePath, kind: 'directory', names, digest, snapshot: after };
+      const record = { path: relativePath, kind: 'directory', names, digest, snapshot: after, parents: parentsAfter };
       if (capture) captureInput(record);
       return { names: [...names], digest };
     } catch (error) {
@@ -212,13 +214,21 @@ export async function createWorkspaceReader(root, context = {}) {
     await context.workspaceFaults?.beforeVerifyInputs?.();
     await validateRootIdentity(trustedRoot);
     for (const expected of [...captured.values()].sort((left, right) => left.path.localeCompare(right.path))) {
+      const segments = safeRelativePath(expected.path);
+      const parentsBefore = await validateParents(trustedRoot, segments);
+      if (!sameParents(expected.parents, parentsBefore)) {
+        throw integrityError('WORKSPACE_PARENT_CHANGED', 'Workspace input parent identity changed after verification began.');
+      }
       const observed = expected.kind === 'file'
         ? await readFileInput(expected.path, {}, false)
         : await readDirectoryInput(expected.path, {}, false);
-      const named = await lstat(path.join(canonicalRoot, ...safeRelativePath(expected.path)), { bigint: true });
+      const parentsAfter = await validateParents(trustedRoot, segments);
+      const named = await lstat(path.join(canonicalRoot, ...segments), { bigint: true });
       const digest = observed.digest;
-      // 最终复验既比较内容摘要也比较首次身份，任何外部改写都不能成为新的可信输入。
-      if (digest !== expected.digest || !sameSnapshot(named, expected.snapshot)) {
+      // 最终复验同时固定内容、目标和父链，任何路径替换都不能成为新的可信输入。
+      if (digest !== expected.digest
+        || !sameSnapshot(named, expected.snapshot)
+        || !sameParents(expected.parents, parentsAfter)) {
         throw integrityError('WORKSPACE_INPUT_CHANGED', 'Workspace input changed after verification began.');
       }
     }
