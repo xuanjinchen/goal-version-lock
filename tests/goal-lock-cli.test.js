@@ -478,6 +478,41 @@ test('real process dispatches propose, reject, approve, and recover-lock with ex
   assert.equal(recovery.code, 'RECOVERY_LOCK_MISSING');
 });
 
+test('real process keeps recover-lock usage failures at exit 2 without writes or sensitive echoes', async (testContext) => {
+  const root = await createCliFixture(testContext);
+  const validOwnerToken = '11111111-1111-4111-8111-111111111111';
+  const secondOwnerToken = '22222222-2222-4222-8222-222222222222';
+  const invalidOwnerToken = 'invalid-owner-token-DO-NOT-ECHO';
+  const lockDigest = '0'.repeat(64);
+  const before = await nonGoalLockSnapshot(root);
+  const cases = [
+    ['invalid UUID', [
+      'recover-lock', '--owner-token', invalidOwnerToken, '--lock-digest', lockDigest,
+    ]],
+    ['missing lock digest', [
+      'recover-lock', '--owner-token', validOwnerToken,
+    ]],
+    ['duplicate owner token', [
+      'recover-lock',
+      '--owner-token', validOwnerToken,
+      '--owner-token', secondOwnerToken,
+      '--lock-digest', lockDigest,
+    ]],
+  ];
+
+  for (const [label, argv] of cases) {
+    const processResult = await runProcess(root, argv);
+    const failure = parseFailure(processResult, 2, 'recover-lock');
+    assert.equal(failure.code, 'CLI_USAGE', label);
+    for (const sensitive of [invalidOwnerToken, validOwnerToken, secondOwnerToken, lockDigest]) {
+      assert.doesNotMatch(processResult.stderr, new RegExp(sensitive), label);
+    }
+  }
+
+  assert.deepEqual(await nonGoalLockSnapshot(root), before);
+  await assert.rejects(lstat(path.join(root, '.goal-lock')));
+});
+
 test('module input reader fails closed when a regular file changes after its bounded read', async (testContext) => {
   const root = await createCliFixture(testContext);
   const target = path.join(root, 'raced.json');

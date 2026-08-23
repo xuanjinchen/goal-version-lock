@@ -341,16 +341,18 @@ async function dispatchCommand(parsed, context) {
   }
 }
 
-function publicFailure(error, command) {
+function publicFailure(error, command, enteredDispatch) {
   const observedExitCode = Number.isInteger(error?.exitCode) && error.exitCode >= 2 && error.exitCode <= 6
     ? error.exitCode
     : 6;
-  // repository 保留自身错误分类；CLI 在边界统一消除批准、Git 与恢复命令的退出码歧义。
-  const exitCode = command === 'recover-lock'
-    ? 6
-    : error?.code === 'GOAL_IO_GIT'
+  // usage/input 的 2 优先保留；恢复类 6 只属于成功解析并已进入 recovery dispatch 的失败。
+  const exitCode = observedExitCode === 2
+    ? 2
+    : command === 'recover-lock' && enteredDispatch
       ? 6
-      : error?.code === 'APPROVAL_REJECTED' ? 5 : observedExitCode;
+      : error?.code === 'GOAL_IO_GIT'
+        ? 6
+        : error?.code === 'APPROVAL_REJECTED' ? 5 : observedExitCode;
   const messages = {
     2: 'Command usage or JSON input was rejected.',
     3: 'The requested goal-lock state transition was rejected.',
@@ -369,6 +371,7 @@ function publicFailure(error, command) {
 
 export async function runGoalLockCli(argv, context = {}) {
   let command = null;
+  let enteredDispatch = false;
   try {
     const parsed = parseGoalLockArgs(argv);
     command = parsed.command;
@@ -379,12 +382,13 @@ export async function runGoalLockCli(argv, context = {}) {
     if (typeof context.root !== 'string') {
       throw new CliError('WORKSPACE_ROOT_REQUIRED', 6, 'The governed project root is unavailable.');
     }
+    enteredDispatch = true;
     const result = await dispatchCommand(parsed, context);
     context.onExitCode?.(0);
     return { ok: true, command, result };
   } catch (error) {
     if (command === null && Array.isArray(argv) && Object.hasOwn(COMMAND_SPECS, argv[0])) command = argv[0];
-    const failure = publicFailure(error, command);
+    const failure = publicFailure(error, command, enteredDispatch);
     context.onExitCode?.(failure.exitCode);
     return { ok: false, command, error: failure.error };
   }
