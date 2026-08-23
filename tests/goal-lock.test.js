@@ -71,6 +71,70 @@ async function installVersionTwo(fixture, changeId = 'CR-0001') {
   return { goal, bytes, digest };
 }
 
+async function installNonHeadProposedChangeState(fixture) {
+  const directory = join(fixture.root, '.goal-lock');
+  const proposed = structuralChange('CR-0001', { status: 'proposed' });
+  const terminal = structuralChange('CR-0002', { status: 'rejected' });
+  const proposedBytes = canonicalBytes(proposed);
+  const terminalBytes = canonicalBytes(terminal);
+  await mkdir(join(directory, 'changes'));
+  await writeFile(join(directory, 'changes', 'CR-0001.json'), proposedBytes);
+  await writeFile(join(directory, 'changes', 'CR-0002.json'), terminalBytes);
+  await rewriteTestLock(fixture, (lock) => {
+    lock.state_revision += 2;
+    lock.change_head = { change_request_id: 'CR-0002', digest: independentSha256(terminalBytes) };
+  });
+  return { proposedBytes, terminalBytes };
+}
+
+async function installVersionThree(fixture, firstChangeStatus) {
+  const directory = join(fixture.root, '.goal-lock');
+  const versionTwo = await installVersionTwo(fixture);
+  const goal = {
+    ...versionTwo.goal,
+    goal_version: 3,
+    objective: 'Ship a three-version safe lock',
+    predecessor: { goal_version: 2, goal_digest: versionTwo.digest },
+    accepted_change_id: 'CR-0002',
+  };
+  const bytes = canonicalBytes(goal);
+  const digest = independentSha256(bytes);
+  const firstChangePath = join(directory, 'changes', 'CR-0001.json');
+  const firstChange = parseCanonicalJson(await readFile(firstChangePath), 'first test change');
+  firstChange.status = firstChangeStatus;
+  const firstChangeBytes = canonicalBytes(firstChange);
+  const secondChange = structuralChange('CR-0002', {
+    baseGoal: versionTwo.goal,
+    candidateGoal: goal,
+    status: 'approved',
+    recordedAt: '2026-08-23T02:00:00.000Z',
+  });
+  const secondChangeBytes = canonicalBytes(secondChange);
+  await writeFile(join(directory, 'current.json'), bytes);
+  await writeFile(join(directory, 'history', 'goals', 'v0003.json'), bytes);
+  await writeFile(firstChangePath, firstChangeBytes);
+  await writeFile(join(directory, 'changes', 'CR-0002.json'), secondChangeBytes);
+  const lockWithoutDigest = {
+    schema_version: 1,
+    goal_id: goal.goal_id,
+    goal_version: 3,
+    goal_digest: digest,
+    approval_type: 'explicit-change',
+    proposal_digest: secondChange.proposal_digest,
+    approved_at: '2026-08-23T02:00:00.000Z',
+    predecessor_digest: versionTwo.digest,
+    state_revision: 3,
+    progress_head: null,
+    change_head: { change_request_id: 'CR-0002', digest: independentSha256(secondChangeBytes) },
+    evidence_heads: {},
+  };
+  await writeFile(join(directory, 'lock.json'), canonicalBytes({
+    ...lockWithoutDigest,
+    record_digest: independentSha256(canonicalBytes(lockWithoutDigest)),
+  }));
+  return { goal, bytes, digest };
+}
+
 function activeGoalReference() {
   return {
     goal_id: 'GL-ALPHA',
@@ -548,6 +612,24 @@ test('rejects change transaction rollback restores the exact proposed request an
   assert.equal((await repository.verifyGoalRepository(fixture.root, fixture)).state, 'CHANGE_PENDING');
 });
 
+test('rejects change when the proposed request is not the terminal lock head', async (testContext) => {
+  const fixture = createGoalLockFixture(testContext);
+  const repository = await goalRepository();
+  await repository.initializeGoal(fixture.root, goalV1(), fixture);
+  await repository.lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 92d74f6bf766', fixture);
+  const before = await installNonHeadProposedChangeState(fixture);
+  const lockBefore = await readFile(join(fixture.root, '.goal-lock', 'lock.json'));
+
+  await assert.rejects(
+    repository.rejectGoalChange(fixture.root, 'CR-0001', 'Reject the non-head request', fixture),
+    (error) => error instanceof GoalLockError && error.kind === 'integrity',
+  );
+
+  assert.deepEqual(await readFile(join(fixture.root, '.goal-lock', 'changes', 'CR-0001.json')), before.proposedBytes);
+  assert.deepEqual(await readFile(join(fixture.root, '.goal-lock', 'changes', 'CR-0002.json')), before.terminalBytes);
+  assert.deepEqual(await readFile(join(fixture.root, '.goal-lock', 'lock.json')), lockBefore);
+});
+
 function refreshTestChange(record) {
   record.candidate_digest = independentSha256(canonicalBytes(record.candidate_goal));
   const {
@@ -628,6 +710,18 @@ test('change verification fails closed for malformed identity, digest, base, can
     await arrange(fixture);
     assert.equal((await repository.verifyGoalRepository(fixture.root, fixture)).state, 'TAMPERED', label);
   }
+});
+
+test('change verification rejects a proposed request that is not the terminal lock head', async (testContext) => {
+  const fixture = createGoalLockFixture(testContext);
+  const repository = await goalRepository();
+  await repository.initializeGoal(fixture.root, goalV1(), fixture);
+  await repository.lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 92d74f6bf766', fixture);
+  await installNonHeadProposedChangeState(fixture);
+
+  const verification = await repository.verifyGoalRepository(fixture.root, fixture);
+
+  assert.equal(verification.state, 'TAMPERED');
 });
 
 const PLAN_REVISION_EVENT_DIGEST = 'bdda7b3968a011b2229bb86936f21a2d51e9a070a992dcd573c91c4bb61e4b72';
@@ -2002,18 +2096,24 @@ function structuralProgressEvent(eventId = 'EVT-000001', eventDigest = '1'.repea
 }
 
 function structuralChange(changeId = 'CR-0001', options = {}) {
+  const baseGoal = options.baseGoal ?? goalV1();
+  const baseReference = {
+    goal_id: baseGoal.goal_id,
+    goal_version: baseGoal.goal_version,
+    goal_digest: independentSha256(canonicalBytes(baseGoal)),
+  };
   const candidateGoal = options.candidateGoal ?? {
-    ...goalV1(),
-    goal_version: 2,
+    ...baseGoal,
+    goal_version: baseGoal.goal_version + 1,
     objective: 'Ship an evolved safe lock',
-    predecessor: { goal_version: 1, goal_digest: activeGoalReference().goal_digest },
+    predecessor: { goal_version: baseGoal.goal_version, goal_digest: baseReference.goal_digest },
     accepted_change_id: changeId,
   };
-  const changes = [{ field: 'objective', before: 'Ship a safe lock', after: candidateGoal.objective }];
+  const changes = [{ field: 'objective', before: baseGoal.objective, after: candidateGoal.objective }];
   const payload = {
     schema_version: 1,
     id: changeId,
-    base_goal: activeGoalReference(),
+    base_goal: baseReference,
     candidate_goal: candidateGoal,
     candidate_digest: independentSha256(canonicalBytes(candidateGoal)),
     changes,
@@ -2023,7 +2123,7 @@ function structuralChange(changeId = 'CR-0001', options = {}) {
     risks: [],
     validation: ['Run verification'],
     rollback: ['Restore version one'],
-    recorded_at: '2026-08-23T01:00:00.000Z',
+    recorded_at: options.recordedAt ?? '2026-08-23T01:00:00.000Z',
   };
   const proposalDigest = independentSha256(canonicalBytes(payload));
   return {
@@ -2589,6 +2689,23 @@ test('verifies goal history follows predecessor versions, digests, and accepted 
 
     assert.equal(result.state, 'TAMPERED', field);
   }
+});
+
+test('verifies every historical goal is backed by its exact approved change request', async (testContext) => {
+  const { initializeGoal, lockInitialGoal, verifyGoalRepository } = await goalRepository();
+  const invalid = createGoalLockFixture(testContext);
+  await initializeGoal(invalid.root, goalV1(), invalid);
+  await lockInitialGoal(invalid.root, 'APPROVE GOAL GL-ALPHA VERSION 1 92d74f6bf766', invalid);
+  await installVersionThree(invalid, 'rejected');
+
+  assert.equal((await verifyGoalRepository(invalid.root, invalid)).state, 'TAMPERED');
+
+  const valid = createGoalLockFixture(testContext);
+  await initializeGoal(valid.root, goalV1(), valid);
+  await lockInitialGoal(valid.root, 'APPROVE GOAL GL-ALPHA VERSION 1 92d74f6bf766', valid);
+  await installVersionThree(valid, 'approved');
+
+  assert.equal((await verifyGoalRepository(valid.root, valid)).state, 'LOCKED');
 });
 
 test('verifies goal history preflights optional state and reports a pending change', async (testContext) => {

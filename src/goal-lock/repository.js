@@ -310,8 +310,7 @@ async function verifyChangeState(reader, rootNames, lock, current, goalHistory) 
     throw integrityError('CHANGE_SEQUENCE_INVALID', 'Change request IDs must be unique and contiguous from CR-0001.');
   }
   const records = new Map();
-  let pending = false;
-  const openTargets = new Set();
+  let open = null;
   for (const name of directory.names) {
     const record = await readCanonicalObject(reader, `.goal-lock/changes/${name}`, 'change request');
     const changeId = name.slice(0, -5);
@@ -336,13 +335,11 @@ async function verifyChangeState(reader, rootNames, lock, current, goalHistory) 
       }
     }
     if (value.status === 'proposed') {
-      const target = `${value.base_goal.goal_version}/${value.candidate_goal.goal_version}`;
-      if (openTargets.has(target)) throw integrityError('CHANGE_OPEN_DUPLICATE', 'Only one proposed change may target a base and candidate version.');
-      openTargets.add(target);
+      if (open !== null) throw integrityError('CHANGE_OPEN_DUPLICATE', 'Only one proposed change request may exist.');
       if (value.base_goal.goal_version !== current.goal.goal_version || value.base_goal.goal_digest !== current.digest) {
         throw integrityError('CHANGE_BASE_STALE', 'Proposed change request base must equal the active goal.');
       }
-      pending = true;
+      open = { ...record, value, target: `.goal-lock/changes/${name}` };
     }
     records.set(changeId, { ...record, value, target: `.goal-lock/changes/${name}` });
   }
@@ -351,7 +348,33 @@ async function verifyChangeState(reader, rootNames, lock, current, goalHistory) 
   if (lock.change_head?.change_request_id !== terminalId || lock.change_head?.digest !== terminal.digest) {
     throw integrityError('CHANGE_HEAD_MISMATCH', 'Lock change head must match the terminal change request record.');
   }
-  return { count: records.size, pending, records };
+  // 唯一 proposed 记录必须同时是数值终项和锁 head，拒绝操作才不会把完整性索引回退到历史 CR。
+  if (open !== null && open.value.id !== terminalId) {
+    throw integrityError('CHANGE_OPEN_HEAD_MISMATCH', 'The proposed change request must be the terminal lock head.');
+  }
+  return { count: records.size, pending: open !== null, open, records };
+}
+
+function verifyHistoricalChangeBindings(goalHistory, changeState) {
+  // 每个非初始目标都反向绑定自己的 approved CR，不能只验证当前 tip 而遗漏中间版本。
+  for (const [version, goalRecord] of goalHistory) {
+    if (version === 1) continue;
+    const predecessor = goalHistory.get(version - 1);
+    const accepted = changeState.records.get(goalRecord.goal.accepted_change_id);
+    if (!predecessor
+      || !accepted
+      || accepted.value.status !== 'approved'
+      || accepted.value.base_goal.goal_id !== predecessor.goal.goal_id
+      || accepted.value.base_goal.goal_version !== predecessor.goal.goal_version
+      || accepted.value.base_goal.goal_digest !== predecessor.digest
+      || accepted.value.candidate_digest !== goalRecord.digest
+      || !accepted.value.candidate_goal.predecessor
+      || accepted.value.candidate_goal.predecessor.goal_version !== predecessor.goal.goal_version
+      || accepted.value.candidate_goal.predecessor.goal_digest !== predecessor.digest
+      || !canonicalBytes(accepted.value.candidate_goal).equals(goalRecord.bytes)) {
+      throw integrityError('GOAL_HISTORY_CHANGE_MISMATCH', 'Each noninitial goal version must bind its exact approved change request.');
+    }
+  }
 }
 
 function verifyChangeReferences(changeState, planState) {
@@ -807,6 +830,7 @@ export async function verifyGoalRepository(root, context = {}) {
     const lockInput = await readLock(reader);
     const history = await verifyGoalHistory(reader, current, lockInput.lock);
     const changeState = await verifyChangeState(reader, rootNames, lockInput.lock, current, history.goals);
+    verifyHistoricalChangeBindings(history.goals, changeState);
     const planState = await verifyPlanState(reader, rootNames, current, history.goals);
     verifyChangeReferences(changeState, planState);
     const evidenceState = await verifyEvidenceState(
@@ -1588,7 +1612,7 @@ export async function rejectGoalChange(root, changeRequestId, reason, context = 
     }
     const record = snapshot.changeState.records.get(changeRequestId);
     if (!record) throw stateError('CHANGE_NOT_FOUND', 'The selected change request does not exist.');
-    if (record.value.status !== 'proposed') {
+    if (snapshot.changeState.open?.value.id !== changeRequestId) {
       throw stateError('CHANGE_NOT_OPEN', 'Only an exact proposed change request may be rejected.');
     }
     if (snapshot.result.state !== 'CHANGE_PENDING') {
