@@ -1,7 +1,7 @@
 {
-  "name": "skill-development-scaffold",
+  "name": "goal-version-lock",
   "version": "0.1.0",
-  "description": "Executable Node.js scaffold for developing mature Agent Skills.",
+  "description": "Keep development work aligned to an approved versioned goal contract by gating goal changes, planning, progress evidence, and completion.",
   "private": true,
   "type": "module",
   "engines": {
@@ -17,20 +17,11 @@
     "gate:delivery": "node scripts/delivery-gate.js"
   },
   "files": [
-    "AGENTS.md",
-    "CHANGELOG.md",
-    "CONTRIBUTING.md",
-    "LICENSE",
-    "README.md",
-    "SECURITY.md",
-    "docs",
-    "scripts",
-    "src",
-    "templates"
+    "SKILL.md"
   ],
   "license": "Apache-2.0",
   "scaffold": {
-    "mode": "source",
+    "mode": "initialized",
     "version": "0.1.0"
   }
 }

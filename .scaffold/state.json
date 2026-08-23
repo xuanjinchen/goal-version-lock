@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "scaffold_version": "0.1.0",
+  "status": "draft",
+  "skill": {
+    "name": "goal-version-lock",
+    "description": "Keep development work aligned to an approved versioned goal contract by gating goal changes, planning, progress evidence, and completion.",
+    "license": "Apache-2.0"
+  },
+  "initialized_at": "2026-08-23",
+  "initial_files": {
+    "LICENSE": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
+    "README.md": "edf3018bef3a1a773d67fedad4a9998f4dea10d91a67984986b57d81a5e2ba05",
+    "SKILL.md": "9ab2b0322cc8cfa58b86c9c39d2ddde6b014b751613c64683e8b5fc1434aea23",
+    "docs/decisions.md": "ff46c52aba621ec361f228be18b53dc6a2f64e6e71cf421b6ce0cbd907527792",
+    "docs/delivery-report.md": "2dd5e95e1ab25feda48c977084a6fe0e1f93f030df44aacaff43dc373c1a7441",
+    "docs/skill-brief.md": "f26e7e0db07baf9536bca0a738c070d73a3c16ac315d6b65f2147121431172e2",
+    "evals/evals.json": "ec8f78b0a5a568eac8fa6aaf0bd846b2e5dac489a9f919488f08ad17bbc524c3",
+    "package-lock.json": "9c160e6dd24a3f0011d4e01c21353ce669b8c7c238844f67a0071e8089b3495c",
+    "package.json": "6ecbbdbf28838d9a7b1a5a9a4da4894d338e3c0803a3c1803f943113c335cd24"
+  }
+}
