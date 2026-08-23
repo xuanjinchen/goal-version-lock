@@ -2,7 +2,14 @@ import { lstat, readdir, readFile, realpath, rmdir } from 'node:fs/promises';
 import path from 'node:path';
 
 import { canonicalBytes, parseCanonicalJson, sha256 } from './canonical.js';
-import { GoalLockError, normalizeRelativePath, validateGoalContract, validateLockRecord, validatePlan } from './contracts.js';
+import {
+  GoalLockError,
+  normalizeRelativePath,
+  validateGoalContract,
+  validateLockRecord,
+  validatePlan,
+  validateProgressEvent,
+} from './contracts.js';
 import { commitGoalFiles, withGoalLock } from './transaction.js';
 import { createWorkspaceReader } from './workspace.js';
 
@@ -213,25 +220,6 @@ function validateGoalReference(value, label) {
   structuralDigest(value.goal_digest, `${label}.goal_digest`);
 }
 
-function validateProgressEnvelope(value) {
-  const label = 'progress event';
-  requiredFields(value, label, ['schema_version', 'event_id', 'recorded_at', 'goal', 'plan_revision', 'task_id', 'event_type', 'summary', 'evidence_refs', 'previous_event_digest', 'event_digest']);
-  if (value.schema_version !== 1) throw integrityError('PROGRESS_STATE_INVALID', 'Progress event schema_version must equal 1.');
-  structuralIdentifier(value.event_id, STRUCTURAL_IDENTIFIERS.event, `${label}.event_id`);
-  structuralTimestamp(value.recorded_at, `${label}.recorded_at`);
-  validateGoalReference(value.goal, `${label}.goal`);
-  structuralPositiveInteger(value.plan_revision, `${label}.plan_revision`);
-  if (value.task_id !== null) structuralIdentifier(value.task_id, STRUCTURAL_IDENTIFIERS.task, `${label}.task_id`);
-  structuralText(value.event_type, `${label}.event_type`);
-  structuralText(value.summary, `${label}.summary`);
-  for (const evidenceId of structuralArray(value.evidence_refs, `${label}.evidence_refs`)) {
-    structuralIdentifier(evidenceId, STRUCTURAL_IDENTIFIERS.evidence, `${label}.evidence_refs`);
-  }
-  if (value.previous_event_digest !== null) structuralDigest(value.previous_event_digest, `${label}.previous_event_digest`);
-  structuralDigest(value.event_digest, `${label}.event_digest`);
-  return value;
-}
-
 function validateChangeEnvelope(value, expectedId) {
   const label = 'change request';
   requiredFields(value, label, ['schema_version', 'id', 'status', 'base_goal', 'candidate_goal', 'candidate_digest', 'proposal_digest', 'changes', 'rationale', 'affected_tasks', 'affected_criteria', 'risks', 'validation', 'rollback', 'approval_phrase', 'recorded_at']);
@@ -392,44 +380,82 @@ async function verifyChangeState(reader, rootNames, lock) {
   return { count: records.size, pending, records };
 }
 
-async function verifyProgressLedger(reader, rootNames, lock) {
+async function verifyProgressLedger(reader, rootNames, lock, goalHistory, planState, evidenceState) {
   if (!rootNames.includes('progress.jsonl')) {
     if (lock.progress_head !== null) throw integrityError('PROGRESS_STATE_MISSING', 'Lock progress head requires a progress ledger.');
-    return { count: 0 };
+    if (planState.present) throw integrityError('PROGRESS_STATE_MISSING', 'A current plan requires its automatic progress ledger event.');
+    return { count: 0, events: [], input: null, terminal: null };
   }
   const input = await reader.readFile('.goal-lock/progress.jsonl');
   if (input.bytes.length === 0 || input.bytes.at(-1) !== 0x0a) {
     throw integrityError('PROGRESS_STATE_INVALID', 'Progress ledger must contain canonical JSON lines.');
   }
+  const plans = new Map(planState.archives.map((archive) => [
+    `${archive.value.goal.goal_version}/${archive.value.plan_revision}`,
+    archive.value,
+  ]));
+  if (planState.current) {
+    plans.set(
+      `${planState.current.value.goal.goal_version}/${planState.current.value.plan_revision}`,
+      planState.current.value,
+    );
+  }
   let count = 0;
   let offset = 0;
   let terminal = null;
+  const events = [];
   while (offset < input.bytes.length) {
     const terminator = input.bytes.indexOf(0x0a, offset);
     const line = input.bytes.subarray(offset, terminator + 1);
+    let event;
     try {
-      terminal = validateProgressEnvelope(plainStructuralObject(parseCanonicalJson(line, 'progress event'), 'progress event'));
+      event = validateProgressEvent(
+        plainStructuralObject(parseCanonicalJson(line, 'progress event'), 'progress event'),
+        terminal?.event_digest ?? null,
+      );
     } catch (error) {
       throw repositoryIntegrity('PROGRESS_STATE_INVALID', 'Progress ledger contains a malformed or noncanonical event.', error);
     }
+    const expectedId = `EVT-${String(count + 1).padStart(6, '0')}`;
+    if (event.event_id !== expectedId) {
+      throw integrityError('PROGRESS_SEQUENCE_INVALID', 'Progress event IDs must be unique and contiguous from EVT-000001.');
+    }
+    const historicalGoal = goalHistory.get(event.goal.goal_version);
+    if (!historicalGoal
+      || historicalGoal.goal.goal_id !== event.goal.goal_id
+      || historicalGoal.digest !== event.goal.goal_digest) {
+      throw integrityError('PROGRESS_GOAL_MISMATCH', 'Progress event does not bind a known goal version.');
+    }
+    const plan = plans.get(`${event.goal.goal_version}/${event.plan_revision}`);
+    if (!plan) throw integrityError('PROGRESS_PLAN_MISMATCH', 'Progress event does not bind a known plan revision.');
+    if (event.task_id !== null && !plan.tasks.some((task) => task.id === event.task_id)) {
+      throw integrityError('PROGRESS_TASK_UNKNOWN', 'Progress event references an unknown task.');
+    }
+    if (event.evidence_refs.some((evidenceId) => !evidenceState.recordsById.has(evidenceId))) {
+      throw integrityError('PROGRESS_EVIDENCE_UNKNOWN', 'Progress event references unknown evidence.');
+    }
+    terminal = event;
+    events.push(event);
     count += 1;
     offset = terminator + 1;
   }
-  if (lock.progress_head !== null
-    && (terminal.event_id !== lock.progress_head.event_id || terminal.event_digest !== lock.progress_head.digest)) {
+  if (lock.progress_head === null
+    || terminal.event_id !== lock.progress_head.event_id
+    || terminal.event_digest !== lock.progress_head.digest) {
     throw integrityError('PROGRESS_HEAD_MISMATCH', 'Lock progress head does not match the terminal progress event.');
   }
-  return { count };
+  return { count, events, input, terminal };
 }
 
 async function verifyEvidenceState(reader, rootNames, lock) {
   if (!rootNames.includes('evidence')) {
     if (Object.keys(lock.evidence_heads).length > 0) throw integrityError('EVIDENCE_STATE_MISSING', 'Lock evidence heads require evidence state.');
-    return { count: 0 };
+    return { count: 0, recordsById: new Map() };
   }
   const evidenceRoot = await reader.readDirectory('.goal-lock/evidence');
   let count = 0;
   const records = new Map();
+  const recordsById = new Map();
   for (const criterion of evidenceRoot.names) {
     if (!/^AC-[0-9]{3}$/.test(criterion)) {
       throw integrityError('EVIDENCE_STATE_INVALID', 'Evidence state contains an unexpected criterion directory.');
@@ -442,7 +468,11 @@ async function verifyEvidenceState(reader, rootNames, lock) {
       const record = await readCanonicalObject(reader, `.goal-lock/evidence/${criterion}/${name}`, 'evidence record');
       const evidenceId = name.slice(0, -5);
       validateEvidenceEnvelope(record.value, criterion, evidenceId);
+      if (recordsById.has(evidenceId)) {
+        throw integrityError('EVIDENCE_STATE_INVALID', 'Evidence IDs must be unique across the repository.');
+      }
       records.set(`${criterion}/${evidenceId}`, record.digest);
+      recordsById.set(evidenceId, record);
       count += 1;
     }
   }
@@ -451,7 +481,7 @@ async function verifyEvidenceState(reader, rootNames, lock) {
       throw integrityError('EVIDENCE_HEAD_MISMATCH', 'Lock evidence head does not match its evidence record.');
     }
   }
-  return { count };
+  return { count, recordsById };
 }
 
 async function readCurrentGoal(reader) {
@@ -587,10 +617,17 @@ export async function verifyGoalRepository(root, context = {}) {
 
     const lockInput = await readLock(reader);
     const changeState = await verifyChangeState(reader, rootNames, lockInput.lock);
-    const progressState = await verifyProgressLedger(reader, rootNames, lockInput.lock);
     const evidenceState = await verifyEvidenceState(reader, rootNames, lockInput.lock);
     const history = await verifyGoalHistory(reader, current, lockInput.lock);
     const planState = await verifyPlanState(reader, rootNames, current, history.goals);
+    const progressState = await verifyProgressLedger(
+      reader,
+      rootNames,
+      lockInput.lock,
+      history.goals,
+      planState,
+      evidenceState,
+    );
     verifyLockBindings(current, lockInput.lock, history.activeHistory, changeState);
     await reader.verifyInputs();
     const optional = {
@@ -604,7 +641,7 @@ export async function verifyGoalRepository(root, context = {}) {
       evidence: verificationEvidence(reader, current, optional),
     };
     return context[RETURN_VERIFIED_SNAPSHOT] === true
-      ? { result, reader, current, rootNames, lockInput, planState, history }
+      ? { result, reader, current, rootNames, lockInput, planState, progressState, evidenceState, history }
       : result;
   } catch (error) {
     const failure = repositoryIntegrity('GOAL_REPOSITORY_TAMPERED', 'Goal repository integrity verification failed.', error);
@@ -715,6 +752,131 @@ function validatePlanCandidate(candidate) {
   return candidate;
 }
 
+function validateGoalEventInput(input) {
+  if (input === null
+    || typeof input !== 'object'
+    || Array.isArray(input)
+    || (Object.getPrototypeOf(input) !== Object.prototype && Object.getPrototypeOf(input) !== null)) {
+    throw inputError('INVALID_EVENT_INPUT', 'Progress event input must be an object.');
+  }
+  const fields = ['kind', 'event_type', 'task_id', 'summary', 'evidence_refs'];
+  const keys = Object.keys(input);
+  if (keys.length !== fields.length || fields.some((field) => !Object.hasOwn(input, field))) {
+    throw inputError('INVALID_EVENT_INPUT', 'Progress event input must contain exactly kind, event_type, task_id, summary, and evidence_refs.');
+  }
+  if (input.kind !== 'progress') throw inputError('INVALID_EVENT_INPUT', 'Progress event kind must equal progress.');
+  return input;
+}
+
+function buildProgressEvent(progressState, goalReference, planRevision, input, context) {
+  const eventId = `EVT-${String(progressState.count + 1).padStart(6, '0')}`;
+  const withoutDigest = {
+    schema_version: 1,
+    event_id: eventId,
+    recorded_at: (context.now ?? (() => new Date().toISOString()))(),
+    goal: goalReference,
+    plan_revision: planRevision,
+    task_id: input.task_id,
+    event_type: input.event_type,
+    summary: input.summary,
+    evidence_refs: input.evidence_refs,
+    previous_event_digest: progressState.terminal?.event_digest ?? null,
+  };
+  // 摘要载荷含前链指针，事件摘要字段本身不参与计算。
+  let eventDigest;
+  try {
+    eventDigest = sha256(canonicalBytes(withoutDigest));
+  } catch {
+    throw inputError('INVALID_EVENT_INPUT', 'Progress event input must contain only canonical JSON values.');
+  }
+  const event = { ...withoutDigest, event_digest: eventDigest };
+  return validateProgressEvent(event, withoutDigest.previous_event_digest);
+}
+
+function appendProgressEntry(progressState, event) {
+  const priorBytes = progressState.input?.bytes ?? Buffer.alloc(0);
+  const nextBytes = Buffer.concat([priorBytes, canonicalBytes(event)]);
+  // 全文件替换仍须逐字节保留已验证账本前缀，并绑定此前文件的精确摘要所有权。
+  if (!nextBytes.subarray(0, priorBytes.length).equals(priorBytes)) {
+    throw integrityError('PROGRESS_PREFIX_MISMATCH', 'Progress ledger replacement did not preserve the verified prefix.');
+  }
+  return {
+    target: '.goal-lock/progress.jsonl',
+    expected: progressState.input
+      ? { kind: 'sha256', digest: progressState.input.digest }
+      : { kind: 'absent' },
+    content: nextBytes,
+  };
+}
+
+function nextLockForEvent(lockInput, event) {
+  const { record_digest: _recordDigest, ...withoutDigest } = lockInput.lock;
+  const nextWithoutDigest = {
+    ...withoutDigest,
+    state_revision: lockInput.lock.state_revision + 1,
+    progress_head: { event_id: event.event_id, digest: event.event_digest },
+  };
+  return validateLockRecord({
+    ...nextWithoutDigest,
+    record_digest: sha256(canonicalBytes(nextWithoutDigest)),
+  });
+}
+
+function verifiedHistoryEntries(current, history, planState) {
+  const entries = [{
+    target: '.goal-lock/current.json',
+    expected: { kind: 'sha256', digest: current.digest },
+    content: current.bytes,
+  }];
+  for (const [goalVersion, goalRecord] of history.goals) {
+    entries.push({
+      target: `.goal-lock/history/goals/v${String(goalVersion).padStart(4, '0')}.json`,
+      expected: { kind: 'sha256', digest: goalRecord.digest },
+      content: goalRecord.bytes,
+    });
+  }
+  for (const archive of planState.archives) {
+    entries.push({
+      target: archive.target,
+      expected: { kind: 'sha256', digest: archive.digest },
+      content: archive.bytes,
+    });
+  }
+  return entries;
+}
+
+function nextExecutableTaskId(tasks, currentNextTaskId) {
+  const tasksById = new Map(tasks.map((task) => [task.id, task]));
+  const executable = tasks.filter((task) => ['pending', 'in_progress'].includes(task.status)
+    && task.dependencies.every((dependencyId) => tasksById.get(dependencyId).status === 'complete'));
+  if (executable.some((task) => task.id === currentNextTaskId)) return currentNextTaskId;
+  return executable[0]?.id ?? null;
+}
+
+function planAfterTaskEvent(plan, eventType, taskId, goal) {
+  const nextStatusByEvent = {
+    'task-start': { from: 'pending', to: 'in_progress' },
+    'task-complete': { from: 'in_progress', to: 'complete' },
+    blocker: { from: 'in_progress', to: 'blocked' },
+  };
+  const transition = nextStatusByEvent[eventType];
+  if (!transition) return plan;
+  const task = plan.tasks.find((candidate) => candidate.id === taskId);
+  if (task.status !== transition.from) {
+    throw stateError('TASK_STATUS_REJECTED', `${eventType} requires task ${taskId} to be ${transition.from}.`);
+  }
+  // 任务状态写入当前计划供恢复使用；同 revision 的摘要链保留不可变审计历史。
+  const tasks = plan.tasks.map((candidate) => candidate.id === taskId
+    ? { ...candidate, status: transition.to }
+    : candidate);
+  const updated = validatePlan({
+    ...plan,
+    tasks,
+    next_task_id: nextExecutableTaskId(tasks, plan.next_task_id),
+  }, plan.goal);
+  return validatePlanCriteria(updated, goal);
+}
+
 export async function revisePlan(root, candidate, classification, context = {}) {
   if (!['aligned', 'implementation-choice'].includes(classification)) {
     throw inputError('INVALID_CLASSIFICATION', 'Plan classification must be aligned or implementation-choice.');
@@ -734,7 +896,7 @@ export async function revisePlan(root, candidate, classification, context = {}) 
     }
 
     // 事务预条件必须复用同一验证快照，不能用第二次读取覆盖已信任的基线。
-    const { reader, current, lockInput, planState, history } = snapshot;
+    const { reader, current, lockInput, planState, progressState, history } = snapshot;
     const priorPlan = planState.current;
     const planRevision = priorPlan ? priorPlan.value.plan_revision + 1 : 1;
     const goalReference = {
@@ -751,21 +913,14 @@ export async function revisePlan(root, candidate, classification, context = {}) 
       deferred: candidate.deferred,
     }, goalReference), current.goal);
     const planBytes = canonicalBytes(plan);
+    const event = buildProgressEvent(progressState, goalReference, planRevision, {
+      event_type: 'plan-revision',
+      task_id: null,
+      summary: `Recorded plan revision ${planRevision}`,
+      evidence_refs: [],
+    }, context);
 
-    const historyGoalTarget = `.goal-lock/history/goals/v${String(current.goal.goal_version).padStart(4, '0')}.json`;
-    const historyGoal = history.activeHistory;
-    // 当前目标及其历史只作为事务所有权前提，相同字节不会被替换。
-    const entries = [
-      { target: '.goal-lock/current.json', expected: { kind: 'sha256', digest: current.digest }, content: current.bytes },
-      { target: historyGoalTarget, expected: { kind: 'sha256', digest: historyGoal.digest }, content: historyGoal.bytes },
-    ];
-    for (const archive of planState.archives) {
-      entries.push({
-        target: archive.target,
-        expected: { kind: 'sha256', digest: archive.digest },
-        content: archive.bytes,
-      });
-    }
+    const entries = verifiedHistoryEntries(current, history, planState);
     if (priorPlan) {
       const archiveTarget = `.goal-lock/history/plans/v${String(current.goal.goal_version).padStart(4, '0')}-r${String(priorPlan.value.plan_revision).padStart(4, '0')}.json`;
       // 当前计划的原始字节只转移到尚不存在的版本化名称，既不重编码也不覆盖历史。
@@ -775,14 +930,9 @@ export async function revisePlan(root, candidate, classification, context = {}) 
       entries.push({ target: '.goal-lock/plan.json', expected: { kind: 'absent' }, content: planBytes });
     }
 
-    const { record_digest: _recordDigest, ...lockWithoutDigest } = lockInput.lock;
-    const nextLockWithoutDigest = { ...lockWithoutDigest, state_revision: lockInput.lock.state_revision + 1 };
-    const nextLock = {
-      ...nextLockWithoutDigest,
-      record_digest: sha256(canonicalBytes(nextLockWithoutDigest)),
-    };
-    validateLockRecord(nextLock);
-    // 计划与锁索引在同一事务中推进；进度、变更和证据头保持原值。
+    entries.push(appendProgressEntry(progressState, event));
+    const nextLock = nextLockForEvent(lockInput, event);
+    // 新计划、自动生命周期事件与完整性索引只共同推进一次状态 revision。
     entries.push({
       target: '.goal-lock/lock.json',
       expected: { kind: 'sha256', digest: lockInput.digest },
@@ -797,6 +947,75 @@ export async function revisePlan(root, candidate, classification, context = {}) 
       goal_digest: current.digest,
       plan_revision: planRevision,
       classification,
+    };
+  }, context);
+}
+
+/** 记录一个派生封装的进度事件，并原子更新任务状态、账本和锁索引。 */
+export async function recordGoalEvent(root, input, context = {}) {
+  validateGoalEventInput(input);
+  return withGoalLock(root, 'record', async () => {
+    const snapshot = await verifyGoalRepository(root, {
+      ...context,
+      mutating: true,
+      [ACTIVE_WRITE]: true,
+      [RETURN_VERIFIED_SNAPSHOT]: true,
+    });
+    if (snapshot.result.state !== 'LOCKED') {
+      throw stateError('EVENT_STATE_REJECTED', `Progress recording requires LOCKED state, not ${snapshot.result.state}.`);
+    }
+    const {
+      reader,
+      current,
+      lockInput,
+      planState,
+      progressState,
+      evidenceState,
+      history,
+    } = snapshot;
+    if (!planState.current) throw stateError('EVENT_PLAN_REQUIRED', 'Progress recording requires a current plan.');
+
+    const plan = planState.current.value;
+    const goalReference = {
+      goal_id: current.goal.goal_id,
+      goal_version: current.goal.goal_version,
+      goal_digest: current.digest,
+    };
+    const event = buildProgressEvent(progressState, goalReference, plan.plan_revision, input, context);
+    if (event.task_id !== null && !plan.tasks.some((task) => task.id === event.task_id)) {
+      throw inputError('INVALID_EVENT_REFERENCE', 'Progress event task_id must reference the current plan.');
+    }
+    if (event.evidence_refs.some((evidenceId) => !evidenceState.recordsById.has(evidenceId))) {
+      throw inputError('INVALID_EVENT_REFERENCE', 'Progress event evidence_refs must reference existing evidence.');
+    }
+    const updatedPlan = planAfterTaskEvent(plan, event.event_type, event.task_id, current.goal);
+    const updatedPlanBytes = canonicalBytes(updatedPlan);
+    const nextLock = nextLockForEvent(lockInput, event);
+
+    // 当前计划、账本和锁共享同一读者快照与一次提交，任一安装失败都会整体回滚。
+    const entries = verifiedHistoryEntries(current, history, planState);
+    entries.push({
+      target: '.goal-lock/plan.json',
+      expected: { kind: 'sha256', digest: planState.current.digest },
+      content: updatedPlanBytes,
+    });
+    entries.push(appendProgressEntry(progressState, event));
+    entries.push({
+      target: '.goal-lock/lock.json',
+      expected: { kind: 'sha256', digest: lockInput.digest },
+      content: canonicalBytes(nextLock),
+    });
+    await reader.verifyInputs();
+    await commitGoalFiles(root, entries, context);
+    return {
+      state: 'LOCKED',
+      event_id: event.event_id,
+      event_digest: event.event_digest,
+      event_type: event.event_type,
+      goal_id: current.goal.goal_id,
+      goal_version: current.goal.goal_version,
+      plan_revision: plan.plan_revision,
+      task_id: event.task_id,
     };
   }, context);
 }

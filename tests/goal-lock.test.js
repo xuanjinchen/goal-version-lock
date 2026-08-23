@@ -224,7 +224,47 @@ function planCandidate(outcome = 'Implement the locked state transition') {
   };
 }
 
-test('plan revision creates revision 1 and atomically advances only the lock state index', async (testContext) => {
+const PLAN_REVISION_EVENT_DIGEST = 'bdda7b3968a011b2229bb86936f21a2d51e9a070a992dcd573c91c4bb61e4b72';
+const SECOND_PLAN_REVISION_EVENT_DIGEST = '9bcd19d7bb31cbac67b8de8749da59f6e8fb5617c4f87c6fa5574e77ce43bea1';
+const FOCUSED_RESULT_EVENT_DIGEST = 'a0e6791495980eb553a5802b0baf094c3f5ab84f52f78c6028b6762e46963093';
+const FULL_RESULT_EVENT_DIGEST = 'acf5a53569b61201d417c4463bf21149df52078ec809a94a0c33a5f679c9f142';
+const PLAN_REVISION_EVENT_LINE = '{"event_digest":"bdda7b3968a011b2229bb86936f21a2d51e9a070a992dcd573c91c4bb61e4b72","event_id":"EVT-000001","event_type":"plan-revision","evidence_refs":[],"goal":{"goal_digest":"92d74f6bf766e096e71b949ff57e2d9a12302a4519226d05cf67c2b544babaa6","goal_id":"GL-ALPHA","goal_version":1},"plan_revision":1,"previous_event_digest":null,"recorded_at":"2026-08-23T00:00:00.000Z","schema_version":1,"summary":"Recorded plan revision 1","task_id":null}\n';
+const SECOND_PLAN_REVISION_EVENT_LINE = '{"event_digest":"9bcd19d7bb31cbac67b8de8749da59f6e8fb5617c4f87c6fa5574e77ce43bea1","event_id":"EVT-000002","event_type":"plan-revision","evidence_refs":[],"goal":{"goal_digest":"92d74f6bf766e096e71b949ff57e2d9a12302a4519226d05cf67c2b544babaa6","goal_id":"GL-ALPHA","goal_version":1},"plan_revision":2,"previous_event_digest":"bdda7b3968a011b2229bb86936f21a2d51e9a070a992dcd573c91c4bb61e4b72","recorded_at":"2026-08-23T00:00:00.000Z","schema_version":1,"summary":"Recorded plan revision 2","task_id":null}\n';
+const FOCUSED_RESULT_EVENT_LINE = '{"event_digest":"a0e6791495980eb553a5802b0baf094c3f5ab84f52f78c6028b6762e46963093","event_id":"EVT-000002","event_type":"verification-result","evidence_refs":[],"goal":{"goal_digest":"92d74f6bf766e096e71b949ff57e2d9a12302a4519226d05cf67c2b544babaa6","goal_id":"GL-ALPHA","goal_version":1},"plan_revision":1,"previous_event_digest":"bdda7b3968a011b2229bb86936f21a2d51e9a070a992dcd573c91c4bb61e4b72","recorded_at":"2026-08-23T00:00:00.000Z","schema_version":1,"summary":"Focused tests passed","task_id":"TASK-0001"}\n';
+const FULL_RESULT_EVENT_LINE = '{"event_digest":"acf5a53569b61201d417c4463bf21149df52078ec809a94a0c33a5f679c9f142","event_id":"EVT-000003","event_type":"verification-result","evidence_refs":[],"goal":{"goal_digest":"92d74f6bf766e096e71b949ff57e2d9a12302a4519226d05cf67c2b544babaa6","goal_id":"GL-ALPHA","goal_version":1},"plan_revision":1,"previous_event_digest":"a0e6791495980eb553a5802b0baf094c3f5ab84f52f78c6028b6762e46963093","recorded_at":"2026-08-23T00:00:00.000Z","schema_version":1,"summary":"Full tests passed","task_id":"TASK-0001"}\n';
+
+function progressInput(summary = 'Focused tests passed', overrides = {}) {
+  return {
+    kind: 'progress',
+    event_type: 'verification-result',
+    task_id: 'TASK-0001',
+    summary,
+    evidence_refs: [],
+    ...overrides,
+  };
+}
+
+async function createProgressFixture(testContext) {
+  const fixture = createGoalLockFixture(testContext);
+  const repository = await goalRepository();
+  await repository.initializeGoal(fixture.root, goalV1(), fixture);
+  await repository.lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 92d74f6bf766', fixture);
+  await repository.revisePlan(fixture.root, planCandidate(), 'aligned', fixture);
+  await repository.recordGoalEvent(fixture.root, progressInput(), fixture);
+  await repository.recordGoalEvent(fixture.root, progressInput('Full tests passed'), fixture);
+  return { fixture, repository };
+}
+
+function withEventDigest(event, previousEventDigest) {
+  const { event_digest: _eventDigest, ...payload } = event;
+  payload.previous_event_digest = previousEventDigest;
+  return {
+    ...payload,
+    event_digest: independentSha256(canonicalBytes(payload)),
+  };
+}
+
+test('plan revision creates revision 1 and its automatic progress event in one state revision', async (testContext) => {
   const fixture = createGoalLockFixture(testContext);
   const { initializeGoal, lockInitialGoal, revisePlan } = await goalRepository();
   await initializeGoal(fixture.root, goalV1(), fixture);
@@ -247,9 +287,10 @@ test('plan revision creates revision 1 and atomically advances only the lock sta
   assert.equal(existsSync(join(directory, 'history', 'plans')), false);
   assert.deepEqual(await readFile(join(directory, 'current.json')), currentBefore);
   assert.deepEqual(await readFile(join(directory, 'history', 'goals', 'v0001.json')), historyBefore);
+  assert.deepEqual(await readFile(join(directory, 'progress.jsonl')), Buffer.from(PLAN_REVISION_EVENT_LINE));
   const lock = parseCanonicalJson(await readFile(join(directory, 'lock.json')), 'test lock');
   assert.equal(lock.state_revision, 2);
-  assert.equal(lock.progress_head, null);
+  assert.deepEqual(lock.progress_head, { event_id: 'EVT-000001', digest: PLAN_REVISION_EVENT_DIGEST });
   assert.equal(lock.change_head, null);
   assert.deepEqual(lock.evidence_heads, {});
   const { record_digest: recordDigest, ...lockWithoutDigest } = lock;
@@ -278,8 +319,15 @@ test('plan revision archives each replaced plan byte-for-byte and preserves earl
     ...completePlan(3),
     tasks: [{ ...completePlan(3).tasks[0], outcome: 'Implementation choice' }, completePlan(3).tasks[1]],
   }));
+  const events = (await readFile(join(directory, 'progress.jsonl'), 'utf8')).trimEnd().split('\n').map(JSON.parse);
+  assert.deepEqual(events.map((event) => [event.event_id, event.event_type, event.plan_revision]), [
+    ['EVT-000001', 'plan-revision', 1],
+    ['EVT-000002', 'plan-revision', 2],
+    ['EVT-000003', 'plan-revision', 3],
+  ]);
   const lock = parseCanonicalJson(await readFile(join(directory, 'lock.json')), 'test lock');
   assert.equal(lock.state_revision, 4);
+  assert.deepEqual(lock.progress_head, { event_id: 'EVT-000003', digest: events[2].event_digest });
   assert.equal((await verifyGoalRepository(fixture.root, fixture)).state, 'LOCKED');
 });
 
@@ -426,6 +474,313 @@ test('plan revision refuses a baseline replaced after semantic verification', as
 
   assert.equal(rootReads, 2);
   assert.equal(existsSync(join(directory, 'plan.json')), false);
+  assert.equal(existsSync(join(directory, 'progress.jsonl')), false);
+  assert.deepEqual(await readFile(join(directory, 'lock.json')), lockBefore);
+});
+
+test('plan revision progress event rolls back with the plan and lock after an install failure', async (testContext) => {
+  const fixture = createGoalLockFixture(testContext);
+  const { initializeGoal, lockInitialGoal, revisePlan } = await goalRepository();
+  await initializeGoal(fixture.root, goalV1(), fixture);
+  await lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 92d74f6bf766', fixture);
+  const directory = join(fixture.root, '.goal-lock');
+  const lockBefore = await readFile(join(directory, 'lock.json'));
+  fixture.transactionFaults.install = () => { throw new Error('injected plan install failure'); };
+
+  await assert.rejects(
+    revisePlan(fixture.root, planCandidate(), 'aligned', fixture),
+    /injected plan install failure/,
+  );
+
+  assert.equal(existsSync(join(directory, 'plan.json')), false);
+  assert.equal(existsSync(join(directory, 'progress.jsonl')), false);
+  assert.equal(existsSync(join(directory, 'history', 'plans')), false);
+  assert.deepEqual(await readFile(join(directory, 'lock.json')), lockBefore);
+});
+
+test('progress ledger public contract validates the exact envelope, prior link, and own digest', () => {
+  assert.equal(typeof goalContracts.validateProgressEvent, 'function');
+  const event = JSON.parse(PLAN_REVISION_EVENT_LINE);
+
+  assert.deepEqual(goalContracts.validateProgressEvent(event, null), event);
+  assert.equal(Object.isFrozen(goalContracts.validateProgressEvent(event, null).goal), true);
+
+  const wrongLink = { ...event, previous_event_digest: 'f'.repeat(64) };
+  assert.throws(() => goalContracts.validateProgressEvent(wrongLink, null), /previous_event_digest/i);
+  const wrongDigest = { ...event, event_digest: 'f'.repeat(64) };
+  assert.throws(() => goalContracts.validateProgressEvent(wrongDigest, null), /event_digest/i);
+  const unknownType = { ...event, event_type: 'finished' };
+  assert.throws(() => goalContracts.validateProgressEvent(unknownType, null), /event_type/i);
+  const callerField = { ...event, kind: 'progress' };
+  assert.throws(() => goalContracts.validateProgressEvent(callerField, null), /unknown|field/i);
+});
+
+test('progress ledger verification rejects a plan with no automatic plan-revision event', async (testContext) => {
+  const fixture = createGoalLockFixture(testContext);
+  const { initializeGoal, lockInitialGoal, verifyGoalRepository } = await goalRepository();
+  await initializeGoal(fixture.root, goalV1(), fixture);
+  await lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 92d74f6bf766', fixture);
+  await writeFile(join(fixture.root, '.goal-lock', 'plan.json'), canonicalBytes(structuralPlan()));
+
+  assert.equal((await verifyGoalRepository(fixture.root, fixture)).state, 'TAMPERED');
+});
+
+test('progress ledger records literal canonical bytes with sequential IDs and digest links', async (testContext) => {
+  const { fixture, repository } = await createProgressFixture(testContext);
+  const directory = join(fixture.root, '.goal-lock');
+
+  assert.deepEqual(
+    await readFile(join(directory, 'progress.jsonl')),
+    Buffer.from(PLAN_REVISION_EVENT_LINE + FOCUSED_RESULT_EVENT_LINE + FULL_RESULT_EVENT_LINE),
+  );
+  const lock = parseCanonicalJson(await readFile(join(directory, 'lock.json')), 'test lock');
+  assert.equal(lock.state_revision, 4);
+  assert.deepEqual(lock.progress_head, { event_id: 'EVT-000003', digest: FULL_RESULT_EVENT_DIGEST });
+  assert.equal(lock.change_head, null);
+  assert.deepEqual(lock.evidence_heads, {});
+  const { record_digest: recordDigest, ...lockWithoutDigest } = lock;
+  assert.equal(recordDigest, independentSha256(canonicalBytes(lockWithoutDigest)));
+  const verified = await repository.verifyGoalRepository(fixture.root, fixture);
+  assert.equal(verified.state, 'LOCKED');
+  assert.equal(verified.evidence.optional.progress_events, 3);
+});
+
+test('progress ledger rejects caller envelope overrides and unknown task or evidence references without appending', async (testContext) => {
+  const fixture = createGoalLockFixture(testContext);
+  const { initializeGoal, lockInitialGoal, revisePlan, recordGoalEvent } = await goalRepository();
+  await initializeGoal(fixture.root, goalV1(), fixture);
+  await lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 92d74f6bf766', fixture);
+  await revisePlan(fixture.root, planCandidate(), 'aligned', fixture);
+  const directory = join(fixture.root, '.goal-lock');
+  const ledgerBefore = await readFile(join(directory, 'progress.jsonl'));
+  const lockBefore = await readFile(join(directory, 'lock.json'));
+
+  const cases = [
+    progressInput('Caller timestamp', { recorded_at: '2026-08-23T02:00:00.000Z' }),
+    progressInput('Caller ID', { event_id: 'EVT-999999' }),
+    progressInput('Unknown task', { task_id: 'TASK-9999' }),
+    progressInput('Unknown evidence', { evidence_refs: ['EVID-9999'] }),
+    progressInput('Malformed evidence list', { evidence_refs: null }),
+    progressInput('Undefined evidence entry', { evidence_refs: [undefined] }),
+  ];
+  for (const input of cases) {
+    await assert.rejects(
+      recordGoalEvent(fixture.root, input, fixture),
+      (error) => error instanceof GoalLockError && ['input', 'state'].includes(error.kind),
+    );
+  }
+
+  assert.deepEqual(await readFile(join(directory, 'progress.jsonl')), ledgerBefore);
+  assert.deepEqual(await readFile(join(directory, 'lock.json')), lockBefore);
+});
+
+test('progress ledger verification rejects deletion, insertion, reordering, rewriting, duplicate IDs, truncation, and missing final LF', async (testContext) => {
+  const tamperCases = [
+    ['deletion', (lines) => [lines[0], lines[2]]],
+    ['insertion', (lines) => [lines[0], lines[2], lines[1], lines[2]]],
+    ['reordering', (lines) => [lines[0], lines[2], lines[1]]],
+    ['rewriting', (lines) => {
+      const rewritten = JSON.parse(lines[1]);
+      rewritten.summary = 'Rewritten result';
+      return [lines[0], canonicalBytes(rewritten).toString('utf8'), lines[2]];
+    }],
+    ['duplicate ID', (lines) => {
+      const duplicate = JSON.parse(lines[2]);
+      duplicate.event_id = 'EVT-000002';
+      return [lines[0], lines[1], canonicalBytes(withEventDigest(duplicate, FOCUSED_RESULT_EVENT_DIGEST)).toString('utf8')];
+    }],
+    ['truncation', (lines) => lines.slice(0, 2)],
+    ['missing final LF', (lines) => [lines[0], lines[1], lines[2].slice(0, -1)]],
+  ];
+
+  for (const [label, tamper] of tamperCases) {
+    const { fixture, repository } = await createProgressFixture(testContext);
+    const ledgerPath = join(fixture.root, '.goal-lock', 'progress.jsonl');
+    const lines = [PLAN_REVISION_EVENT_LINE, FOCUSED_RESULT_EVENT_LINE, FULL_RESULT_EVENT_LINE];
+    await writeFile(ledgerPath, Buffer.from(tamper(lines).join('')));
+
+    const result = await repository.verifyGoalRepository(fixture.root, fixture);
+    assert.equal(result.state, 'TAMPERED', label);
+  }
+});
+
+test('progress ledger verification rejects a validly redigested cross-version event chain', async (testContext) => {
+  const { fixture, repository } = await createProgressFixture(testContext);
+  const directory = join(fixture.root, '.goal-lock');
+  const first = JSON.parse(PLAN_REVISION_EVENT_LINE);
+  const second = JSON.parse(FOCUSED_RESULT_EVENT_LINE);
+  second.goal = { goal_id: 'GL-ALPHA', goal_version: 2, goal_digest: 'f'.repeat(64) };
+  const redigestedSecond = withEventDigest(second, PLAN_REVISION_EVENT_DIGEST);
+  const third = withEventDigest(JSON.parse(FULL_RESULT_EVENT_LINE), redigestedSecond.event_digest);
+  await writeFile(join(directory, 'progress.jsonl'), Buffer.concat([
+    canonicalBytes(first),
+    canonicalBytes(redigestedSecond),
+    canonicalBytes(third),
+  ]));
+  await rewriteTestLock(fixture, (lock) => {
+    lock.progress_head = { event_id: 'EVT-000003', digest: third.event_digest };
+  });
+
+  assert.equal((await repository.verifyGoalRepository(fixture.root, fixture)).state, 'TAMPERED');
+});
+
+async function installTestEvidence(fixture, evidenceId = 'EVID-0001') {
+  const evidenceDirectory = join(fixture.root, '.goal-lock', 'evidence', 'AC-001');
+  await mkdir(evidenceDirectory, { recursive: true });
+  await writeFile(join(evidenceDirectory, `${evidenceId}.json`), canonicalBytes(structuralEvidence(evidenceId)));
+}
+
+async function createPlannedFixture(testContext) {
+  const fixture = createGoalLockFixture(testContext);
+  const repository = await goalRepository();
+  await repository.initializeGoal(fixture.root, goalV1(), fixture);
+  await repository.lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 92d74f6bf766', fixture);
+  await repository.revisePlan(fixture.root, planCandidate(), 'aligned', fixture);
+  return { fixture, repository };
+}
+
+test('task status task-start moves only pending tasks to in_progress without revising or archiving the plan', async (testContext) => {
+  const { fixture, repository } = await createPlannedFixture(testContext);
+  const directory = join(fixture.root, '.goal-lock');
+
+  await assert.rejects(
+    repository.recordGoalEvent(fixture.root, progressInput('Start blocked task', {
+      event_type: 'task-start',
+      task_id: 'TASK-0002',
+    }), fixture),
+    (error) => error instanceof GoalLockError && error.kind === 'state',
+  );
+  await repository.recordGoalEvent(fixture.root, progressInput('Started implementation', {
+    event_type: 'task-start',
+  }), fixture);
+
+  const plan = parseCanonicalJson(await readFile(join(directory, 'plan.json')), 'test plan');
+  assert.equal(plan.plan_revision, 1);
+  assert.equal(plan.tasks[0].status, 'in_progress');
+  assert.equal(plan.tasks[1].status, 'blocked');
+  assert.equal(existsSync(join(directory, 'history', 'plans')), false);
+  await assert.rejects(
+    repository.recordGoalEvent(fixture.root, progressInput('Start twice', { event_type: 'task-start' }), fixture),
+    (error) => error instanceof GoalLockError && error.kind === 'state',
+  );
+});
+
+test('task status task-complete requires an in_progress task and existing evidence', async (testContext) => {
+  const { fixture, repository } = await createPlannedFixture(testContext);
+  const directory = join(fixture.root, '.goal-lock');
+  await installTestEvidence(fixture);
+
+  await assert.rejects(
+    repository.recordGoalEvent(fixture.root, progressInput('Completed too early', {
+      event_type: 'task-complete',
+      evidence_refs: ['EVID-0001'],
+    }), fixture),
+    (error) => error instanceof GoalLockError && error.kind === 'state',
+  );
+  await repository.recordGoalEvent(fixture.root, progressInput('Started implementation', { event_type: 'task-start' }), fixture);
+  const beforeMissingEvidence = await readFile(join(directory, 'progress.jsonl'));
+  await assert.rejects(
+    repository.recordGoalEvent(fixture.root, progressInput('Completed without evidence', {
+      event_type: 'task-complete',
+    }), fixture),
+    (error) => error instanceof GoalLockError && error.kind === 'input',
+  );
+  assert.deepEqual(await readFile(join(directory, 'progress.jsonl')), beforeMissingEvidence);
+
+  await repository.recordGoalEvent(fixture.root, progressInput('Completed with evidence', {
+    event_type: 'task-complete',
+    evidence_refs: ['EVID-0001'],
+  }), fixture);
+  const plan = parseCanonicalJson(await readFile(join(directory, 'plan.json')), 'test plan');
+  assert.equal(plan.plan_revision, 1);
+  assert.equal(plan.tasks[0].status, 'complete');
+  assert.equal(plan.next_task_id, null);
+  await assert.rejects(
+    repository.recordGoalEvent(fixture.root, progressInput('Complete twice', {
+      event_type: 'task-complete',
+      evidence_refs: ['EVID-0001'],
+    }), fixture),
+    (error) => error instanceof GoalLockError && error.kind === 'state',
+  );
+});
+
+test('task status blocker moves only an in_progress task to blocked', async (testContext) => {
+  const { fixture, repository } = await createPlannedFixture(testContext);
+  const directory = join(fixture.root, '.goal-lock');
+
+  await assert.rejects(
+    repository.recordGoalEvent(fixture.root, progressInput('Blocked before start', { event_type: 'blocker' }), fixture),
+    (error) => error instanceof GoalLockError && error.kind === 'state',
+  );
+  await repository.recordGoalEvent(fixture.root, progressInput('Started implementation', { event_type: 'task-start' }), fixture);
+  await repository.recordGoalEvent(fixture.root, progressInput('Blocked on external decision', { event_type: 'blocker' }), fixture);
+
+  const plan = parseCanonicalJson(await readFile(join(directory, 'plan.json')), 'test plan');
+  assert.equal(plan.tasks[0].status, 'blocked');
+  assert.equal(plan.next_task_id, null);
+});
+
+test('task status audit events never silently complete the active task', async (testContext) => {
+  const { fixture, repository } = await createPlannedFixture(testContext);
+  const directory = join(fixture.root, '.goal-lock');
+  await repository.recordGoalEvent(fixture.root, progressInput('Started implementation', { event_type: 'task-start' }), fixture);
+
+  for (const eventType of ['verification-result', 'plan-revision', 'goal-change', 'evidence-invalidation', 'recovery', 'final-audit']) {
+    await repository.recordGoalEvent(fixture.root, progressInput(`Recorded ${eventType}`, {
+      event_type: eventType,
+      task_id: eventType === 'verification-result' ? 'TASK-0001' : null,
+    }), fixture);
+    const plan = parseCanonicalJson(await readFile(join(directory, 'plan.json')), 'test plan');
+    assert.equal(plan.tasks[0].status, 'in_progress', eventType);
+    assert.equal(plan.plan_revision, 1, eventType);
+  }
+});
+
+test('task status event rolls back the plan, ledger, and lock together after an install failure', async (testContext) => {
+  const { fixture, repository } = await createPlannedFixture(testContext);
+  const directory = join(fixture.root, '.goal-lock');
+  const planBefore = await readFile(join(directory, 'plan.json'));
+  const ledgerBefore = await readFile(join(directory, 'progress.jsonl'));
+  const lockBefore = await readFile(join(directory, 'lock.json'));
+  fixture.transactionFaults.install = () => { throw new Error('injected task status install failure'); };
+
+  await assert.rejects(
+    repository.recordGoalEvent(fixture.root, progressInput('Started implementation', { event_type: 'task-start' }), fixture),
+    /injected task status install failure/,
+  );
+
+  assert.deepEqual(await readFile(join(directory, 'plan.json')), planBefore);
+  assert.deepEqual(await readFile(join(directory, 'progress.jsonl')), ledgerBefore);
+  assert.deepEqual(await readFile(join(directory, 'lock.json')), lockBefore);
+});
+
+test('progress ledger append refuses a raced replacement and preserves the replacing bytes', async (testContext) => {
+  const { fixture, repository } = await createPlannedFixture(testContext);
+  const directory = join(fixture.root, '.goal-lock');
+  const ledgerPath = join(directory, 'progress.jsonl');
+  const lockBefore = await readFile(join(directory, 'lock.json'));
+  const replacement = Buffer.concat([await readFile(ledgerPath), Buffer.from('{"foreign":true}\n')]);
+  let armed = false;
+  let rootReads = 0;
+  fixture.workspaceFaults = {
+    beforeVerifyInputs: () => {
+      if (armed) return;
+      armed = true;
+      fixture.workspaceFaults.afterDirectoryRead = async ({ relativePath }) => {
+        if (relativePath !== '.goal-lock') return;
+        rootReads += 1;
+        if (rootReads === 2) await writeFile(ledgerPath, replacement);
+      };
+    },
+  };
+
+  await assert.rejects(
+    repository.recordGoalEvent(fixture.root, progressInput(), fixture),
+    (error) => error instanceof GoalLockError && error.kind === 'integrity',
+  );
+
+  assert.equal(rootReads, 2);
+  assert.deepEqual(await readFile(ledgerPath), replacement);
   assert.deepEqual(await readFile(join(directory, 'lock.json')), lockBefore);
 });
 
@@ -1036,7 +1391,11 @@ test('verifies goal history preflights optional state and reports a pending chan
   await lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 92d74f6bf766', fixture);
   const directory = join(fixture.root, '.goal-lock');
   await writeFile(join(directory, 'plan.json'), canonicalBytes(structuralPlan()));
-  await writeFile(join(directory, 'progress.jsonl'), canonicalBytes(structuralProgressEvent()));
+  await writeFile(join(directory, 'progress.jsonl'), Buffer.from(PLAN_REVISION_EVENT_LINE));
+  await rewriteTestLock(fixture, (lock) => {
+    lock.state_revision = 2;
+    lock.progress_head = { event_id: 'EVT-000001', digest: PLAN_REVISION_EVENT_DIGEST };
+  });
   await mkdir(join(directory, 'changes'));
   await writeFile(join(directory, 'changes', 'CR-0001.json'), canonicalBytes({ ...structuralChange(), status: 'proposed' }));
   await mkdir(join(directory, 'evidence', 'AC-001'), { recursive: true });
@@ -1115,6 +1474,14 @@ test('verifies goal history structurally preflights present plan history', async
   await writeFile(join(directory, 'plan.json'), canonicalBytes({ ...structuralPlan(), plan_revision: 2 }));
   await mkdir(join(directory, 'history', 'plans'));
   await writeFile(join(directory, 'history', 'plans', 'v0001-r0001.json'), canonicalBytes(structuralPlan()));
+  await writeFile(
+    join(directory, 'progress.jsonl'),
+    Buffer.from(PLAN_REVISION_EVENT_LINE + SECOND_PLAN_REVISION_EVENT_LINE),
+  );
+  await rewriteTestLock(fixture, (lock) => {
+    lock.state_revision = 3;
+    lock.progress_head = { event_id: 'EVT-000002', digest: SECOND_PLAN_REVISION_EVENT_DIGEST };
+  });
 
   const result = await verifyGoalRepository(fixture.root, fixture);
 

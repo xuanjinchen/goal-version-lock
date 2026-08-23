@@ -1,6 +1,17 @@
 import { canonicalBytes, sha256, shortFingerprint } from './canonical.js';
 
 const DIGEST_PATTERN = /^[a-f0-9]{64}$/;
+const PROGRESS_EVENT_TYPES = new Set([
+  'task-start',
+  'task-complete',
+  'blocker',
+  'verification-result',
+  'plan-revision',
+  'goal-change',
+  'evidence-invalidation',
+  'recovery',
+  'final-audit',
+]);
 const IDENTIFIERS = {
   goal_id: /^GL-[A-Z0-9][A-Z0-9-]*$/,
   acceptance_criterion_id: /^AC-[0-9]{3}$/,
@@ -299,6 +310,66 @@ export function validatePlan(value, goalReference) {
     tasks,
     deferred,
   });
+}
+
+/** 验证进度事件的完整封装、自身摘要及其与前一事件摘要的精确链接。 */
+export function validateProgressEvent(value, previousDigest) {
+  const fields = ['schema_version', 'event_id', 'recorded_at', 'goal', 'plan_revision', 'task_id', 'event_type', 'summary', 'evidence_refs', 'previous_event_digest', 'event_digest'];
+  exactKeys(value, 'progress event', fields);
+  if (value.schema_version !== 1) fail('INVALID_CONTRACT', 'input', 2, 'schema_version must equal 1');
+
+  exactKeys(value.goal, 'progress event.goal', ['goal_id', 'goal_version', 'goal_digest']);
+  const goal = {
+    goal_id: identifier(value.goal.goal_id, 'goal_id', 'progress event.goal.goal_id'),
+    goal_version: positiveInteger(value.goal.goal_version, 'progress event.goal.goal_version'),
+    goal_digest: digest(value.goal.goal_digest, 'progress event.goal.goal_digest'),
+  };
+  const taskId = value.task_id === null
+    ? null
+    : identifier(value.task_id, 'task_id', 'progress event.task_id');
+  if (!PROGRESS_EVENT_TYPES.has(value.event_type)) {
+    fail('INVALID_CONTRACT', 'input', 2, 'progress event.event_type is invalid');
+  }
+  if (['task-start', 'task-complete', 'blocker'].includes(value.event_type) && taskId === null) {
+    fail('INVALID_CONTRACT', 'input', 2, 'progress event.task_id is required for task status events');
+  }
+  const evidenceRefs = array(value.evidence_refs, 'progress event.evidence_refs')
+    .map((evidenceId, index) => identifier(evidenceId, 'evidence_id', `progress event.evidence_refs[${index}]`));
+  if (new Set(evidenceRefs).size !== evidenceRefs.length) {
+    fail('INVALID_CONTRACT', 'input', 2, 'progress event.evidence_refs contains duplicates');
+  }
+  if (value.event_type === 'task-complete' && evidenceRefs.length === 0) {
+    fail('INVALID_CONTRACT', 'input', 2, 'task-complete requires evidence_refs');
+  }
+  const expectedPreviousDigest = previousDigest === null
+    ? null
+    : digest(previousDigest, 'previous digest');
+  const suppliedPreviousDigest = value.previous_event_digest === null
+    ? null
+    : digest(value.previous_event_digest, 'progress event.previous_event_digest');
+  if (suppliedPreviousDigest !== expectedPreviousDigest) {
+    fail('INTEGRITY_FAILURE', 'integrity', 4, 'progress event.previous_event_digest does not match the previous event');
+  }
+
+  const normalized = {
+    schema_version: 1,
+    event_id: identifier(value.event_id, 'event_id', 'progress event.event_id'),
+    recorded_at: timestamp(value.recorded_at, 'progress event.recorded_at'),
+    goal,
+    plan_revision: positiveInteger(value.plan_revision, 'progress event.plan_revision'),
+    task_id: taskId,
+    event_type: value.event_type,
+    summary: requiredText(value.summary, 'progress event.summary'),
+    evidence_refs: evidenceRefs,
+    previous_event_digest: suppliedPreviousDigest,
+    event_digest: digest(value.event_digest, 'progress event.event_digest'),
+  };
+  // 事件摘要覆盖规范化载荷和前链指针，仅排除摘要字段本身。
+  const { event_digest: suppliedDigest, ...digestPayload } = normalized;
+  if (sha256(canonicalBytes(digestPayload)) !== suppliedDigest) {
+    fail('INTEGRITY_FAILURE', 'integrity', 4, 'progress event.event_digest does not match the event payload');
+  }
+  return deepFreeze(normalized);
 }
 
 function nullableHead(value, label, idType, idField) {
