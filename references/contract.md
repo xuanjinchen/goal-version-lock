@@ -5,9 +5,39 @@ version: "1"
 
 # Goal Version Lock Contract
 
-This reference defines the persisted `.goal-lock/` protocol. The approved goal
-and its goal-bound plan are authoritative; external planning displays are
-optional and subordinate.
+This reference defines the public CLI inputs and persisted `.goal-lock/`
+protocol. The approved goal and its goal-bound plan are authoritative;
+external planning displays are optional and subordinate.
+
+## Contents
+
+- [When to load this reference](#when-to-load-this-reference)
+- [Authority and lifecycle](#authority-and-lifecycle)
+- [Machine-readable contract](#machine-readable-contract)
+- [Input derivation rules](#input-derivation-rules)
+- [Command envelopes](#command-envelopes)
+- [Integrity and recovery boundary](#integrity-and-recovery-boundary)
+
+## When to load this reference
+
+Load this file when creating, validating, changing, gating, or recovering
+runtime state. Ordinary implementation work needs only the verified current
+goal and plan; loading the complete schemas on every work slice adds context
+without changing their authority.
+
+## Authority and lifecycle
+
+The governed project's current working directory is the runtime root. A normal
+lifecycle is `DRAFT` after `init`, `LOCKED` after exact version-1 approval,
+`CHANGE_PENDING` while one change request awaits a decision, and `COMPLETE`
+only when every gate condition passes. `TAMPERED` and integrity exit code `4`
+are fail-closed states, not alternate versions of the goal.
+
+`current.json`, `lock.json`, and `plan.json` are authoritative current state.
+`progress.jsonl` is append-only. History, change, and evidence paths preserve
+accepted lineage.
+
+## Machine-readable contract
 
 <!-- goal-lock-reference-contract:v1 -->
 ```json
@@ -43,6 +73,114 @@ optional and subordinate.
       ".."
     ],
     "delivery_artifacts_reject_prefix": ".goal-lock/"
+  },
+  "inputs": {
+    "initial_goal": {
+      "command": "init",
+      "fields": [
+        "schema_version",
+        "goal_id",
+        "goal_version",
+        "objective",
+        "scope",
+        "non_goals",
+        "constraints",
+        "acceptance_criteria",
+        "authorization_boundary",
+        "assumptions",
+        "predecessor",
+        "accepted_change_id"
+      ],
+      "fixed": {
+        "schema_version": 1,
+        "goal_version": 1,
+        "predecessor": null,
+        "accepted_change_id": null
+      }
+    },
+    "plan_candidate": {
+      "command": "plan",
+      "fields": [
+        "next_task_id",
+        "tasks",
+        "deferred"
+      ],
+      "derived": [
+        "schema_version",
+        "goal",
+        "plan_revision"
+      ]
+    },
+    "change_proposal": {
+      "command": "propose",
+      "fields": [
+        "candidate",
+        "changes",
+        "rationale",
+        "affected_tasks",
+        "affected_criteria",
+        "risks",
+        "validation",
+        "rollback"
+      ],
+      "candidate_fields": [
+        "objective",
+        "scope",
+        "non_goals",
+        "constraints",
+        "acceptance_criteria",
+        "authorization_boundary",
+        "assumptions"
+      ]
+    },
+    "progress": {
+      "command": "record",
+      "fields": [
+        "kind",
+        "event_type",
+        "task_id",
+        "summary",
+        "evidence_refs"
+      ],
+      "fixed": {
+        "kind": "progress"
+      }
+    },
+    "evidence": {
+      "command": "record",
+      "fields": [
+        "kind",
+        "acceptance_criterion_id",
+        "task_id",
+        "method",
+        "observed_result",
+        "artifact_refs",
+        "workspace_fingerprint",
+        "state",
+        "supersedes"
+      ],
+      "fixed": {
+        "kind": "evidence"
+      }
+    },
+    "final_audit": {
+      "command": "record",
+      "fields": [
+        "kind",
+        "semantic_summary",
+        "inventory"
+      ],
+      "fixed": {
+        "kind": "final-audit"
+      }
+    },
+    "inventory": {
+      "commands": [
+        "gate",
+        "record final-audit"
+      ],
+      "shape": "sorted non-empty array of unique safe delivery-file paths; required only outside Git"
+    }
   },
   "artifacts": {
     ".write-lock.json": {
@@ -338,8 +476,63 @@ optional and subordinate.
 }
 ```
 
-`current.json`, `lock.json`, and `plan.json` are authoritative current state.
-`progress.jsonl` is append-only; history, change, and evidence paths preserve
-accepted lineage. See the [approved design](../docs/superpowers/specs/2026-08-23-goal-version-lock-design.md)
-for lifecycle sequencing and the [Skill Brief](../docs/skill-brief.md) for the
-current requirements.
+## Input derivation rules
+
+- `init` accepts one complete version-1 goal. It does not derive or approve
+  omitted semantic fields.
+- `plan` accepts only `next_task_id`, `tasks`, and `deferred`. Task objects use
+  the persisted `plan.json` task shape. The runtime derives the schema, active
+  goal reference, and next plan revision; shared task status is preserved and
+  a new task starts as `pending`.
+- `propose` accepts all seven semantic goal fields under `candidate` and an
+  exact `changes` entry for every semantic difference. The runtime derives the
+  next version, predecessor, CR ID, candidate digest, proposal digest, and
+  approval phrase. Affected task and criterion IDs must exist in current state.
+- `record` accepts exactly one of the three input shapes above. Ordinary
+  progress cannot submit derived `plan-revision` or `final-audit` event types.
+  Evidence must supersede the immediately preceding record for its criterion.
+- A final-audit input uses `inventory: null` in Git. Outside Git, use the same
+  sorted, unique, non-empty safe delivery-file array for the final audit and
+  `gate --inventory`; bookkeeping paths under `.git/` or `.goal-lock/` are
+  forbidden.
+
+All CLI JSON inputs must be strict UTF-8 documents of at most 1 MiB. File
+inputs are repository-relative, use `/`, and must be unlinked regular files.
+The CLI also accepts `--input -` for `init`, `plan`, `propose`, and `record`.
+Inventory input must be a file, not stdin.
+
+## Command envelopes
+
+On success, the CLI writes exactly one compact JSON line to stdout and nothing
+to stderr:
+
+```json
+{"ok":true,"command":"verify","result":{"state":"LOCKED"}}
+```
+
+On failure, it writes exactly one redacted JSON line to stderr and nothing to
+stdout. The process exit code matches `cli.exit_codes`:
+
+```json
+{"ok":false,"command":"verify","error":{"code":"GOAL_REPOSITORY_TAMPERED","message":"Goal-lock integrity or path safety verification failed."}}
+```
+
+Diagnostics do not echo input bytes, objectives, approval phrases, rejection
+reasons, owner tokens, digests, or file paths. `--help` is a read-only success
+whose `result` is the complete usage string.
+
+## Integrity and recovery boundary
+
+Every mutating command verifies the accepted state and uses a cooperative
+`.write-lock.json`, atomic replacement, read-back verification, and rollback.
+Do not remove that file merely because it exists. `recover-lock` succeeds only
+when its owner token and SHA-256 bind to the unchanged lock and recovery safety
+checks pass.
+
+Recovery of `.write-lock.json` is not recovery of `current.json`, history,
+progress, change requests, evidence, or their digest chains. Preserve an
+integrity failure for inspection and restore only exact user-selected
+known-good bytes; never rewrite damaged state into a newly accepted goal.
+
+See the [Agent workflow](../SKILL.md) for semantic routing and the [Skill
+Brief](../docs/skill-brief.md) for the current requirements.

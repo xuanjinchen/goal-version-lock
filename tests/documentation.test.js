@@ -8,9 +8,11 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const DOCUMENTS = [
   'AGENTS.md',
   'README.md',
+  'SKILL.md',
   'docs/scaffold-usage.md',
   'docs/mature-skill-development-design.md',
   'docs/mature-skill-development-plan.md',
+  'references/contract.md',
   'templates/project/README.md.template',
   'templates/project/skill-brief.md.template',
 ];
@@ -28,6 +30,165 @@ function assertInOrder(source, values) {
     cursor = next;
   }
 }
+
+function parseSkillFrontmatter(source) {
+  const frontmatter = /^---\n([\s\S]*?)\n---\n/u.exec(source);
+  assert.notEqual(frontmatter, null, 'SKILL.md must have delimited frontmatter');
+  const values = {};
+  for (const line of frontmatter[1].split('\n')) {
+    const entry = /^([a-z_]+): (.+)$/u.exec(line);
+    assert.notEqual(entry, null, `invalid Skill frontmatter line: ${line}`);
+    values[entry[1]] = JSON.parse(entry[2]);
+  }
+  return { body: source.slice(frontmatter[0].length), values };
+}
+
+function parseMarkdownTable(source, heading, expectedHeaders) {
+  const headingIndex = source.indexOf(`${heading}\n`);
+  assert.notEqual(headingIndex, -1, `missing table heading: ${heading}`);
+  const lines = source.slice(headingIndex + heading.length + 1).split('\n');
+  const tableStart = lines.findIndex((line) => line.startsWith('| '));
+  assert.notEqual(tableStart, -1, `missing table after: ${heading}`);
+  const endOffset = lines.slice(tableStart).findIndex((line) => !line.startsWith('| '));
+  const tableLines = endOffset === -1 ? lines.slice(tableStart) : lines.slice(tableStart, tableStart + endOffset);
+  const cells = tableLines
+    .filter((line) => line.startsWith('| '))
+    .map((line) => line.slice(1, -1).split('|').map((value) => value.trim()));
+  assert.deepEqual(cells[0], expectedHeaders, `${heading} headers changed`);
+  assert.equal(cells[1].every((value) => /^:?-{3,}:?$/u.test(value)), true, `${heading} separator is invalid`);
+  return cells.slice(2).map((row) => Object.fromEntries(expectedHeaders.map((header, index) => [header, row[index]])));
+}
+
+// 这里只验证可解析的静态文档契约；Agent 的语义路由结论由 Task 14 的真实行为评测负责。
+test('goal version lock skill exposes a discriminating static workflow contract', () => {
+  const source = read('SKILL.md');
+  const { body, values } = parseSkillFrontmatter(source);
+  assert.deepEqual(Object.keys(values).sort(), ['description', 'name']);
+  assert.equal(values.name, 'goal-version-lock');
+  const stateDescription = JSON.parse(read('.scaffold/state.json')).skill.description;
+  const packageDescription = JSON.parse(read('package.json')).description;
+  assert.equal(values.description, stateDescription);
+  assert.equal(values.description, packageDescription);
+  assert.ok([...values.description].length <= 500, 'description exceeds initialized state limit');
+  const triggerMatrix = [
+    ['lock or freeze a development goal', 'lock, freeze with controlled version changes'],
+    ['preserve a development goal against drift', 'preserve, or prevent drift in a development goal'],
+    ['resume an existing governed workspace', 'existing .goal-lock/ workspace governs the task'],
+    ['ordinary planning near-miss', 'Do not use for ordinary planning'],
+    ['personal goal-tracking near-miss', 'personal OKRs'],
+    ['configuration-drift near-miss', 'infrastructure configuration drift'],
+    ['read-only near-miss', 'read-only questions'],
+  ];
+  for (const [context, discoveryText] of triggerMatrix) {
+    assert.ok(values.description.includes(discoveryText), `frontmatter does not discriminate: ${context}`);
+  }
+  assert.match(values.description, /approved, versioned goal contract/u);
+  assert.match(values.description, /planning, progress, change approval, recovery, and completion gates/u);
+  assert.doesNotMatch(body, /^## (?:Triggers|When to use|Trigger boundaries)$/gmu);
+
+  assertInOrder(body, [
+    '# Goal Version Lock',
+    '## Read runtime details only when needed',
+    '## Establish or resume authority',
+    '## Verify each work slice',
+    '## Classify and route instructions',
+    '## Apply exact approvals',
+    '## Plan and record progress',
+    '## Handle integrity failures',
+    '## Audit and gate completion',
+    '## Report',
+  ]);
+
+  const routes = parseMarkdownTable(body, '## Classify and route instructions', [
+    'Classification', 'Semantic test', 'CLI route',
+  ]);
+  assert.deepEqual(routes.map(({ Classification, 'CLI route': route }) => [Classification, route]), [
+    ['aligned', 'Continue; use `plan --classification aligned` only for a plan revision.'],
+    ['implementation-choice', 'Use `plan --classification implementation-choice`; keep the goal version.'],
+    ['clarification', 'Ask, then verify and reclassify before a governed write.'],
+    ['goal-change', 'Use `propose`; pause affected work for exact approval.'],
+    ['constraint-change', 'Use `propose`; pause affected work for exact approval.'],
+    ['ambiguous', 'Ask; make no governed write until conservative reclassification.'],
+    ['conflicting', 'Stop conflicting work; ask whether to propose a goal change.'],
+  ]);
+
+  const checkpoints = parseMarkdownTable(body, '## Verify each work slice', ['Checkpoint', 'Required action']);
+  assert.deepEqual(checkpoints.map(({ Checkpoint }) => Checkpoint), [
+    'Before every work slice',
+    'Before applying a new instruction',
+    'After context loss',
+  ]);
+  assert.match(checkpoints[0]['Required action'], /`verify`.*`(?:\.goal-lock\/)?current\.json`.*`(?:\.goal-lock\/)?plan\.json`/u);
+  assert.match(checkpoints[1]['Required action'], /`verify`.*re-read.*classify/u);
+  assert.match(checkpoints[2]['Required action'], /`verify`.*`lock\.json`.*progress.*`next_task_id`/u);
+
+  const contract = parseGoalLockReference(read('references/contract.md'));
+  assert.ok(body.includes(contract.approval.initial));
+  assert.ok(body.includes(contract.approval.change));
+  assert.match(body, /byte-for-byte and case-sensitive/u);
+  assert.match(body, /generic confirmation/u);
+  assert.match(body, /stop all goal-governed writes/u);
+  assert.match(body, /final semantic diff audit/u);
+  assert.match(body, /state is `COMPLETE`/u);
+
+  const documentedCommands = new Set([...body.matchAll(/`(?:node scripts\/goal-lock\.js )?([a-z][a-z-]+)(?:\s[^`]*)?`/gu)]
+    .map((match) => match[1])
+    .filter((command) => contract.cli.commands.some((entry) => entry.command === command)));
+  assert.deepEqual([...documentedCommands].sort(), contract.cli.commands.map(({ command }) => command).sort());
+  assert.match(body, /Read \[`references\/contract\.md`\]\(references\/contract\.md\) only when creating, validating, changing, gating, or recovering runtime state\./u);
+});
+
+test('planning-with-files stays optional and non-authoritative', () => {
+  const source = read('SKILL.md');
+  const mapping = parseMarkdownTable(source, '### Optional `planning-with-files` display', [
+    'Display field', 'Authoritative source',
+  ]);
+  assert.deepEqual(mapping, [
+    { 'Display field': '`goal_id`', 'Authoritative source': '`.goal-lock/current.json`' },
+    { 'Display field': '`goal_version`', 'Authoritative source': '`.goal-lock/lock.json`' },
+    { 'Display field': '`goal_digest`', 'Authoritative source': '`.goal-lock/lock.json`' },
+  ]);
+  assert.match(source, /optional display only; it is not a dependency or authority/u);
+  assert.match(source, /cannot replace `current\.json`, `lock\.json`, `plan\.json`, `progress\.jsonl`, or evidence records/u);
+});
+
+test('independent README presents a runnable user-guide contract', () => {
+  const source = read('README.md');
+  assertInOrder(source, [
+    '# goal\\-version\\-lock',
+    '## Features',
+    '## Prerequisites',
+    '## Install as a local Skill',
+    '## Quick start',
+    '## CLI reference',
+    '## Core concepts',
+    '## Common workflows',
+    '## Recovery and tamper troubleshooting',
+    '## Optional planning-with-files bridge',
+    '## Non-goals',
+    '## Documentation',
+    '## Contributing',
+    '## License',
+  ]);
+  for (const required of [
+    'Node.js 22 or newer',
+    '`SKILL.md`',
+    '`references/`',
+    '`scripts/`',
+    '`src/goal-lock/`',
+    'no runtime dependencies',
+    'Expected output',
+    'fictional',
+    'goal ID, version, and digest',
+    'optional and non-authoritative',
+  ]) {
+    assert.ok(source.includes(required), `README.md is missing: ${required}`);
+  }
+  const contract = parseGoalLockReference(read('references/contract.md'));
+  const examples = new Set([...source.matchAll(/node scripts\/goal-lock\.js ([a-z][a-z-]+)/gu)].map((match) => match[1]));
+  assert.deepEqual([...examples].sort(), contract.cli.commands.map(({ command }) => command).sort());
+  assert.doesNotMatch(source, /works on (?:Windows|macOS|Linux)|compatible with (?:Claude|Codex|Cursor)/iu);
+});
 
 test('Task 10 文档存在且保持可移植文本格式', () => {
   for (const target of DOCUMENTS) {
@@ -347,6 +508,46 @@ test('goal lock reference defines every persisted artifact', () => {
     { command: 'gate', inventory: 'optional inventory.json' },
     { command: 'recover-lock', owner_token: 'required', lock_digest: 'required' },
   ]);
+});
+
+test('goal lock reference input schemas match the public CLI boundary', () => {
+  const contract = parseGoalLockReference(read('references/contract.md'));
+  assert.deepEqual(contract.inputs, {
+    initial_goal: {
+      command: 'init',
+      fields: ['schema_version', 'goal_id', 'goal_version', 'objective', 'scope', 'non_goals', 'constraints', 'acceptance_criteria', 'authorization_boundary', 'assumptions', 'predecessor', 'accepted_change_id'],
+      fixed: { schema_version: 1, goal_version: 1, predecessor: null, accepted_change_id: null },
+    },
+    plan_candidate: {
+      command: 'plan',
+      fields: ['next_task_id', 'tasks', 'deferred'],
+      derived: ['schema_version', 'goal', 'plan_revision'],
+    },
+    change_proposal: {
+      command: 'propose',
+      fields: ['candidate', 'changes', 'rationale', 'affected_tasks', 'affected_criteria', 'risks', 'validation', 'rollback'],
+      candidate_fields: ['objective', 'scope', 'non_goals', 'constraints', 'acceptance_criteria', 'authorization_boundary', 'assumptions'],
+    },
+    progress: {
+      command: 'record',
+      fields: ['kind', 'event_type', 'task_id', 'summary', 'evidence_refs'],
+      fixed: { kind: 'progress' },
+    },
+    evidence: {
+      command: 'record',
+      fields: ['kind', 'acceptance_criterion_id', 'task_id', 'method', 'observed_result', 'artifact_refs', 'workspace_fingerprint', 'state', 'supersedes'],
+      fixed: { kind: 'evidence' },
+    },
+    final_audit: {
+      command: 'record',
+      fields: ['kind', 'semantic_summary', 'inventory'],
+      fixed: { kind: 'final-audit' },
+    },
+    inventory: {
+      commands: ['gate', 'record final-audit'],
+      shape: 'sorted non-empty array of unique safe delivery-file paths; required only outside Git',
+    },
+  });
 });
 
 test('initial behavior matrix contains positive negative and boundary cases', () => {

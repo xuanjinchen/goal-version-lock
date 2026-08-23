@@ -1,7 +1,7 @@
 {
   "name": "goal-version-lock",
   "version": "0.1.0",
-  "description": "Keep development work aligned to an approved versioned goal contract by gating goal changes, planning, progress evidence, and completion.",
+  "description": "Keep multi-step development work aligned to an approved, versioned goal contract by orchestrating planning, progress, change approval, recovery, and completion gates. Use for requests to lock, freeze with controlled version changes, preserve, or prevent drift in a development goal, or when an existing .goal-lock/ workspace governs the task. Do not use for ordinary planning, personal OKRs, infrastructure configuration drift, or read-only questions outside a development goal contract.",
   "private": true,
   "type": "module",
   "engines": {
