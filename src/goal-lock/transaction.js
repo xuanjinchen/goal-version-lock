@@ -258,6 +258,41 @@ function validateExpected(expected) {
   throw new GoalLockError('INVALID_TRANSACTION', 'input', 2, 'Transaction expected ownership is invalid.');
 }
 
+async function prepareReadOnlyAssertions(root, assertions, seenTargets) {
+  // 只读目标同样参与预检和末次复核，避免“读取后修改”留下跨版本混合状态。
+  if (assertions === undefined) return [];
+  if (!Array.isArray(assertions)) {
+    throw new GoalLockError('INVALID_TRANSACTION', 'input', 2, 'Read-only transaction assertions must be an array.');
+  }
+  const prepared = [];
+  for (const assertion of assertions) {
+    if (assertion === null || typeof assertion !== 'object' || Array.isArray(assertion)) {
+      throw new GoalLockError('INVALID_TRANSACTION', 'input', 2, 'Each read-only transaction assertion must be an object.');
+    }
+    const fields = ['target', 'expected'];
+    if (Object.keys(assertion).length !== fields.length || fields.some((field) => !Object.hasOwn(assertion, field))) {
+      throw new GoalLockError('INVALID_TRANSACTION', 'input', 2, 'Each read-only transaction assertion must contain exactly target and expected.');
+    }
+    validateExpected(assertion.expected);
+    if (assertion.expected.kind !== 'sha256') {
+      throw new GoalLockError('INVALID_TRANSACTION', 'input', 2, 'Read-only transaction assertions must require an existing SHA-256 target.');
+    }
+    const absolute = resolveGoalTarget(root, assertion.target);
+    const targetKey = comparablePath(absolute);
+    if (seenTargets.has(targetKey)) {
+      throw transactionIntegrity(`Duplicate transaction target: ${assertion.target}`);
+    }
+    seenTargets.add(targetKey);
+    await assertSafeAncestors(root, absolute);
+    const original = await readTransactionFile(absolute, 'Read-only transaction target');
+    if (original.digest !== assertion.expected.digest) {
+      throw transactionIntegrity(`Read-only transaction target digest changed: ${assertion.target}`);
+    }
+    prepared.push({ ...assertion, absolute, original });
+  }
+  return prepared;
+}
+
 async function isOwnerProcessAlive(pid, context) {
   if (typeof context.isProcessAlive === 'function') {
     try {
@@ -423,6 +458,7 @@ export async function commitGoalFiles(root, entries, context = {}) {
     }
     prepared.push({ ...entry, absolute, original });
   }
+  const readOnlyAssertions = await prepareReadOnlyAssertions(canonicalRoot, context.readOnlyAssertions, seenTargets);
 
   const transactionId = (context.randomToken ?? randomUUID)();
   const createdDirectories = [];
@@ -484,6 +520,12 @@ export async function commitGoalFiles(root, entries, context = {}) {
       if (entry.content === null ? actual !== null : !actual
         || actual && (!sameIdentity(actual.snapshot, entry.staged.snapshot) || actual.digest !== entry.staged.digest)) {
         throw transactionIntegrity(`Final transaction verification failed: ${entry.target}`);
+      }
+    }
+    for (const assertion of readOnlyAssertions) {
+      const actual = await optionalTransactionFile(assertion.absolute, 'Read-only transaction target');
+      if (!actual || !sameIdentity(actual.snapshot, assertion.original.snapshot) || actual.digest !== assertion.original.digest) {
+        throw transactionIntegrity(`Read-only transaction target changed before final verification: ${assertion.target}`);
       }
     }
   } catch (originalError) {
@@ -620,7 +662,14 @@ export async function withGoalLock(root, command, operation, context = {}) {
   }
   const ownerBytes = canonicalBytes(owner);
 
-  await mkdir(goalLockDirectory, { recursive: true });
+  await invokeFault(context, 'beforeGoalLockMkdir', { goalLockDirectory });
+  const createdDirectory = await mkdir(goalLockDirectory, { recursive: true });
+  let createdDirectoryIdentity = null;
+  // mkdir 返回本次创建路径且 inode 延续到持锁后，才可把失败清理的目录所有权交给调用方。
+  if (createdDirectory && comparablePath(createdDirectory) === comparablePath(goalLockDirectory)) {
+    const snapshot = await lstat(goalLockDirectory, { bigint: true });
+    if (!snapshot.isSymbolicLink() && snapshot.isDirectory()) createdDirectoryIdentity = snapshot;
+  }
   await validateCanonicalDirectory(goalLockDirectory, 'Goal-lock directory');
   let handle;
   let initialIdentity;
@@ -675,7 +724,14 @@ export async function withGoalLock(root, command, operation, context = {}) {
   let result;
   let operationError;
   try {
-    result = await operation();
+    let goalLockDirectoryCreated = false;
+    if (createdDirectoryIdentity) {
+      const currentDirectory = await lstat(goalLockDirectory, { bigint: true });
+      goalLockDirectoryCreated = !currentDirectory.isSymbolicLink()
+        && currentDirectory.isDirectory()
+        && sameIdentity(currentDirectory, createdDirectoryIdentity);
+    }
+    result = await operation({ goalLockDirectoryCreated, goalLockDirectoryIdentity: createdDirectoryIdentity });
   } catch (error) {
     operationError = error;
   }

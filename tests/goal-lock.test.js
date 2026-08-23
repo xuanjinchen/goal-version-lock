@@ -105,6 +105,19 @@ test('initializes goal draft refuses a repeated initialization without changing 
   assert.deepEqual(await readdir(join(fixture.root, '.goal-lock')), ['current.json']);
 });
 
+test('initializes goal draft preserves an empty goal-lock directory created after preflight', async (testContext) => {
+  const fixture = createGoalLockFixture(testContext);
+  const { initializeGoal } = await goalRepository();
+  const directory = join(fixture.root, '.goal-lock');
+  fixture.transactionFaults.beforeGoalLockMkdir = async () => { await mkdir(directory); };
+  fixture.transactionFaults.install = () => { throw new Error('install failure'); };
+
+  await assert.rejects(initializeGoal(fixture.root, goalV1(), fixture), /install failure/);
+
+  assert.equal(existsSync(directory), true);
+  assert.deepEqual(await readdir(directory), []);
+});
+
 test('version 1 lock rejects every approval other than the exact current phrase', async (testContext) => {
   const fixture = createGoalLockFixture(testContext);
   const { initializeGoal, lockInitialGoal } = await goalRepository();
@@ -178,6 +191,23 @@ test('version 1 lock rolls back lock and history when either installation fails'
     assert.equal(await optionalBytes(join(fixture.root, '.goal-lock', 'lock.json')), null);
     assert.equal(await optionalBytes(join(fixture.root, '.goal-lock', 'history', 'goals', 'v0001.json')), null);
   }
+});
+
+test('version 1 lock rolls back when current draft ownership changes during final verification', async (testContext) => {
+  const fixture = createGoalLockFixture(testContext);
+  const { initializeGoal, lockInitialGoal } = await goalRepository();
+  await initializeGoal(fixture.root, goalV1(), fixture);
+  const currentPath = join(fixture.root, '.goal-lock', 'current.json');
+  const externallyEdited = goalV1();
+  externallyEdited.objective = 'Edited outside the writer protocol';
+  const editedBytes = canonicalBytes(externallyEdited);
+  fixture.transactionFaults.finalReadBack = async () => { await writeFile(currentPath, editedBytes); };
+
+  await assert.rejects(lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 92d74f6bf766', fixture), /ownership|current|digest|transaction/i);
+
+  assert.deepEqual(await readFile(currentPath), editedBytes);
+  assert.equal(await optionalBytes(join(fixture.root, '.goal-lock', 'lock.json')), null);
+  assert.equal(await optionalBytes(join(fixture.root, '.goal-lock', 'history', 'goals', 'v0001.json')), null);
 });
 
 test('cooperative lock writes canonical owner bytes and removes them after success', async (testContext) => {

@@ -141,9 +141,13 @@ export async function initializeGoal(root, draft, context = {}) {
   let createdDirectoryIdentity = null;
 
   try {
-    return await withGoalLock(preflight.canonicalRoot, 'init', async () => {
+    return await withGoalLock(preflight.canonicalRoot, 'init', async (ownership) => {
       const directoryIdentity = await assertDraftDirectory(preflight.directory);
-      if (preflight.directoryWasAbsent) createdDirectoryIdentity = directoryIdentity;
+      if (preflight.directoryWasAbsent
+        && ownership.goalLockDirectoryCreated
+        && sameIdentity(directoryIdentity, ownership.goalLockDirectoryIdentity)) {
+        createdDirectoryIdentity = directoryIdentity;
+      }
       await commitGoalFiles(preflight.canonicalRoot, [{
         target: '.goal-lock/current.json',
         expected: { kind: 'absent' },
@@ -197,7 +201,14 @@ export async function lockInitialGoal(root, approval, context = {}) {
     await commitGoalFiles(root, [
       { target: '.goal-lock/lock.json', expected: { kind: 'absent' }, content: canonicalBytes(lock) },
       { target: '.goal-lock/history/goals/v0001.json', expected: { kind: 'absent' }, content: current.bytes },
-    ], context);
+    ], {
+      ...context,
+      // 当前草稿只读参与整个提交的所有权校验，末次校验失败时锁与历史会被事务回滚。
+      readOnlyAssertions: [{
+        target: '.goal-lock/current.json',
+        expected: { kind: 'sha256', digest: current.digest },
+      }],
+    });
     return { state: 'LOCKED', goal_id: current.goal.goal_id, goal_version: 1, goal_digest: current.digest };
   }, context);
 }
