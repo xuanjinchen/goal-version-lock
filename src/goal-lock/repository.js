@@ -4,6 +4,8 @@ import path from 'node:path';
 import { canonicalBytes, parseCanonicalJson, sha256 } from './canonical.js';
 import {
   GoalLockError,
+  approvalPhraseForChange,
+  validateChangeRequest,
   validateEvidence,
   validateGoalContract,
   validateLockRecord,
@@ -20,6 +22,15 @@ const TASK_STATUS_TRANSITIONS = Object.freeze({
   'task-complete': Object.freeze({ from: 'in_progress', to: 'complete' }),
   blocker: Object.freeze({ from: 'in_progress', to: 'blocked' }),
 });
+const GOAL_SEMANTIC_FIELDS = Object.freeze([
+  'objective',
+  'scope',
+  'non_goals',
+  'constraints',
+  'acceptance_criteria',
+  'authorization_boundary',
+  'assumptions',
+]);
 
 function stateError(code, message) {
   return new GoalLockError(code, 'state', 3, message);
@@ -158,95 +169,45 @@ function plainStructuralObject(value, label) {
   return value;
 }
 
-const STRUCTURAL_IDENTIFIERS = {
-  goal: /^GL-[A-Z0-9][A-Z0-9-]*$/,
-  criterion: /^AC-[0-9]{3}$/,
-  task: /^TASK-[0-9]{4}$/,
-  change: /^CR-[0-9]{4}$/,
-  event: /^EVT-[0-9]{6}$/,
-};
-const STRUCTURAL_DIGEST = /^[a-f0-9]{64}$/;
-const STRUCTURAL_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/;
-
-function requiredFields(value, label, fields) {
-  plainStructuralObject(value, label);
-  const missing = fields.filter((field) => !Object.hasOwn(value, field));
-  if (missing.length > 0) {
-    throw integrityError('OPTIONAL_STATE_INVALID', `${label} is missing required envelope fields.`);
-  }
-  return value;
-}
-
-function structuralIdentifier(value, pattern, label) {
-  if (typeof value !== 'string' || !pattern.test(value)) {
-    throw integrityError('OPTIONAL_STATE_INVALID', `${label} is not a valid identifier.`);
-  }
-  return value;
-}
-
-function structuralDigest(value, label) {
-  if (typeof value !== 'string' || !STRUCTURAL_DIGEST.test(value)) {
-    throw integrityError('OPTIONAL_STATE_INVALID', `${label} is not a SHA-256 digest.`);
-  }
-  return value;
-}
-
-function structuralText(value, label) {
-  if (typeof value !== 'string' || value.length === 0 || value.trim() !== value) {
-    throw integrityError('OPTIONAL_STATE_INVALID', `${label} must be non-empty trimmed text.`);
-  }
-  return value;
-}
-
-function structuralArray(value, label) {
-  if (!Array.isArray(value)) throw integrityError('OPTIONAL_STATE_INVALID', `${label} must be an array.`);
-  return value;
-}
-
-function structuralPositiveInteger(value, label) {
-  if (!Number.isSafeInteger(value) || value < 1) {
-    throw integrityError('OPTIONAL_STATE_INVALID', `${label} must be a positive integer.`);
-  }
-  return value;
-}
-
-function structuralTimestamp(value, label) {
-  if (typeof value !== 'string' || !STRUCTURAL_TIMESTAMP.test(value)) {
-    throw integrityError('OPTIONAL_STATE_INVALID', `${label} must be an RFC 3339 UTC timestamp.`);
-  }
-  return value;
-}
-
-function validateGoalReference(value, label) {
-  requiredFields(value, label, ['goal_id', 'goal_version', 'goal_digest']);
-  structuralIdentifier(value.goal_id, STRUCTURAL_IDENTIFIERS.goal, `${label}.goal_id`);
-  structuralPositiveInteger(value.goal_version, `${label}.goal_version`);
-  structuralDigest(value.goal_digest, `${label}.goal_digest`);
-}
-
 function validateChangeEnvelope(value, expectedId) {
-  const label = 'change request';
-  requiredFields(value, label, ['schema_version', 'id', 'status', 'base_goal', 'candidate_goal', 'candidate_digest', 'proposal_digest', 'changes', 'rationale', 'affected_tasks', 'affected_criteria', 'risks', 'validation', 'rollback', 'approval_phrase', 'recorded_at']);
-  if (value.schema_version !== 1) throw integrityError('CHANGE_STATE_INVALID', 'Change request schema_version must equal 1.');
-  structuralIdentifier(value.id, STRUCTURAL_IDENTIFIERS.change, `${label}.id`);
-  if (value.id !== expectedId) throw integrityError('CHANGE_STATE_INVALID', 'Change request ID does not match its filename.');
-  if (!['proposed', 'approved', 'rejected', 'superseded'].includes(value.status)) {
-    throw integrityError('CHANGE_STATE_INVALID', 'Change request status is unsupported.');
+  let normalized;
+  try {
+    normalized = validateChangeRequest(value);
+  } catch (error) {
+    throw repositoryIntegrity('CHANGE_STATE_INVALID', 'Change request violates the complete change contract.', error);
   }
-  validateGoalReference(value.base_goal, `${label}.base_goal`);
-  requiredFields(value.candidate_goal, `${label}.candidate_goal`, ['schema_version', 'goal_id', 'goal_version', 'objective', 'scope', 'non_goals', 'constraints', 'acceptance_criteria', 'authorization_boundary', 'assumptions', 'predecessor', 'accepted_change_id']);
-  structuralDigest(value.candidate_digest, `${label}.candidate_digest`);
-  structuralDigest(value.proposal_digest, `${label}.proposal_digest`);
-  structuralArray(value.changes, `${label}.changes`);
-  structuralText(value.rationale, `${label}.rationale`);
-  for (const taskId of structuralArray(value.affected_tasks, `${label}.affected_tasks`)) structuralIdentifier(taskId, STRUCTURAL_IDENTIFIERS.task, `${label}.affected_tasks`);
-  for (const criterionId of structuralArray(value.affected_criteria, `${label}.affected_criteria`)) structuralIdentifier(criterionId, STRUCTURAL_IDENTIFIERS.criterion, `${label}.affected_criteria`);
-  for (const field of ['risks', 'validation', 'rollback']) {
-    for (const entry of structuralArray(value[field], `${label}.${field}`)) structuralText(entry, `${label}.${field}`);
+  if (normalized.id !== expectedId) {
+    throw integrityError('CHANGE_STATE_INVALID', 'Change request ID does not match its filename.');
   }
-  structuralText(value.approval_phrase, `${label}.approval_phrase`);
-  structuralTimestamp(value.recorded_at, `${label}.recorded_at`);
-  return value;
+  return normalized;
+}
+
+function canonicalValuesEqual(left, right) {
+  return canonicalBytes(left).equals(canonicalBytes(right));
+}
+
+function validateSemanticChangeCoverage(baseGoal, candidateGoal, changes, createError, { requireOrder = false } = {}) {
+  const expected = GOAL_SEMANTIC_FIELDS
+    .filter((field) => !canonicalValuesEqual(baseGoal[field], candidateGoal[field]))
+    .map((field) => ({ field, before: baseGoal[field], after: candidateGoal[field] }));
+  const claims = Array.isArray(changes) ? new Map(changes.map((change) => [change?.field, change])) : new Map();
+  let exact = false;
+  try {
+    exact = changes?.length === expected.length
+      && claims.size === changes.length
+      && expected.every((difference) => {
+        const claim = claims.get(difference.field);
+        return claim
+          && canonicalValuesEqual(claim.before, difference.before)
+          && canonicalValuesEqual(claim.after, difference.after);
+      });
+  } catch {
+    exact = false;
+  }
+  const ordered = !requireOrder || changes.every((change, index) => change.field === expected[index].field);
+  // 每个顶层语义字段落盘时按固定契约顺序出现，漏报、虚报、重复或错配前后值都不能形成可批准提案。
+  if (!exact || !ordered || expected.length === 0) throw createError();
+  return expected;
 }
 
 async function readCanonicalObject(reader, relativePath, label) {
@@ -335,31 +296,74 @@ async function verifyPlanState(reader, rootNames, current, goalHistory) {
   return { present, current: currentRecord, archives };
 }
 
-async function verifyChangeState(reader, rootNames, lock) {
+async function verifyChangeState(reader, rootNames, lock, current, goalHistory) {
   if (!rootNames.includes('changes')) {
     if (lock.change_head !== null) throw integrityError('CHANGE_STATE_MISSING', 'Lock change head requires change state.');
     return { count: 0, pending: false, records: new Map() };
   }
   const directory = await reader.readDirectory('.goal-lock/changes');
+  const expectedNames = Array.from(
+    { length: directory.names.length },
+    (_, index) => `CR-${String(index + 1).padStart(4, '0')}.json`,
+  );
+  if (expectedNames.length === 0 || directory.names.some((name, index) => name !== expectedNames[index])) {
+    throw integrityError('CHANGE_SEQUENCE_INVALID', 'Change request IDs must be unique and contiguous from CR-0001.');
+  }
   const records = new Map();
   let pending = false;
+  const openTargets = new Set();
   for (const name of directory.names) {
-    if (!/^CR-[0-9]{4}\.json$/.test(name)) {
-      throw integrityError('CHANGE_STATE_INVALID', 'Change state contains an unexpected entry.');
-    }
     const record = await readCanonicalObject(reader, `.goal-lock/changes/${name}`, 'change request');
     const changeId = name.slice(0, -5);
-    validateChangeEnvelope(record.value, changeId);
-    records.set(changeId, record);
-    if (record.value.status === 'proposed') pending = true;
-  }
-  if (lock.change_head !== null) {
-    const head = records.get(lock.change_head.change_request_id);
-    if (!head || head.digest !== lock.change_head.digest) {
-      throw integrityError('CHANGE_HEAD_MISMATCH', 'Lock change head does not match its change request record.');
+    const value = validateChangeEnvelope(record.value, changeId);
+    const base = goalHistory.get(value.base_goal.goal_version);
+    if (!base
+      || value.base_goal.goal_id !== base.goal.goal_id
+      || value.base_goal.goal_digest !== base.digest) {
+      throw integrityError('CHANGE_BASE_MISMATCH', 'Change request base does not bind an accepted goal version.');
     }
+    validateSemanticChangeCoverage(base.goal, value.candidate_goal, value.changes, () => (
+      integrityError('CHANGE_COVERAGE_INVALID', 'Change request field-level changes do not exactly cover the semantic difference.')
+    ), { requireOrder: true });
+    const criterionIds = new Set(base.goal.acceptance_criteria.map((criterion) => criterion.id));
+    if (value.affected_criteria.some((criterionId) => !criterionIds.has(criterionId))) {
+      throw integrityError('CHANGE_CRITERION_UNKNOWN', 'Change request affected criteria must exist in its base goal.');
+    }
+    if (value.status === 'approved') {
+      const acceptedGoal = goalHistory.get(value.candidate_goal.goal_version);
+      if (!acceptedGoal || acceptedGoal.digest !== value.candidate_digest || !acceptedGoal.bytes.equals(canonicalBytes(value.candidate_goal))) {
+        throw integrityError('CHANGE_CANDIDATE_MISMATCH', 'Approved change request candidate must be an accepted goal version.');
+      }
+    }
+    if (value.status === 'proposed') {
+      const target = `${value.base_goal.goal_version}/${value.candidate_goal.goal_version}`;
+      if (openTargets.has(target)) throw integrityError('CHANGE_OPEN_DUPLICATE', 'Only one proposed change may target a base and candidate version.');
+      openTargets.add(target);
+      if (value.base_goal.goal_version !== current.goal.goal_version || value.base_goal.goal_digest !== current.digest) {
+        throw integrityError('CHANGE_BASE_STALE', 'Proposed change request base must equal the active goal.');
+      }
+      pending = true;
+    }
+    records.set(changeId, { ...record, value, target: `.goal-lock/changes/${name}` });
+  }
+  const terminalId = `CR-${String(records.size).padStart(4, '0')}`;
+  const terminal = records.get(terminalId);
+  if (lock.change_head?.change_request_id !== terminalId || lock.change_head?.digest !== terminal.digest) {
+    throw integrityError('CHANGE_HEAD_MISMATCH', 'Lock change head must match the terminal change request record.');
   }
   return { count: records.size, pending, records };
+}
+
+function verifyChangeReferences(changeState, planState) {
+  const plans = [planState.current, ...planState.archives].filter(Boolean);
+  for (const record of changeState.records.values()) {
+    const knownTasks = new Set(plans
+      .filter((plan) => plan.value.goal.goal_version === record.value.base_goal.goal_version)
+      .flatMap((plan) => plan.value.tasks.map((task) => task.id)));
+    if (record.value.affected_tasks.some((taskId) => !knownTasks.has(taskId))) {
+      throw integrityError('CHANGE_TASK_UNKNOWN', 'Change request affected tasks must exist in a plan for its base goal.');
+    }
+  }
 }
 
 /** 限制账本绑定只向前推进；跨目标版本仅预留相邻版本入口，具体生命周期由后续任务定义。 */
@@ -801,9 +805,10 @@ export async function verifyGoalRepository(root, context = {}) {
     }
 
     const lockInput = await readLock(reader);
-    const changeState = await verifyChangeState(reader, rootNames, lockInput.lock);
     const history = await verifyGoalHistory(reader, current, lockInput.lock);
+    const changeState = await verifyChangeState(reader, rootNames, lockInput.lock, current, history.goals);
     const planState = await verifyPlanState(reader, rootNames, current, history.goals);
+    verifyChangeReferences(changeState, planState);
     const evidenceState = await verifyEvidenceState(
       reader,
       rootNames,
@@ -832,7 +837,7 @@ export async function verifyGoalRepository(root, context = {}) {
       evidence: verificationEvidence(reader, current, optional, [], evidenceState.publicLatest),
     };
     return context[RETURN_VERIFIED_SNAPSHOT] === true
-      ? { result, reader, current, rootNames, lockInput, planState, progressState, evidenceState, history }
+      ? { result, reader, current, rootNames, lockInput, planState, progressState, evidenceState, changeState, history }
       : result;
   } catch (error) {
     const failure = repositoryIntegrity('GOAL_REPOSITORY_TAMPERED', 'Goal repository integrity verification failed.', error);
@@ -941,6 +946,108 @@ function validatePlanCandidate(candidate) {
     throw inputError('INVALID_PLAN_INPUT', 'Plan candidate must contain exactly next_task_id, tasks, and deferred.');
   }
   return candidate;
+}
+
+function validateChangeProposalInput(input) {
+  if (input === null
+    || typeof input !== 'object'
+    || Array.isArray(input)
+    || (Object.getPrototypeOf(input) !== Object.prototype && Object.getPrototypeOf(input) !== null)) {
+    throw inputError('INVALID_CHANGE_INPUT', 'Change proposal input must be an object.');
+  }
+  const fields = ['candidate', 'changes', 'rationale', 'affected_tasks', 'affected_criteria', 'risks', 'validation', 'rollback'];
+  const keys = Object.keys(input);
+  if (keys.length !== fields.length || fields.some((field) => !Object.hasOwn(input, field))) {
+    throw inputError('INVALID_CHANGE_INPUT', 'Change proposal input contains missing or derived fields.');
+  }
+  if (input.candidate === null
+    || typeof input.candidate !== 'object'
+    || Array.isArray(input.candidate)
+    || (Object.getPrototypeOf(input.candidate) !== Object.prototype && Object.getPrototypeOf(input.candidate) !== null)) {
+    throw inputError('INVALID_CHANGE_INPUT', 'Change candidate must be an object.');
+  }
+  const candidateKeys = Object.keys(input.candidate);
+  if (candidateKeys.length !== GOAL_SEMANTIC_FIELDS.length
+    || GOAL_SEMANTIC_FIELDS.some((field) => !Object.hasOwn(input.candidate, field))) {
+    throw inputError('INVALID_CHANGE_INPUT', 'Change candidate must contain only semantic goal fields.');
+  }
+  return input;
+}
+
+function proposalPayload(changeRequest) {
+  const {
+    status: _status,
+    proposal_digest: _proposalDigest,
+    approval_phrase: _approvalPhrase,
+    ...payload
+  } = changeRequest;
+  return payload;
+}
+
+function nextLockForChange(lockInput, changeRequestId, changeDigest) {
+  const { record_digest: _recordDigest, ...withoutDigest } = lockInput.lock;
+  const nextWithoutDigest = {
+    ...withoutDigest,
+    state_revision: lockInput.lock.state_revision + 1,
+    change_head: { change_request_id: changeRequestId, digest: changeDigest },
+  };
+  return validateLockRecord({
+    ...nextWithoutDigest,
+    record_digest: sha256(canonicalBytes(nextWithoutDigest)),
+  });
+}
+
+function verifiedChangeMutationEntries(snapshot, mutableChangeRequestId = null) {
+  const entries = verifiedHistoryEntries(snapshot.current, snapshot.history, snapshot.planState);
+  if (snapshot.planState.current) {
+    entries.push({
+      target: '.goal-lock/plan.json',
+      expected: { kind: 'sha256', digest: snapshot.planState.current.digest },
+      content: snapshot.planState.current.bytes,
+    });
+  }
+  if (snapshot.progressState.input) {
+    entries.push({
+      target: '.goal-lock/progress.jsonl',
+      expected: { kind: 'sha256', digest: snapshot.progressState.input.digest },
+      content: snapshot.progressState.input.bytes,
+    });
+  }
+  for (const record of snapshot.changeState.records.values()) {
+    if (record.value.id === mutableChangeRequestId) continue;
+    entries.push({
+      target: record.target,
+      expected: { kind: 'sha256', digest: record.digest },
+      content: record.bytes,
+    });
+  }
+  entries.push(...verifiedEvidenceEntries(snapshot.evidenceState));
+  return entries;
+}
+
+function validateChangeRejectionInput(changeRequestId, reason) {
+  if (typeof changeRequestId !== 'string' || !/^CR-[0-9]{4}$/.test(changeRequestId)) {
+    throw inputError('INVALID_CHANGE_ID', 'Change rejection requires an exact CR-NNNN identifier.');
+  }
+  if (typeof reason !== 'string' || reason.length === 0 || reason.trim() !== reason || reason.length > 500) {
+    throw inputError('INVALID_REJECTION_REASON', 'Change rejection reason must be non-empty trimmed text of at most 500 characters.');
+  }
+}
+
+function assertChangeReferencesExist(input, current, planState) {
+  const taskIds = new Set(planState.current?.value.tasks.map((task) => task.id) ?? []);
+  if (input.affected_tasks.some((taskId) => !taskIds.has(taskId))) {
+    throw inputError('INVALID_CHANGE_REFERENCE', 'Affected tasks must exist in the current plan.');
+  }
+  const criterionIds = new Set(current.goal.acceptance_criteria.map((criterion) => criterion.id));
+  if (input.affected_criteria.some((criterionId) => !criterionIds.has(criterionId))) {
+    throw inputError('INVALID_CHANGE_REFERENCE', 'Affected criteria must exist in the current goal.');
+  }
+}
+
+function hasStaleChangeBase(planState, evidenceState) {
+  return (planState.current?.value.tasks.some((task) => task.status === 'stale') ?? false)
+    || [...evidenceState.latestByCriterion.values()].some((record) => record.value.state === 'stale');
 }
 
 function validateGoalEventInput(input) {
@@ -1342,6 +1449,176 @@ export async function recordGoalEvent(root, input, context = {}) {
       goal_version: current.goal.goal_version,
       plan_revision: plan.plan_revision,
       task_id: event.task_id,
+    };
+  }, context);
+}
+
+export async function proposeGoalChange(root, input, context = {}) {
+  validateChangeProposalInput(input);
+  return withGoalLock(root, 'change-propose', async () => {
+    const snapshot = await verifyGoalRepository(root, {
+      ...context,
+      mutating: true,
+      [ACTIVE_WRITE]: true,
+      [RETURN_VERIFIED_SNAPSHOT]: true,
+    });
+    if (snapshot.result.state !== 'LOCKED') {
+      throw stateError('CHANGE_STATE_REJECTED', `Change proposals require LOCKED state, not ${snapshot.result.state}.`);
+    }
+    const {
+      reader,
+      current,
+      lockInput,
+      planState,
+      progressState,
+      evidenceState,
+      changeState,
+    } = snapshot;
+    if (hasStaleChangeBase(planState, evidenceState)) {
+      throw stateError('CHANGE_BASE_STALE', 'Change proposals require a current non-stale goal, plan, and evidence state.');
+    }
+    if (changeState.count >= 9999) throw stateError('CHANGE_SEQUENCE_EXHAUSTED', 'Change request sequence exhausted its four-digit identifier space.');
+
+    const changeRequestId = `CR-${String(changeState.count + 1).padStart(4, '0')}`;
+    const baseGoal = {
+      goal_id: current.goal.goal_id,
+      goal_version: current.goal.goal_version,
+      goal_digest: current.digest,
+    };
+    let candidateGoal;
+    try {
+      candidateGoal = validateGoalContract({
+        schema_version: 1,
+        goal_id: current.goal.goal_id,
+        goal_version: current.goal.goal_version + 1,
+        ...input.candidate,
+        predecessor: { goal_version: current.goal.goal_version, goal_digest: current.digest },
+        accepted_change_id: changeRequestId,
+      }, { goal_id: current.goal.goal_id });
+    } catch (error) {
+      throw new GoalLockError('INVALID_CHANGE_INPUT', 'input', 2, 'Change candidate violates the semantic goal contract.', { cause: error });
+    }
+    const normalizedChanges = validateSemanticChangeCoverage(current.goal, candidateGoal, input.changes, () => (
+      inputError('INVALID_CHANGE_COVERAGE', 'Changes must exactly cover every semantic difference.')
+    ));
+
+    const candidateBytes = canonicalBytes(candidateGoal);
+    const candidateDigest = sha256(candidateBytes);
+    const incomplete = {
+      schema_version: 1,
+      id: changeRequestId,
+      status: 'proposed',
+      base_goal: baseGoal,
+      candidate_goal: candidateGoal,
+      candidate_digest: candidateDigest,
+      proposal_digest: '0'.repeat(64),
+      changes: normalizedChanges,
+      rationale: input.rationale,
+      affected_tasks: input.affected_tasks,
+      affected_criteria: input.affected_criteria,
+      risks: input.risks,
+      validation: input.validation,
+      rollback: input.rollback,
+      approval_phrase: 'pending',
+      recorded_at: (context.now ?? (() => new Date().toISOString()))(),
+    };
+    let proposalDigest;
+    try {
+      proposalDigest = sha256(canonicalBytes(proposalPayload(incomplete)));
+    } catch (error) {
+      throw new GoalLockError('INVALID_CHANGE_INPUT', 'input', 2, 'Change proposal must contain only canonical JSON values.', { cause: error });
+    }
+    const approvalRequired = approvalPhraseForChange({
+      id: changeRequestId,
+      candidate_goal: candidateGoal,
+      proposal_digest: proposalDigest,
+    });
+    let changeRequest;
+    try {
+      changeRequest = validateChangeRequest({
+        ...incomplete,
+        proposal_digest: proposalDigest,
+        approval_phrase: approvalRequired,
+      });
+    } catch (error) {
+      if (error instanceof GoalLockError && error.kind === 'input') throw error;
+      throw new GoalLockError('INVALID_CHANGE_INPUT', 'input', 2, 'Change proposal violates the change request contract.', { cause: error });
+    }
+    assertChangeReferencesExist(changeRequest, current, planState);
+
+    const changeBytes = canonicalBytes(changeRequest);
+    const changeDigest = sha256(changeBytes);
+    const nextLock = nextLockForChange(lockInput, changeRequestId, changeDigest);
+    const entries = verifiedChangeMutationEntries(snapshot);
+    entries.push({
+      target: `.goal-lock/changes/${changeRequestId}.json`,
+      expected: { kind: 'absent' },
+      content: changeBytes,
+    });
+    entries.push({
+      target: '.goal-lock/lock.json',
+      expected: { kind: 'sha256', digest: lockInput.digest },
+      content: canonicalBytes(nextLock),
+    });
+    // 新 CR 与 change_head 共享一次 revision；完整快照作为只读所有权输入，失败时两项一起回滚。
+    await reader.verifyInputs();
+    await commitGoalFiles(root, entries, context);
+    return {
+      state: 'CHANGE_PENDING',
+      change_request_id: changeRequestId,
+      candidate_goal_version: candidateGoal.goal_version,
+      candidate_digest: candidateDigest,
+      proposal_digest: proposalDigest,
+      approval_required: approvalRequired,
+    };
+  }, context);
+}
+
+export async function rejectGoalChange(root, changeRequestId, reason, context = {}) {
+  validateChangeRejectionInput(changeRequestId, reason);
+  return withGoalLock(root, 'change-reject', async () => {
+    const snapshot = await verifyGoalRepository(root, {
+      ...context,
+      mutating: true,
+      [ACTIVE_WRITE]: true,
+      [RETURN_VERIFIED_SNAPSHOT]: true,
+    });
+    if (!['CHANGE_PENDING', 'LOCKED'].includes(snapshot.result.state)) {
+      throw stateError('CHANGE_REJECTION_STATE', `Change rejection requires verified goal state, not ${snapshot.result.state}.`);
+    }
+    const record = snapshot.changeState.records.get(changeRequestId);
+    if (!record) throw stateError('CHANGE_NOT_FOUND', 'The selected change request does not exist.');
+    if (record.value.status !== 'proposed') {
+      throw stateError('CHANGE_NOT_OPEN', 'Only an exact proposed change request may be rejected.');
+    }
+    if (snapshot.result.state !== 'CHANGE_PENDING') {
+      throw stateError('CHANGE_NOT_PENDING', 'The selected change request is not the open repository change.');
+    }
+
+    // 拒绝只替换状态；提案字段、摘要、批准短语和记录时间保持逐值不变。
+    const rejected = validateChangeRequest({ ...record.value, status: 'rejected' });
+    const rejectedBytes = canonicalBytes(rejected);
+    const rejectedDigest = sha256(rejectedBytes);
+    const nextLock = nextLockForChange(snapshot.lockInput, changeRequestId, rejectedDigest);
+    const entries = verifiedChangeMutationEntries(snapshot, changeRequestId);
+    entries.push({
+      target: record.target,
+      expected: { kind: 'sha256', digest: record.digest },
+      content: rejectedBytes,
+    });
+    entries.push({
+      target: '.goal-lock/lock.json',
+      expected: { kind: 'sha256', digest: snapshot.lockInput.digest },
+      content: canonicalBytes(nextLock),
+    });
+    // CR 状态与 change_head 同属一次原子替换，任一所有权或安装失败都恢复原提案与原锁。
+    await snapshot.reader.verifyInputs();
+    await commitGoalFiles(root, entries, context);
+    return {
+      state: 'LOCKED',
+      change_request_id: changeRequestId,
+      status: 'rejected',
+      reason,
     };
   }, context);
 }

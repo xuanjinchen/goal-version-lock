@@ -20,6 +20,24 @@ const IDENTIFIERS = {
   evidence_id: /^EVID-[0-9]{4}$/,
   task_id: /^TASK-[0-9]{4}$/,
 };
+const CHANGE_REQUEST_FIELDS = [
+  'schema_version',
+  'id',
+  'status',
+  'base_goal',
+  'candidate_goal',
+  'candidate_digest',
+  'proposal_digest',
+  'changes',
+  'rationale',
+  'affected_tasks',
+  'affected_criteria',
+  'risks',
+  'validation',
+  'rollback',
+  'approval_phrase',
+  'recorded_at',
+];
 
 export class GoalLockError extends Error {
   constructor(code, kind, exitCode, message, options = {}) {
@@ -121,6 +139,14 @@ function array(value, label, { nonEmpty = false } = {}) {
 
 function textArray(value, label, options = {}) {
   return array(value, label, options).map((entry, index) => requiredText(entry, `${label}[${index}]`));
+}
+
+function uniqueIdentifiers(value, label, type) {
+  const normalized = array(value, label).map((entry, index) => identifier(entry, type, `${label}[${index}]`));
+  if (new Set(normalized).size !== normalized.length) {
+    fail('INVALID_CONTRACT', 'input', 2, `${label} must not contain duplicate identifiers`);
+  }
+  return normalized;
 }
 
 function validatePredecessor(value, goalVersion) {
@@ -467,6 +493,78 @@ export function validateLockRecord(value) {
   // record_digest 是锁记录自身的防篡改边界，因此只排除它本身参与摘要。
   const { record_digest: suppliedDigest, ...withoutDigest } = normalized;
   if (sha256(canonicalBytes(withoutDigest)) !== suppliedDigest) fail('INTEGRITY_FAILURE', 'integrity', 4, 'record_digest does not match the lock record');
+  return deepFreeze(normalized);
+}
+
+export function validateChangeRequest(value) {
+  exactKeys(value, 'change request', CHANGE_REQUEST_FIELDS);
+  if (value.schema_version !== 1) fail('INVALID_CONTRACT', 'input', 2, 'change request.schema_version must equal 1');
+  const id = identifier(value.id, 'change_request_id', 'change request.id');
+  if (!['proposed', 'approved', 'rejected', 'superseded'].includes(value.status)) {
+    fail('INVALID_CONTRACT', 'input', 2, 'change request.status is invalid');
+  }
+  exactKeys(value.base_goal, 'change request.base_goal', ['goal_id', 'goal_version', 'goal_digest']);
+  const baseGoal = {
+    goal_id: identifier(value.base_goal.goal_id, 'goal_id', 'change request.base_goal.goal_id'),
+    goal_version: positiveInteger(value.base_goal.goal_version, 'change request.base_goal.goal_version'),
+    goal_digest: digest(value.base_goal.goal_digest, 'change request.base_goal.goal_digest'),
+  };
+  const candidateGoal = validateGoalContract(value.candidate_goal, { goal_id: baseGoal.goal_id });
+  if (candidateGoal.goal_version !== baseGoal.goal_version + 1
+    || candidateGoal.accepted_change_id !== id
+    || candidateGoal.predecessor?.goal_version !== baseGoal.goal_version
+    || candidateGoal.predecessor?.goal_digest !== baseGoal.goal_digest) {
+    fail('INVALID_CONTRACT', 'input', 2, 'change request candidate metadata does not exactly follow its base goal');
+  }
+  const candidateDigest = digest(value.candidate_digest, 'change request.candidate_digest');
+  if (candidateDigest !== sha256(canonicalBytes(candidateGoal))) {
+    fail('INVALID_CONTRACT', 'input', 2, 'change request.candidate_digest does not match candidate_goal');
+  }
+  const changedFields = new Set();
+  const changes = array(value.changes, 'change request.changes', { nonEmpty: true }).map((change, index) => {
+    exactKeys(change, `change request.changes[${index}]`, ['field', 'before', 'after']);
+    const field = requiredText(change.field, `change request.changes[${index}].field`);
+    if (changedFields.has(field)) fail('INVALID_CONTRACT', 'input', 2, 'change request.changes contains a duplicate field');
+    changedFields.add(field);
+    try {
+      canonicalBytes(change.before);
+      canonicalBytes(change.after);
+    } catch {
+      fail('INVALID_CONTRACT', 'input', 2, `change request.changes[${index}] values must be canonical JSON`);
+    }
+    return { field, before: structuredClone(change.before), after: structuredClone(change.after) };
+  });
+  const normalized = {
+    schema_version: 1,
+    id,
+    status: value.status,
+    base_goal: baseGoal,
+    candidate_goal: candidateGoal,
+    candidate_digest: candidateDigest,
+    proposal_digest: digest(value.proposal_digest, 'change request.proposal_digest'),
+    changes,
+    rationale: requiredText(value.rationale, 'change request.rationale'),
+    affected_tasks: uniqueIdentifiers(value.affected_tasks, 'change request.affected_tasks', 'task_id'),
+    affected_criteria: uniqueIdentifiers(value.affected_criteria, 'change request.affected_criteria', 'acceptance_criterion_id'),
+    risks: textArray(value.risks, 'change request.risks'),
+    validation: textArray(value.validation, 'change request.validation'),
+    rollback: textArray(value.rollback, 'change request.rollback'),
+    approval_phrase: requiredText(value.approval_phrase, 'change request.approval_phrase'),
+    recorded_at: timestamp(value.recorded_at, 'change request.recorded_at'),
+  };
+  const {
+    status: _status,
+    proposal_digest: suppliedProposalDigest,
+    approval_phrase: _approvalPhrase,
+    ...proposalPayload
+  } = normalized;
+  // proposal_digest 自身不是提案载荷；载荷只排除可变状态与由摘要派生的批准短语。
+  if (sha256(canonicalBytes(proposalPayload)) !== suppliedProposalDigest) {
+    fail('INTEGRITY_FAILURE', 'integrity', 4, 'change request.proposal_digest does not match the immutable proposal payload');
+  }
+  if (normalized.approval_phrase !== approvalPhraseForChange(normalized)) {
+    fail('INTEGRITY_FAILURE', 'integrity', 4, 'change request.approval_phrase does not bind the proposal');
+  }
   return deepFreeze(normalized);
 }
 

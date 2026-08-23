@@ -43,16 +43,13 @@ async function installVersionTwo(fixture, changeId = 'CR-0001') {
   };
   const bytes = canonicalBytes(goal);
   const digest = independentSha256(bytes);
-  const proposalDigest = '9'.repeat(64);
+  const change = structuralChange(changeId, { candidateGoal: goal });
+  const proposalDigest = change.proposal_digest;
+  const changeBytes = canonicalBytes(change);
   await writeFile(join(directory, 'current.json'), bytes);
   await writeFile(join(directory, 'history', 'goals', 'v0002.json'), bytes);
   await mkdir(join(directory, 'changes'), { recursive: true });
-  await writeFile(join(directory, 'changes', `${changeId}.json`), canonicalBytes({
-    ...structuralChange(changeId),
-    candidate_goal: goal,
-    candidate_digest: digest,
-    proposal_digest: proposalDigest,
-  }));
+  await writeFile(join(directory, 'changes', `${changeId}.json`), changeBytes);
   const lockWithoutDigest = {
     schema_version: 1,
     goal_id: 'GL-ALPHA',
@@ -64,7 +61,7 @@ async function installVersionTwo(fixture, changeId = 'CR-0001') {
     predecessor_digest: independentSha256(previousBytes),
     state_revision: 2,
     progress_head: null,
-    change_head: null,
+    change_head: { change_request_id: changeId, digest: independentSha256(changeBytes) },
     evidence_heads: {},
   };
   await writeFile(join(directory, 'lock.json'), canonicalBytes({
@@ -224,6 +221,414 @@ function planCandidate(outcome = 'Implement the locked state transition') {
     deferred: plan.deferred,
   };
 }
+
+function changeCandidate() {
+  const goal = goalV1();
+  return {
+    objective: 'Ship a safer lock',
+    scope: goal.scope,
+    non_goals: goal.non_goals,
+    constraints: goal.constraints,
+    acceptance_criteria: [{ id: 'AC-001', outcome: 'State remains safely locked', verification: 'Run verification' }],
+    authorization_boundary: goal.authorization_boundary,
+    assumptions: goal.assumptions,
+  };
+}
+
+function changeProposalInput(overrides = {}) {
+  return {
+    candidate: changeCandidate(),
+    changes: [
+      { field: 'objective', before: 'Ship a safe lock', after: 'Ship a safer lock' },
+      {
+        field: 'acceptance_criteria',
+        before: [{ id: 'AC-001', outcome: 'State is locked', verification: 'Run verification' }],
+        after: [{ id: 'AC-001', outcome: 'State remains safely locked', verification: 'Run verification' }],
+      },
+    ],
+    rationale: 'Strengthen the accepted safety outcome',
+    affected_tasks: ['TASK-0001'],
+    affected_criteria: ['AC-001'],
+    risks: ['Existing implementation may need revision'],
+    validation: ['Run the complete goal-lock test file'],
+    rollback: ['Reject the proposal and keep version one'],
+    ...overrides,
+  };
+}
+
+const CHANGE_CANDIDATE_DIGEST = 'e2757e366e6229d0b8be1698a457ed61788bb11534da8671447c5eb78bd2db79';
+const CHANGE_PROPOSAL_DIGEST = '3cbab5b6bf74c7b173fef5e628f946f295e209d3e62fbc3954b52339b981ee88';
+const CHANGE_RECORD_DIGEST = '9c71174dc8aeb3cedb2577670d386bdfa18949c65fe4e6820c784b7884342660';
+
+function expectedChangeRequest(overrides = {}) {
+  return {
+    schema_version: 1,
+    id: 'CR-0001',
+    status: 'proposed',
+    base_goal: activeGoalReference(),
+    candidate_goal: {
+      schema_version: 1,
+      goal_id: 'GL-ALPHA',
+      goal_version: 2,
+      ...changeCandidate(),
+      predecessor: { goal_version: 1, goal_digest: activeGoalReference().goal_digest },
+      accepted_change_id: 'CR-0001',
+    },
+    candidate_digest: CHANGE_CANDIDATE_DIGEST,
+    proposal_digest: CHANGE_PROPOSAL_DIGEST,
+    changes: changeProposalInput().changes,
+    rationale: 'Strengthen the accepted safety outcome',
+    affected_tasks: ['TASK-0001'],
+    affected_criteria: ['AC-001'],
+    risks: ['Existing implementation may need revision'],
+    validation: ['Run the complete goal-lock test file'],
+    rollback: ['Reject the proposal and keep version one'],
+    approval_phrase: 'APPROVE CR-0001 GOAL VERSION 2 3cbab5b6bf74',
+    recorded_at: '2026-08-23T00:00:00.000Z',
+    ...overrides,
+  };
+}
+
+async function createChangeProposalFixture(testContext) {
+  const fixture = createGoalLockFixture(testContext);
+  const repository = await goalRepository();
+  await repository.initializeGoal(fixture.root, goalV1(), fixture);
+  await repository.lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 92d74f6bf766', fixture);
+  await repository.revisePlan(fixture.root, planCandidate(), 'aligned', fixture);
+  return { fixture, repository };
+}
+
+test('change proposal derives one exact canonical request and advances only the lock integrity index', async (testContext) => {
+  const { fixture, repository } = await createChangeProposalFixture(testContext);
+  const directory = join(fixture.root, '.goal-lock');
+  const preservedPaths = ['current.json', 'plan.json', 'progress.jsonl', 'history/goals/v0001.json'];
+  const preserved = new Map(await Promise.all(preservedPaths.map(async (relativePath) => [relativePath, await readFile(join(directory, ...relativePath.split('/')))])));
+  const lockBefore = parseCanonicalJson(await readFile(join(directory, 'lock.json')), 'test lock');
+
+  const receipt = await repository.proposeGoalChange(fixture.root, changeProposalInput(), fixture);
+
+  assert.deepEqual(receipt, {
+    state: 'CHANGE_PENDING',
+    change_request_id: 'CR-0001',
+    candidate_goal_version: 2,
+    candidate_digest: CHANGE_CANDIDATE_DIGEST,
+    proposal_digest: CHANGE_PROPOSAL_DIGEST,
+    approval_required: 'APPROVE CR-0001 GOAL VERSION 2 3cbab5b6bf74',
+  });
+  const changeBytes = await readFile(join(directory, 'changes', 'CR-0001.json'));
+  assert.deepEqual(changeBytes, canonicalBytes(expectedChangeRequest()));
+  assert.equal(independentSha256(changeBytes), CHANGE_RECORD_DIGEST);
+  assert.deepEqual(goalContracts.validateChangeRequest(parseCanonicalJson(changeBytes, 'test change')), expectedChangeRequest());
+  assert.equal(Object.isFrozen(goalContracts.validateChangeRequest(expectedChangeRequest()).candidate_goal), true);
+  for (const [relativePath, bytes] of preserved) {
+    assert.deepEqual(await readFile(join(directory, ...relativePath.split('/'))), bytes, relativePath);
+  }
+  const lock = parseCanonicalJson(await readFile(join(directory, 'lock.json')), 'test lock');
+  assert.equal(lock.state_revision, lockBefore.state_revision + 1);
+  assert.deepEqual(lock.progress_head, lockBefore.progress_head);
+  assert.deepEqual(lock.evidence_heads, lockBefore.evidence_heads);
+  assert.deepEqual(lock.change_head, { change_request_id: 'CR-0001', digest: CHANGE_RECORD_DIGEST });
+  const { record_digest: recordDigest, ...withoutDigest } = lock;
+  assert.equal(recordDigest, independentSha256(canonicalBytes(withoutDigest)));
+  assert.equal((await repository.verifyGoalRepository(fixture.root, fixture)).state, 'CHANGE_PENDING');
+});
+
+test('change proposal rejects caller-owned metadata and inexact semantic change claims without mutation', async (testContext) => {
+  const { fixture, repository } = await createChangeProposalFixture(testContext);
+  const directory = join(fixture.root, '.goal-lock');
+  const lockBefore = await readFile(join(directory, 'lock.json'));
+  const cases = [
+    ['derived root field', { ...changeProposalInput(), status: 'proposed' }],
+    ['derived candidate field', changeProposalInput({ candidate: { ...changeCandidate(), goal_version: 2 } })],
+    ['omitted difference', changeProposalInput({ changes: changeProposalInput().changes.slice(0, 1) })],
+    ['extra unchanged claim', changeProposalInput({ changes: [...changeProposalInput().changes, { field: 'scope', before: goalV1().scope, after: goalV1().scope }] })],
+    ['wrong before value', changeProposalInput({ changes: [{ field: 'objective', before: 'Wrong base', after: 'Ship a safer lock' }, changeProposalInput().changes[1]] })],
+    ['wrong after value', changeProposalInput({ changes: [{ field: 'objective', before: 'Ship a safe lock', after: 'Wrong candidate' }, changeProposalInput().changes[1]] })],
+    ['duplicate field', changeProposalInput({ changes: [...changeProposalInput().changes, changeProposalInput().changes[0]] })],
+  ];
+
+  for (const [label, input] of cases) {
+    await assert.rejects(
+      repository.proposeGoalChange(fixture.root, input, fixture),
+      (error) => error instanceof GoalLockError && error.kind === 'input',
+      label,
+    );
+  }
+  assert.equal(existsSync(join(directory, 'changes')), false);
+  assert.deepEqual(await readFile(join(directory, 'lock.json')), lockBefore);
+});
+
+test('change proposal normalizes complete semantic claims into stable contract order', async (testContext) => {
+  const { fixture, repository } = await createChangeProposalFixture(testContext);
+  const reversed = changeProposalInput().changes.toReversed();
+
+  await repository.proposeGoalChange(fixture.root, changeProposalInput({ changes: reversed }), fixture);
+
+  const change = parseCanonicalJson(
+    await readFile(join(fixture.root, '.goal-lock', 'changes', 'CR-0001.json')),
+    'test change',
+  );
+  assert.deepEqual(change.changes, changeProposalInput().changes);
+  assert.equal(change.proposal_digest, CHANGE_PROPOSAL_DIGEST);
+});
+
+test('change proposal requires existing affected task and criterion identifiers', async (testContext) => {
+  const { fixture, repository } = await createChangeProposalFixture(testContext);
+  for (const [label, overrides] of [
+    ['task', { affected_tasks: ['TASK-9999'] }],
+    ['criterion', { affected_criteria: ['AC-999'] }],
+    ['unsafe task', { affected_tasks: ['../TASK-0001'] }],
+  ]) {
+    await assert.rejects(
+      repository.proposeGoalChange(fixture.root, changeProposalInput(overrides), fixture),
+      (error) => error instanceof GoalLockError && error.kind === 'input',
+      label,
+    );
+  }
+  assert.equal(existsSync(join(fixture.root, '.goal-lock', 'changes')), false);
+});
+
+test('change proposal refuses draft, tampered, stale, and change-pending repository state', async (testContext) => {
+  const draft = createGoalLockFixture(testContext);
+  const repository = await goalRepository();
+  await repository.initializeGoal(draft.root, goalV1(), draft);
+  await assert.rejects(
+    repository.proposeGoalChange(draft.root, changeProposalInput(), draft),
+    (error) => error instanceof GoalLockError && error.kind === 'state',
+  );
+
+  const tampered = await createChangeProposalFixture(testContext);
+  await writeFile(join(tampered.fixture.root, '.goal-lock', 'current.json'), canonicalBytes({ ...goalV1(), objective: 'Tampered objective' }));
+  await assert.rejects(
+    tampered.repository.proposeGoalChange(tampered.fixture.root, changeProposalInput(), tampered.fixture),
+    (error) => error instanceof GoalLockError && error.kind === 'integrity',
+  );
+
+  const stale = await createChangeProposalFixture(testContext);
+  await stale.repository.recordGoalEvent(stale.fixture.root, evidenceInput({ state: 'stale' }), stale.fixture);
+  await assert.rejects(
+    stale.repository.proposeGoalChange(stale.fixture.root, changeProposalInput(), stale.fixture),
+    (error) => error instanceof GoalLockError && error.kind === 'state',
+  );
+
+  const pending = await createChangeProposalFixture(testContext);
+  await pending.repository.proposeGoalChange(pending.fixture.root, changeProposalInput(), pending.fixture);
+  const firstBytes = await readFile(join(pending.fixture.root, '.goal-lock', 'changes', 'CR-0001.json'));
+  await assert.rejects(
+    pending.repository.proposeGoalChange(pending.fixture.root, changeProposalInput(), pending.fixture),
+    (error) => error instanceof GoalLockError && error.kind === 'state',
+  );
+  assert.deepEqual(await readFile(join(pending.fixture.root, '.goal-lock', 'changes', 'CR-0001.json')), firstBytes);
+  assert.equal(existsSync(join(pending.fixture.root, '.goal-lock', 'changes', 'CR-0002.json')), false);
+});
+
+test('change proposal transaction rolls back the request when lock-head installation fails', async (testContext) => {
+  const { fixture, repository } = await createChangeProposalFixture(testContext);
+  const directory = join(fixture.root, '.goal-lock');
+  const lockBefore = await readFile(join(directory, 'lock.json'));
+  fixture.transactionFaults.install = ({ target }) => {
+    if (target === '.goal-lock/lock.json') throw new Error('change-lock-install-failure');
+  };
+
+  await assert.rejects(
+    repository.proposeGoalChange(fixture.root, changeProposalInput(), fixture),
+    /change-lock-install-failure/,
+  );
+
+  assert.equal(existsSync(join(directory, 'changes', 'CR-0001.json')), false);
+  assert.deepEqual(await readFile(join(directory, 'lock.json')), lockBefore);
+  assert.deepEqual((await readdir(directory)).filter((name) => name.includes('.stage') || name.includes('.backup')), []);
+});
+
+test('rejects change by replacing only status and advancing the lock integrity index', async (testContext) => {
+  const { fixture, repository } = await createChangeProposalFixture(testContext);
+  const directory = join(fixture.root, '.goal-lock');
+  await repository.proposeGoalChange(fixture.root, changeProposalInput(), fixture);
+  const proposed = parseCanonicalJson(await readFile(join(directory, 'changes', 'CR-0001.json')), 'test change');
+  const lockBefore = parseCanonicalJson(await readFile(join(directory, 'lock.json')), 'test lock');
+  const preservedPaths = ['current.json', 'plan.json', 'progress.jsonl', 'history/goals/v0001.json'];
+  const preserved = new Map(await Promise.all(preservedPaths.map(async (relativePath) => [relativePath, await readFile(join(directory, ...relativePath.split('/')))])));
+
+  const receipt = await repository.rejectGoalChange(fixture.root, 'CR-0001', 'The stronger outcome is not authorized', fixture);
+
+  assert.deepEqual(receipt, {
+    state: 'LOCKED',
+    change_request_id: 'CR-0001',
+    status: 'rejected',
+    reason: 'The stronger outcome is not authorized',
+  });
+  const rejectedBytes = await readFile(join(directory, 'changes', 'CR-0001.json'));
+  assert.equal(independentSha256(rejectedBytes), 'b7755ab94f6f90dcb89ced9622a22524b2e57744f0f46b3d8cb729f3650c773f');
+  const rejected = parseCanonicalJson(rejectedBytes, 'test rejected change');
+  assert.deepEqual(rejected, { ...proposed, status: 'rejected' });
+  assert.equal(Object.hasOwn(rejected, 'reason'), false);
+  for (const [relativePath, bytes] of preserved) {
+    assert.deepEqual(await readFile(join(directory, ...relativePath.split('/'))), bytes, relativePath);
+  }
+  const lock = parseCanonicalJson(await readFile(join(directory, 'lock.json')), 'test lock');
+  assert.equal(lock.state_revision, lockBefore.state_revision + 1);
+  assert.deepEqual(lock.progress_head, lockBefore.progress_head);
+  assert.deepEqual(lock.evidence_heads, lockBefore.evidence_heads);
+  assert.deepEqual(lock.change_head, {
+    change_request_id: 'CR-0001',
+    digest: 'b7755ab94f6f90dcb89ced9622a22524b2e57744f0f46b3d8cb729f3650c773f',
+  });
+  assert.equal((await repository.verifyGoalRepository(fixture.root, fixture)).state, 'LOCKED');
+});
+
+test('rejects change refusal for unknown, terminal, unsafe, or invalidly reasoned requests without mutation', async (testContext) => {
+  const { fixture, repository } = await createChangeProposalFixture(testContext);
+  const directory = join(fixture.root, '.goal-lock');
+  await repository.proposeGoalChange(fixture.root, changeProposalInput(), fixture);
+  const proposedBefore = await readFile(join(directory, 'changes', 'CR-0001.json'));
+  const lockBefore = await readFile(join(directory, 'lock.json'));
+  const cases = [
+    ['unknown', 'CR-0002', 'Reject an unknown request'],
+    ['unsafe', '../CR-0001', 'Reject an unsafe request'],
+    ['empty reason', 'CR-0001', ''],
+    ['untrimmed reason', 'CR-0001', ' not concise '],
+    ['overlong reason', 'CR-0001', 'x'.repeat(501)],
+  ];
+  for (const [label, changeRequestId, reason] of cases) {
+    await assert.rejects(
+      repository.rejectGoalChange(fixture.root, changeRequestId, reason, fixture),
+      (error) => error instanceof GoalLockError && ['input', 'state'].includes(error.kind),
+      label,
+    );
+  }
+  assert.deepEqual(await readFile(join(directory, 'changes', 'CR-0001.json')), proposedBefore);
+  assert.deepEqual(await readFile(join(directory, 'lock.json')), lockBefore);
+
+  await repository.rejectGoalChange(fixture.root, 'CR-0001', 'Do not change the accepted outcome', fixture);
+  const terminalBefore = await readFile(join(directory, 'changes', 'CR-0001.json'));
+  const terminalLockBefore = await readFile(join(directory, 'lock.json'));
+  await assert.rejects(
+    repository.rejectGoalChange(fixture.root, 'CR-0001', 'Reject it again', fixture),
+    (error) => error instanceof GoalLockError && error.kind === 'state',
+  );
+  assert.deepEqual(await readFile(join(directory, 'changes', 'CR-0001.json')), terminalBefore);
+  assert.deepEqual(await readFile(join(directory, 'lock.json')), terminalLockBefore);
+});
+
+test('rejects change then allocates the next safely scanned change request ID', async (testContext) => {
+  const { fixture, repository } = await createChangeProposalFixture(testContext);
+  await repository.proposeGoalChange(fixture.root, changeProposalInput(), fixture);
+  await repository.rejectGoalChange(fixture.root, 'CR-0001', 'Keep the current acceptance outcome', fixture);
+
+  const receipt = await repository.proposeGoalChange(fixture.root, changeProposalInput(), fixture);
+
+  assert.equal(receipt.change_request_id, 'CR-0002');
+  assert.equal(parseCanonicalJson(
+    await readFile(join(fixture.root, '.goal-lock', 'changes', 'CR-0001.json')),
+    'first change',
+  ).status, 'rejected');
+  assert.equal(parseCanonicalJson(
+    await readFile(join(fixture.root, '.goal-lock', 'changes', 'CR-0002.json')),
+    'second change',
+  ).status, 'proposed');
+});
+
+test('rejects change transaction rollback restores the exact proposed request and lock head', async (testContext) => {
+  const { fixture, repository } = await createChangeProposalFixture(testContext);
+  const directory = join(fixture.root, '.goal-lock');
+  await repository.proposeGoalChange(fixture.root, changeProposalInput(), fixture);
+  const proposedBefore = await readFile(join(directory, 'changes', 'CR-0001.json'));
+  const lockBefore = await readFile(join(directory, 'lock.json'));
+  fixture.transactionFaults.install = ({ target }) => {
+    if (target === '.goal-lock/lock.json') throw new Error('reject-lock-install-failure');
+  };
+
+  await assert.rejects(
+    repository.rejectGoalChange(fixture.root, 'CR-0001', 'Keep the accepted outcome', fixture),
+    /reject-lock-install-failure/,
+  );
+
+  assert.deepEqual(await readFile(join(directory, 'changes', 'CR-0001.json')), proposedBefore);
+  assert.deepEqual(await readFile(join(directory, 'lock.json')), lockBefore);
+  assert.equal((await repository.verifyGoalRepository(fixture.root, fixture)).state, 'CHANGE_PENDING');
+});
+
+function refreshTestChange(record) {
+  record.candidate_digest = independentSha256(canonicalBytes(record.candidate_goal));
+  const {
+    status: _status,
+    proposal_digest: _proposalDigest,
+    approval_phrase: _approvalPhrase,
+    ...payload
+  } = record;
+  record.proposal_digest = independentSha256(canonicalBytes(payload));
+  record.approval_phrase = `APPROVE ${record.id} GOAL VERSION ${record.candidate_goal.goal_version} ${record.proposal_digest.slice(0, 12)}`;
+  return record;
+}
+
+async function rewriteTestChange(fixture, mutate) {
+  const changePath = join(fixture.root, '.goal-lock', 'changes', 'CR-0001.json');
+  const change = parseCanonicalJson(await readFile(changePath), 'test change');
+  mutate(change);
+  const bytes = canonicalBytes(change);
+  await writeFile(changePath, bytes);
+  await rewriteTestLock(fixture, (lock) => {
+    lock.change_head = { change_request_id: 'CR-0001', digest: independentSha256(bytes) };
+  });
+}
+
+test('change verification fails closed for malformed identity, digest, base, candidate, coverage, phrase, references, and head state', async (testContext) => {
+  const cases = [
+    ['ID mismatch', (change) => { change.id = 'CR-0002'; }],
+    ['candidate digest', (change) => { change.candidate_digest = 'f'.repeat(64); }],
+    ['proposal digest', (change) => { change.proposal_digest = 'f'.repeat(64); }],
+    ['approval phrase', (change) => { change.approval_phrase = 'APPROVE CR-0001 GOAL VERSION 2 ffffffffffff'; }],
+    ['unsupported status', (change) => { change.status = 'open'; }],
+    ['unknown envelope field', (change) => { change.rejection_reason = 'not part of the fixed contract'; }],
+    ['stale base', (change) => {
+      change.base_goal.goal_id = 'GL-BETA';
+      change.candidate_goal.goal_id = 'GL-BETA';
+      refreshTestChange(change);
+    }],
+    ['skipped candidate version', (change) => {
+      change.candidate_goal.goal_version = 3;
+      change.candidate_goal.predecessor.goal_version = 2;
+      refreshTestChange(change);
+    }],
+    ['omitted semantic difference', (change) => {
+      change.changes = change.changes.slice(0, 1);
+      refreshTestChange(change);
+    }],
+    ['unknown affected task', (change) => {
+      change.affected_tasks = ['TASK-9999'];
+      refreshTestChange(change);
+    }],
+    ['unknown affected criterion', (change) => {
+      change.affected_criteria = ['AC-999'];
+      refreshTestChange(change);
+    }],
+  ];
+
+  for (const [label, mutate] of cases) {
+    const { fixture, repository } = await createChangeProposalFixture(testContext);
+    await repository.proposeGoalChange(fixture.root, changeProposalInput(), fixture);
+    await rewriteTestChange(fixture, mutate);
+
+    const verification = await repository.verifyGoalRepository(fixture.root, fixture);
+
+    assert.equal(verification.state, 'TAMPERED', label);
+  }
+
+  for (const [label, arrange] of [
+    ['filename gap', async (fixture) => rename(
+      join(fixture.root, '.goal-lock', 'changes', 'CR-0001.json'),
+      join(fixture.root, '.goal-lock', 'changes', 'CR-0002.json'),
+    )],
+    ['head mismatch', async (fixture) => rewriteTestLock(fixture, (lock) => {
+      lock.change_head.digest = 'f'.repeat(64);
+    })],
+  ]) {
+    const { fixture, repository } = await createChangeProposalFixture(testContext);
+    await repository.proposeGoalChange(fixture.root, changeProposalInput(), fixture);
+    await arrange(fixture);
+    assert.equal((await repository.verifyGoalRepository(fixture.root, fixture)).state, 'TAMPERED', label);
+  }
+});
 
 const PLAN_REVISION_EVENT_DIGEST = 'bdda7b3968a011b2229bb86936f21a2d51e9a070a992dcd573c91c4bb61e4b72';
 const SECOND_PLAN_REVISION_EVENT_DIGEST = '9bcd19d7bb31cbac67b8de8749da59f6e8fb5617c4f87c6fa5574e77ce43bea1';
@@ -545,7 +950,7 @@ test('plan revision rejects criteria outside the goal without changing accepted 
 });
 
 test('plan revision rejects draft, tampered, and change-pending repositories', async (testContext) => {
-  const { initializeGoal, lockInitialGoal, revisePlan } = await goalRepository();
+  const { initializeGoal, lockInitialGoal, proposeGoalChange, revisePlan } = await goalRepository();
 
   const draft = createGoalLockFixture(testContext);
   await initializeGoal(draft.root, goalV1(), draft);
@@ -566,8 +971,7 @@ test('plan revision rejects draft, tampered, and change-pending repositories', a
   const pending = createGoalLockFixture(testContext);
   await initializeGoal(pending.root, goalV1(), pending);
   await lockInitialGoal(pending.root, 'APPROVE GOAL GL-ALPHA VERSION 1 92d74f6bf766', pending);
-  await mkdir(join(pending.root, '.goal-lock', 'changes'));
-  await writeFile(join(pending.root, '.goal-lock', 'changes', 'CR-0001.json'), canonicalBytes({ ...structuralChange(), status: 'proposed' }));
+  await proposeGoalChange(pending.root, changeProposalInput({ affected_tasks: [] }), pending);
   await assert.rejects(
     revisePlan(pending.root, planCandidate(), 'aligned', pending),
     (error) => error instanceof GoalLockError && error.kind === 'state',
@@ -1597,30 +2001,36 @@ function structuralProgressEvent(eventId = 'EVT-000001', eventDigest = '1'.repea
   };
 }
 
-function structuralChange(changeId = 'CR-0001') {
-  const candidateGoal = {
+function structuralChange(changeId = 'CR-0001', options = {}) {
+  const candidateGoal = options.candidateGoal ?? {
     ...goalV1(),
     goal_version: 2,
+    objective: 'Ship an evolved safe lock',
     predecessor: { goal_version: 1, goal_digest: activeGoalReference().goal_digest },
     accepted_change_id: changeId,
   };
-  return {
+  const changes = [{ field: 'objective', before: 'Ship a safe lock', after: candidateGoal.objective }];
+  const payload = {
     schema_version: 1,
     id: changeId,
-    status: 'approved',
     base_goal: activeGoalReference(),
     candidate_goal: candidateGoal,
     candidate_digest: independentSha256(canonicalBytes(candidateGoal)),
-    proposal_digest: '2'.repeat(64),
-    changes: [{ field: 'objective', before: 'Ship a safe lock', after: 'Ship an evolved safe lock' }],
+    changes,
     rationale: 'Evolve the approved goal',
     affected_tasks: [],
     affected_criteria: [],
     risks: [],
     validation: ['Run verification'],
     rollback: ['Restore version one'],
-    approval_phrase: 'APPROVE CR-0001 GOAL VERSION 2 222222222222',
     recorded_at: '2026-08-23T01:00:00.000Z',
+  };
+  const proposalDigest = independentSha256(canonicalBytes(payload));
+  return {
+    ...payload,
+    status: options.status ?? 'approved',
+    proposal_digest: proposalDigest,
+    approval_phrase: `APPROVE ${changeId} GOAL VERSION ${candidateGoal.goal_version} ${proposalDigest.slice(0, 12)}`,
   };
 }
 
@@ -2186,6 +2596,7 @@ test('verifies goal history preflights optional state and reports a pending chan
   const {
     initializeGoal,
     lockInitialGoal,
+    proposeGoalChange,
     recordGoalEvent,
     revisePlan,
     verifyGoalRepository,
@@ -2195,8 +2606,7 @@ test('verifies goal history preflights optional state and reports a pending chan
   const directory = join(fixture.root, '.goal-lock');
   await revisePlan(fixture.root, planCandidate(), 'aligned', fixture);
   await recordGoalEvent(fixture.root, evidenceInput(), fixture);
-  await mkdir(join(directory, 'changes'));
-  await writeFile(join(directory, 'changes', 'CR-0001.json'), canonicalBytes({ ...structuralChange(), status: 'proposed' }));
+  await proposeGoalChange(fixture.root, changeProposalInput(), fixture);
 
   const result = await verifyGoalRepository(fixture.root, fixture);
 
@@ -2288,12 +2698,11 @@ test('verifies goal history structurally preflights present plan history', async
 
 test('detects tampering when plan history appears after its structural preflight', async (testContext) => {
   const fixture = createGoalLockFixture(testContext);
-  const { initializeGoal, lockInitialGoal, verifyGoalRepository } = await goalRepository();
+  const { initializeGoal, lockInitialGoal, proposeGoalChange, verifyGoalRepository } = await goalRepository();
   await initializeGoal(fixture.root, goalV1(), fixture);
   await lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 92d74f6bf766', fixture);
   const directory = join(fixture.root, '.goal-lock');
-  await mkdir(join(directory, 'changes'));
-  await writeFile(join(directory, 'changes', 'CR-0001.json'), canonicalBytes({ ...structuralChange(), status: 'proposed' }));
+  await proposeGoalChange(fixture.root, changeProposalInput({ affected_tasks: [] }), fixture);
   let injected = false;
   fixture.workspaceFaults = {
     afterFileRead: async ({ relativePath }) => {
