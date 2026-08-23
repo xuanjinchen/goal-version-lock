@@ -746,7 +746,7 @@ test('exact change approval rejects generic, inexact, stale, competing, and tamp
   ]) {
     const { fixture, repository } = await proposeChangeForApproval(testContext);
     await assert.rejects(
-      repository.approveGoalChange(fixture.root, approval, fixture),
+      repository.approveGoalChange(fixture.root, 'CR-0001', approval, fixture),
       (error) => error instanceof GoalLockError && error.kind === 'approval',
       approval,
     );
@@ -755,7 +755,7 @@ test('exact change approval rejects generic, inexact, stale, competing, and tamp
   const stale = await proposeChangeForApproval(testContext);
   await stale.repository.rejectGoalChange(stale.fixture.root, 'CR-0001', 'Keep the accepted outcome', stale.fixture);
   await assert.rejects(
-    stale.repository.approveGoalChange(stale.fixture.root, stale.receipt.approval_required, stale.fixture),
+    stale.repository.approveGoalChange(stale.fixture.root, 'CR-0001', stale.receipt.approval_required, stale.fixture),
     (error) => error instanceof GoalLockError && error.kind === 'approval',
   );
 
@@ -765,7 +765,7 @@ test('exact change approval rejects generic, inexact, stale, competing, and tamp
     canonicalBytes({ ...expectedChangeRequest(), rationale: 'Tampered request bytes' }),
   );
   await assert.rejects(
-    tampered.repository.approveGoalChange(tampered.fixture.root, tampered.receipt.approval_required, tampered.fixture),
+    tampered.repository.approveGoalChange(tampered.fixture.root, 'CR-0001', tampered.receipt.approval_required, tampered.fixture),
     (error) => error instanceof GoalLockError && error.kind === 'integrity',
   );
 
@@ -784,8 +784,8 @@ test('exact change approval rejects generic, inexact, stale, competing, and tamp
     const changed = await proposeChangeForApproval(testContext);
     await rewriteTestChange(changed.fixture, mutate);
     await assert.rejects(
-      changed.repository.approveGoalChange(changed.fixture.root, changed.receipt.approval_required, changed.fixture),
-      (error) => error instanceof GoalLockError && error.kind === 'integrity',
+      changed.repository.approveGoalChange(changed.fixture.root, 'CR-0001', changed.receipt.approval_required, changed.fixture),
+      (error) => error instanceof GoalLockError && error.kind === (label === 'stale base digest' ? 'approval' : 'integrity'),
       label,
     );
   }
@@ -796,9 +796,16 @@ test('exact change approval rejects generic, inexact, stale, competing, and tamp
   await competingRepository.lockInitialGoal(competing.root, 'APPROVE GOAL GL-ALPHA VERSION 1 92d74f6bf766', competing);
   await installNonHeadProposedChangeState(competing);
   await assert.rejects(
-    competingRepository.approveGoalChange(competing.root, 'APPROVE CR-0001 GOAL VERSION 2 3cbab5b6bf74', competing),
+    competingRepository.approveGoalChange(competing.root, 'CR-0001', 'APPROVE CR-0001 GOAL VERSION 2 3cbab5b6bf74', competing),
     (error) => error instanceof GoalLockError && error.kind === 'integrity',
   );
+
+  const wrongId = await proposeChangeForApproval(testContext);
+  await assert.rejects(
+    wrongId.repository.approveGoalChange(wrongId.fixture.root, 'CR-0002', wrongId.receipt.approval_required, wrongId.fixture),
+    (error) => error instanceof GoalLockError && error.kind === 'approval',
+  );
+  assert.equal((await wrongId.repository.verifyGoalRepository(wrongId.fixture.root, wrongId.fixture)).state, 'CHANGE_PENDING');
 });
 
 test('exact change approval atomically installs the candidate, archives the plan, and selectively invalidates', async (testContext) => {
@@ -808,7 +815,7 @@ test('exact change approval atomically installs the candidate, archives the plan
   const priorPlan = await readFile(join(directory, 'plan.json'));
   const priorEvidence = await readFile(join(directory, 'evidence', 'AC-001', 'EVID-0001.json'));
   const priorLock = parseCanonicalJson(await readFile(join(directory, 'lock.json')), 'prior lock');
-  const result = await repository.approveGoalChange(fixture.root, receipt.approval_required, fixture);
+  const result = await repository.approveGoalChange(fixture.root, 'CR-0001', receipt.approval_required, fixture);
 
   assert.deepEqual(result, { state: 'LOCKED', goal_version: 2 });
   const current = parseCanonicalJson(await readFile(join(directory, 'current.json')), 'current v2');
@@ -845,7 +852,7 @@ test('exact change approval atomically installs the candidate, archives the plan
   assert.equal(lock.evidence_heads['AC-001'].evidence_id, 'EVID-0002');
   assert.equal((await repository.verifyGoalRepository(fixture.root, fixture)).state, 'LOCKED');
   await assert.rejects(
-    repository.approveGoalChange(fixture.root, receipt.approval_required, fixture),
+    repository.approveGoalChange(fixture.root, 'CR-0001', receipt.approval_required, fixture),
     (error) => error instanceof GoalLockError && error.kind === 'approval',
   );
 });
@@ -861,7 +868,7 @@ test('selective invalidation retains unaffected task status across the new goal 
     affected_criteria: [],
   }), fixture);
 
-  await repository.approveGoalChange(fixture.root, receipt.approval_required, fixture);
+  await repository.approveGoalChange(fixture.root, 'CR-0001', receipt.approval_required, fixture);
 
   const plan = parseCanonicalJson(await readFile(join(fixture.root, '.goal-lock', 'plan.json')), 'retained task plan');
   assert.equal(plan.tasks.find((task) => task.id === 'TASK-0001').status, 'in_progress');
@@ -880,7 +887,7 @@ test('selective invalidation preserves unaffected plan and evidence state and cr
       affected_tasks: affectedTasks,
       affected_criteria: affectedCriteria,
     }, true);
-    await repository.approveGoalChange(fixture.root, receipt.approval_required, fixture);
+    await repository.approveGoalChange(fixture.root, 'CR-0001', receipt.approval_required, fixture);
     const directory = join(fixture.root, '.goal-lock');
     const plan = parseCanonicalJson(await readFile(join(directory, 'plan.json')), `${label} plan`);
     assert.equal(plan.tasks.find((task) => task.id === 'TASK-0001').status, expectTaskStale ? 'stale' : 'pending', label);
@@ -896,7 +903,7 @@ test('selective invalidation preserves unaffected plan and evidence state and cr
     affected_tasks: [],
     affected_criteria: [],
   }), fixture);
-  await repository.approveGoalChange(fixture.root, receipt.approval_required, fixture);
+  await repository.approveGoalChange(fixture.root, 'CR-0001', receipt.approval_required, fixture);
   const plan = parseCanonicalJson(await readFile(join(fixture.root, '.goal-lock', 'plan.json')), 'empty v2 plan');
   assert.equal(plan.goal.goal_version, 2);
   assert.equal(plan.plan_revision, 1);
@@ -906,10 +913,12 @@ test('selective invalidation preserves unaffected plan and evidence state and cr
 
 test('exact change approval rolls back every installed file when any installation fails', async (testContext) => {
   const targets = [
+    '.goal-lock/history/goals/v0001.json',
     '.goal-lock/current.json',
     '.goal-lock/history/goals/v0002.json',
     '.goal-lock/history/plans/v0001-r0001.json',
     '.goal-lock/plan.json',
+    '.goal-lock/evidence/AC-001/EVID-0001.json',
     '.goal-lock/evidence/AC-001/EVID-0002.json',
     '.goal-lock/progress.jsonl',
     '.goal-lock/changes/CR-0001.json',
@@ -918,12 +927,13 @@ test('exact change approval rolls back every installed file when any installatio
   for (const target of targets) {
     const { fixture, repository, receipt } = await proposeChangeForApproval(testContext, {}, true);
     const before = await readFile(join(fixture.root, '.goal-lock', 'current.json'));
-    fixture.transactionFaults.install = ({ target: installed }) => {
-      if (installed === target) throw new Error(`approval install failure at ${target}`);
+    fixture.transactionFaults.finalReadBack = ({ targets: committed }) => {
+      if (!committed.includes(target)) throw new Error(`approval target missing from commit at ${target}`);
+      throw new Error(`approval final verification failure at ${target}`);
     };
     await assert.rejects(
-      repository.approveGoalChange(fixture.root, receipt.approval_required, fixture),
-      new RegExp(`approval install failure at ${target.replace(/[.]/g, '\\.')}`),
+      repository.approveGoalChange(fixture.root, 'CR-0001', receipt.approval_required, fixture),
+      new RegExp(`approval final verification failure at ${target.replace(/[.]/g, '\\.')}`),
       target,
     );
     assert.deepEqual(await readFile(join(fixture.root, '.goal-lock', 'current.json')), before, target);

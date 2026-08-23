@@ -1676,16 +1676,25 @@ export async function rejectGoalChange(root, changeRequestId, reason, context = 
   }, context);
 }
 
-export async function approveGoalChange(root, approval, context = {}) {
+export async function approveGoalChange(root, changeRequestId, approval, context = {}) {
   return withGoalLock(root, 'change-approve', async () => {
-    const snapshot = await verifyGoalRepository(root, {
-      ...context,
-      mutating: true,
-      [ACTIVE_WRITE]: true,
-      [RETURN_VERIFIED_SNAPSHOT]: true,
-    });
+    let snapshot;
+    try {
+      snapshot = await verifyGoalRepository(root, {
+        ...context,
+        mutating: true,
+        [ACTIVE_WRITE]: true,
+        [RETURN_VERIFIED_SNAPSHOT]: true,
+      });
+    } catch (error) {
+      // 已失效的 base 是过期批准而不是可接受状态；真实摘要或字节破坏仍保留完整性分类。
+      if (error instanceof GoalLockError && ['CHANGE_BASE_MISMATCH', 'CHANGE_BASE_STALE'].includes(error.code)) {
+        throw approvalError('APPROVAL_STALE', 'Change approval requires a proposal based on the active goal.');
+      }
+      throw error;
+    }
     const proposed = snapshot.changeState.open;
-    if (!proposed || snapshot.result.state !== 'CHANGE_PENDING') {
+    if (!proposed || snapshot.result.state !== 'CHANGE_PENDING' || proposed.value.id !== changeRequestId) {
       throw approvalError('APPROVAL_STALE', 'Change approval requires one current proposed change request.');
     }
     if (approval !== proposed.value.approval_phrase) {
