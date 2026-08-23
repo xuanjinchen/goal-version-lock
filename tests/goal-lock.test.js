@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { link, lstat, mkdir, readFile, readdir, rename, symlink, unlink, writeFile } from 'node:fs/promises';
+import { link, lstat, mkdir, readFile, readdir, rename, rm, symlink, unlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { test } from 'node:test';
 
@@ -47,8 +47,8 @@ async function installVersionTwo(fixture, changeId = 'CR-0001') {
   await writeFile(join(directory, 'history', 'goals', 'v0002.json'), bytes);
   await mkdir(join(directory, 'changes'), { recursive: true });
   await writeFile(join(directory, 'changes', `${changeId}.json`), canonicalBytes({
-    id: changeId,
-    status: 'approved',
+    ...structuralChange(changeId),
+    candidate_goal: goal,
     candidate_digest: digest,
     proposal_digest: proposalDigest,
   }));
@@ -71,6 +71,95 @@ async function installVersionTwo(fixture, changeId = 'CR-0001') {
     record_digest: independentSha256(canonicalBytes(lockWithoutDigest)),
   }));
   return { goal, bytes, digest };
+}
+
+function activeGoalReference() {
+  return {
+    goal_id: 'GL-ALPHA',
+    goal_version: 1,
+    goal_digest: '92d74f6bf766e096e71b949ff57e2d9a12302a4519226d05cf67c2b544babaa6',
+  };
+}
+
+function structuralPlan() {
+  return {
+    schema_version: 1,
+    goal: activeGoalReference(),
+    plan_revision: 1,
+    next_task_id: null,
+    tasks: [],
+    deferred: [],
+  };
+}
+
+function structuralProgressEvent(eventId = 'EVT-000001', eventDigest = '1'.repeat(64)) {
+  return {
+    schema_version: 1,
+    event_id: eventId,
+    recorded_at: '2026-08-23T01:00:00.000Z',
+    goal: activeGoalReference(),
+    plan_revision: 1,
+    task_id: null,
+    event_type: 'plan-revision',
+    summary: 'Plan created',
+    evidence_refs: [],
+    previous_event_digest: null,
+    event_digest: eventDigest,
+  };
+}
+
+function structuralChange(changeId = 'CR-0001') {
+  const candidateGoal = {
+    ...goalV1(),
+    goal_version: 2,
+    predecessor: { goal_version: 1, goal_digest: activeGoalReference().goal_digest },
+    accepted_change_id: changeId,
+  };
+  return {
+    schema_version: 1,
+    id: changeId,
+    status: 'approved',
+    base_goal: activeGoalReference(),
+    candidate_goal: candidateGoal,
+    candidate_digest: independentSha256(canonicalBytes(candidateGoal)),
+    proposal_digest: '2'.repeat(64),
+    changes: [{ field: 'objective', before: 'Ship a safe lock', after: 'Ship an evolved safe lock' }],
+    rationale: 'Evolve the approved goal',
+    affected_tasks: [],
+    affected_criteria: [],
+    risks: [],
+    validation: ['Run verification'],
+    rollback: ['Restore version one'],
+    approval_phrase: 'APPROVE CR-0001 GOAL VERSION 2 222222222222',
+    recorded_at: '2026-08-23T01:00:00.000Z',
+  };
+}
+
+function structuralEvidence(evidenceId = 'EVID-0001', criterionId = 'AC-001') {
+  return {
+    schema_version: 1,
+    evidence_id: evidenceId,
+    acceptance_criterion_id: criterionId,
+    goal: activeGoalReference(),
+    plan_revision: 1,
+    task_id: 'TASK-0001',
+    method: 'Run verification',
+    observed_result: 'Verification passed',
+    artifact_refs: ['reports/result.txt'],
+    workspace_fingerprint: '3'.repeat(64),
+    state: 'pass',
+    supersedes: null,
+    recorded_at: '2026-08-23T01:00:00.000Z',
+  };
+}
+
+async function rewriteTestLock(fixture, mutate) {
+  const lockPath = join(fixture.root, '.goal-lock', 'lock.json');
+  const lock = parseCanonicalJson(await readFile(lockPath), 'test lock');
+  delete lock.record_digest;
+  mutate(lock);
+  lock.record_digest = independentSha256(canonicalBytes(lock));
+  await writeFile(lockPath, canonicalBytes(lock));
 }
 
 async function optionalBytes(target) {
@@ -342,6 +431,65 @@ test('safe workspace detects file replacement during read and changed final inpu
   await assert.rejects(changedReader.verifyInputs(), (error) => error instanceof GoalLockError && error.kind === 'integrity');
 });
 
+test('safe workspace rejects repository root replacement after parent validation', async (testContext) => {
+  const fixture = createGoalLockFixture(testContext);
+  const detachedRoot = `${fixture.root}-detached`;
+  await mkdir(join(fixture.root, '.goal-lock'));
+  await writeFile(join(fixture.root, '.goal-lock', 'current.json'), '{"owner":"original"}\n');
+  let replaced = false;
+  fixture.workspaceFaults = {
+    afterParentValidation: async ({ relativePath }) => {
+      if (relativePath !== '.goal-lock/current.json' || replaced) return;
+      replaced = true;
+      await rename(fixture.root, detachedRoot);
+      await mkdir(join(fixture.root, '.goal-lock'), { recursive: true });
+      await writeFile(join(fixture.root, '.goal-lock', 'current.json'), '{"owner":"replacement"}\n');
+    },
+  };
+  const { createWorkspaceReader } = await workspaceReader();
+  const reader = await createWorkspaceReader(fixture.root, fixture);
+
+  try {
+    await assert.rejects(reader.readFile('.goal-lock/current.json'), (error) => error instanceof GoalLockError && error.kind === 'integrity');
+  } finally {
+    await rm(detachedRoot, { force: true, recursive: true });
+  }
+});
+
+test('safe workspace rejects parent replacement after parent validation', async (testContext) => {
+  const fixture = createGoalLockFixture(testContext);
+  const directory = join(fixture.root, '.goal-lock');
+  const detachedDirectory = join(fixture.root, 'detached-goal-lock');
+  await mkdir(directory);
+  await writeFile(join(directory, 'current.json'), '{"owner":"original"}\n');
+  let replaced = false;
+  fixture.workspaceFaults = {
+    afterParentValidation: async ({ relativePath }) => {
+      if (relativePath !== '.goal-lock/current.json' || replaced) return;
+      replaced = true;
+      await rename(directory, detachedDirectory);
+      await mkdir(directory);
+      await writeFile(join(directory, 'current.json'), '{"owner":"replacement"}\n');
+    },
+  };
+  const { createWorkspaceReader } = await workspaceReader();
+  const reader = await createWorkspaceReader(fixture.root, fixture);
+
+  await assert.rejects(reader.readFile('.goal-lock/current.json'), (error) => error instanceof GoalLockError && error.kind === 'integrity');
+});
+
+test('safe workspace preserves the first trusted snapshot when a path is read twice', async (testContext) => {
+  const fixture = createGoalLockFixture(testContext);
+  const history = join(fixture.root, '.goal-lock', 'history');
+  await mkdir(join(history, 'goals'), { recursive: true });
+  const { createWorkspaceReader } = await workspaceReader();
+  const reader = await createWorkspaceReader(fixture.root, fixture);
+  await reader.readDirectory('.goal-lock/history');
+  await mkdir(join(history, 'plans'));
+
+  await assert.rejects(reader.readDirectory('.goal-lock/history'), (error) => error instanceof GoalLockError && error.kind === 'integrity');
+});
+
 test('verifies goal history for draft and locked version one without adopting observed bytes', async (testContext) => {
   const draftFixture = createGoalLockFixture(testContext);
   const { initializeGoal, lockInitialGoal, verifyGoalRepository } = await goalRepository();
@@ -526,12 +674,12 @@ test('verifies goal history preflights optional state and reports a pending chan
   await initializeGoal(fixture.root, goalV1(), fixture);
   await lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 92d74f6bf766', fixture);
   const directory = join(fixture.root, '.goal-lock');
-  await writeFile(join(directory, 'plan.json'), canonicalBytes({ schema_version: 1 }));
-  await writeFile(join(directory, 'progress.jsonl'), canonicalBytes({ schema_version: 1 }));
+  await writeFile(join(directory, 'plan.json'), canonicalBytes(structuralPlan()));
+  await writeFile(join(directory, 'progress.jsonl'), canonicalBytes(structuralProgressEvent()));
   await mkdir(join(directory, 'changes'));
-  await writeFile(join(directory, 'changes', 'CR-0001.json'), canonicalBytes({ schema_version: 1, status: 'proposed' }));
+  await writeFile(join(directory, 'changes', 'CR-0001.json'), canonicalBytes({ ...structuralChange(), status: 'proposed' }));
   await mkdir(join(directory, 'evidence', 'AC-001'), { recursive: true });
-  await writeFile(join(directory, 'evidence', 'AC-001', 'EVID-0001.json'), canonicalBytes({ schema_version: 1 }));
+  await writeFile(join(directory, 'evidence', 'AC-001', 'EVID-0001.json'), canonicalBytes(structuralEvidence()));
 
   const result = await verifyGoalRepository(fixture.root, fixture);
 
@@ -603,14 +751,87 @@ test('verifies goal history structurally preflights present plan history', async
   await initializeGoal(fixture.root, goalV1(), fixture);
   await lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 92d74f6bf766', fixture);
   const directory = join(fixture.root, '.goal-lock');
-  await writeFile(join(directory, 'plan.json'), canonicalBytes({ schema_version: 1 }));
+  await writeFile(join(directory, 'plan.json'), canonicalBytes(structuralPlan()));
   await mkdir(join(directory, 'history', 'plans'));
-  await writeFile(join(directory, 'history', 'plans', 'v0001-r0001.json'), canonicalBytes({ schema_version: 1 }));
+  await writeFile(join(directory, 'history', 'plans', 'v0001-r0001.json'), canonicalBytes(structuralPlan()));
 
   const result = await verifyGoalRepository(fixture.root, fixture);
 
   assert.equal(result.state, 'LOCKED');
   assert.equal(result.evidence.optional.plan, true);
+});
+
+test('detects tampering when plan history appears after its structural preflight', async (testContext) => {
+  const fixture = createGoalLockFixture(testContext);
+  const { initializeGoal, lockInitialGoal, verifyGoalRepository } = await goalRepository();
+  await initializeGoal(fixture.root, goalV1(), fixture);
+  await lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 92d74f6bf766', fixture);
+  const directory = join(fixture.root, '.goal-lock');
+  await mkdir(join(directory, 'changes'));
+  await writeFile(join(directory, 'changes', 'CR-0001.json'), canonicalBytes({ ...structuralChange(), status: 'proposed' }));
+  let injected = false;
+  fixture.workspaceFaults = {
+    afterFileRead: async ({ relativePath }) => {
+      if (relativePath !== '.goal-lock/changes/CR-0001.json' || injected) return;
+      injected = true;
+      await mkdir(join(directory, 'history', 'plans'));
+      await writeFile(join(directory, 'history', 'plans', 'v0001-r0001.json'), '{bad}\n');
+    },
+  };
+
+  const result = await verifyGoalRepository(fixture.root, fixture);
+
+  assert.equal(result.state, 'TAMPERED');
+});
+
+test('detects tampering when lock heads do not match their terminal records', async (testContext) => {
+  const { initializeGoal, lockInitialGoal, verifyGoalRepository } = await goalRepository();
+  const cases = [
+    ['progress_head', async (fixture, directory) => {
+      await writeFile(join(directory, 'progress.jsonl'), canonicalBytes(structuralProgressEvent('EVT-000002', '4'.repeat(64))));
+      await rewriteTestLock(fixture, (lock) => { lock.progress_head = { event_id: 'EVT-000001', digest: '1'.repeat(64) }; });
+    }],
+    ['change_head', async (fixture, directory) => {
+      await mkdir(join(directory, 'changes'));
+      const changeBytes = canonicalBytes(structuralChange('CR-0002'));
+      await writeFile(join(directory, 'changes', 'CR-0002.json'), changeBytes);
+      await rewriteTestLock(fixture, (lock) => { lock.change_head = { change_request_id: 'CR-0001', digest: independentSha256(changeBytes) }; });
+    }],
+    ['evidence_heads', async (fixture, directory) => {
+      await mkdir(join(directory, 'evidence', 'AC-001'), { recursive: true });
+      await rewriteTestLock(fixture, (lock) => { lock.evidence_heads = { 'AC-001': { evidence_id: 'EVID-0001', digest: '3'.repeat(64) } }; });
+    }],
+  ];
+  for (const [field, arrange] of cases) {
+    const fixture = createGoalLockFixture(testContext);
+    await initializeGoal(fixture.root, goalV1(), fixture);
+    await lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 92d74f6bf766', fixture);
+    await arrange(fixture, join(fixture.root, '.goal-lock'));
+
+    const result = await verifyGoalRepository(fixture.root, fixture);
+
+    assert.equal(result.state, 'TAMPERED', field);
+  }
+});
+
+test('detects tampering in canonical optional objects without required envelopes', async (testContext) => {
+  const { initializeGoal, lockInitialGoal, verifyGoalRepository } = await goalRepository();
+  const cases = [
+    ['plan', async (directory) => writeFile(join(directory, 'plan.json'), canonicalBytes({}))],
+    ['progress', async (directory) => writeFile(join(directory, 'progress.jsonl'), canonicalBytes({}))],
+    ['change', async (directory) => { await mkdir(join(directory, 'changes')); await writeFile(join(directory, 'changes', 'CR-0001.json'), canonicalBytes({})); }],
+    ['evidence', async (directory) => { await mkdir(join(directory, 'evidence', 'AC-001'), { recursive: true }); await writeFile(join(directory, 'evidence', 'AC-001', 'EVID-0001.json'), canonicalBytes({})); }],
+  ];
+  for (const [artifact, arrange] of cases) {
+    const fixture = createGoalLockFixture(testContext);
+    await initializeGoal(fixture.root, goalV1(), fixture);
+    await lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 92d74f6bf766', fixture);
+    await arrange(join(fixture.root, '.goal-lock'));
+
+    const result = await verifyGoalRepository(fixture.root, fixture);
+
+    assert.equal(result.state, 'TAMPERED', artifact);
+  }
 });
 
 test('cooperative lock writes canonical owner bytes and removes them after success', async (testContext) => {

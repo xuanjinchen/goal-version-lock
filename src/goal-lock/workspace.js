@@ -60,18 +60,40 @@ async function validateRoot(root) {
   if (stat.isSymbolicLink() || !stat.isDirectory() || !samePath(await realpath(resolved), resolved)) {
     throw integrityError('WORKSPACE_ROOT_INVALID', 'Workspace root must be a canonical real directory.');
   }
-  return resolved;
+  return { path: resolved, snapshot: stat };
+}
+
+async function validateRootIdentity(root) {
+  // 根目录必须始终保持初始化时的身份，不能把替换后的同名路径当作原工作区。
+  const stat = await optionalLstat(root.path);
+  if (!stat
+    || stat.isSymbolicLink()
+    || !stat.isDirectory()
+    || !sameSnapshot(stat, root.snapshot)
+    || !samePath(await realpath(root.path), root.path)) {
+    throw integrityError('WORKSPACE_ROOT_CHANGED', 'Workspace root identity changed during verification.');
+  }
 }
 
 async function validateParents(root, segments) {
-  let current = root;
+  await validateRootIdentity(root);
+  let current = root.path;
+  const parents = [];
   for (const segment of segments.slice(0, -1)) {
     current = path.join(current, segment);
     const stat = await optionalLstat(current);
     if (!stat || stat.isSymbolicLink() || !stat.isDirectory() || !samePath(await realpath(current), current)) {
       throw integrityError('WORKSPACE_PARENT_UNSAFE', 'Workspace input parent must be a real directory without links.');
     }
+    parents.push({ path: current, snapshot: stat });
   }
+  return parents;
+}
+
+function sameParents(left, right) {
+  return left.length === right.length
+    && left.every((parent, index) => samePath(parent.path, right[index].path)
+      && sameSnapshot(parent.snapshot, right[index].snapshot));
 }
 
 function publicInput(record) {
@@ -80,12 +102,26 @@ function publicInput(record) {
 
 /** 安全读取工作区输入，并保留首次观察到的身份与摘要供提交前复验。 */
 export async function createWorkspaceReader(root, context = {}) {
-  const canonicalRoot = await validateRoot(root);
+  const trustedRoot = await validateRoot(root);
+  const canonicalRoot = trustedRoot.path;
   const captured = new Map();
+
+  function captureInput(record) {
+    // 重读只能确认首次信任的快照，不能以较新的观察值覆盖信任基线。
+    const trusted = captured.get(record.path);
+    if (trusted
+      && (trusted.kind !== record.kind
+        || trusted.digest !== record.digest
+        || !sameSnapshot(trusted.snapshot, record.snapshot))) {
+      throw integrityError('WORKSPACE_INPUT_CHANGED', 'Workspace input changed after its first trusted read.');
+    }
+    if (!trusted) captured.set(record.path, record);
+  }
 
   async function readFileInput(relativePath, options = {}, capture = true) {
     const segments = safeRelativePath(relativePath);
-    await validateParents(canonicalRoot, segments);
+    const parentsBefore = await validateParents(trustedRoot, segments);
+    await context.workspaceFaults?.afterParentValidation?.({ relativePath, target: path.join(canonicalRoot, ...segments) });
     const target = path.join(canonicalRoot, ...segments);
     let namedBefore;
     try {
@@ -112,8 +148,12 @@ export async function createWorkspaceReader(root, context = {}) {
       await context.workspaceFaults?.afterFileRead?.({ relativePath, target });
       const openedAfter = await handle.stat({ bigint: true });
       const namedAfter = await optionalLstat(target);
+      const parentsAfter = await validateParents(trustedRoot, segments);
       // 路径名与已打开句柄在读前读后都必须指向同一快照，拒绝替换后继续信任旧句柄字节。
-      if (!namedAfter || !sameSnapshot(openedBefore, openedAfter) || !sameSnapshot(openedAfter, namedAfter)) {
+      if (!namedAfter
+        || !sameSnapshot(openedBefore, openedAfter)
+        || !sameSnapshot(openedAfter, namedAfter)
+        || !sameParents(parentsBefore, parentsAfter)) {
         throw integrityError('WORKSPACE_FILE_RACED', 'Workspace file changed while being read.');
       }
       const record = {
@@ -123,7 +163,7 @@ export async function createWorkspaceReader(root, context = {}) {
         digest: sha256(bytes),
         snapshot: namedAfter,
       };
-      if (capture) captured.set(relativePath, record);
+      if (capture) captureInput(record);
       return { bytes: Buffer.from(bytes), digest: record.digest };
     } catch (error) {
       if (error instanceof GoalLockError) throw error;
@@ -135,7 +175,8 @@ export async function createWorkspaceReader(root, context = {}) {
 
   async function readDirectoryInput(relativePath, options = {}, capture = true) {
     const segments = safeRelativePath(relativePath);
-    await validateParents(canonicalRoot, segments);
+    const parentsBefore = await validateParents(trustedRoot, segments);
+    await context.workspaceFaults?.afterParentValidation?.({ relativePath, target: path.join(canonicalRoot, ...segments) });
     const target = path.join(canonicalRoot, ...segments);
     let before;
     try {
@@ -150,12 +191,16 @@ export async function createWorkspaceReader(root, context = {}) {
       const names = (await readdir(target)).sort();
       await context.workspaceFaults?.afterDirectoryRead?.({ relativePath, target });
       const after = await optionalLstat(target);
-      if (!after || !sameSnapshot(before, after) || !samePath(await realpath(target), target)) {
+      const parentsAfter = await validateParents(trustedRoot, segments);
+      if (!after
+        || !sameSnapshot(before, after)
+        || !samePath(await realpath(target), target)
+        || !sameParents(parentsBefore, parentsAfter)) {
         throw integrityError('WORKSPACE_DIRECTORY_RACED', 'Workspace directory changed while being read.');
       }
       const digest = sha256(canonicalBytes(names));
       const record = { path: relativePath, kind: 'directory', names, digest, snapshot: after };
-      if (capture) captured.set(relativePath, record);
+      if (capture) captureInput(record);
       return { names: [...names], digest };
     } catch (error) {
       if (error instanceof GoalLockError) throw error;
@@ -165,6 +210,7 @@ export async function createWorkspaceReader(root, context = {}) {
 
   async function verifyInputs() {
     await context.workspaceFaults?.beforeVerifyInputs?.();
+    await validateRootIdentity(trustedRoot);
     for (const expected of [...captured.values()].sort((left, right) => left.path.localeCompare(right.path))) {
       const observed = expected.kind === 'file'
         ? await readFileInput(expected.path, {}, false)

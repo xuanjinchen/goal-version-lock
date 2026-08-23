@@ -2,7 +2,7 @@ import { lstat, readdir, readFile, realpath, rmdir } from 'node:fs/promises';
 import path from 'node:path';
 
 import { canonicalBytes, parseCanonicalJson, sha256 } from './canonical.js';
-import { GoalLockError, validateGoalContract, validateLockRecord } from './contracts.js';
+import { GoalLockError, normalizeRelativePath, validateGoalContract, validateLockRecord } from './contracts.js';
 import { commitGoalFiles, withGoalLock } from './transaction.js';
 import { createWorkspaceReader } from './workspace.js';
 
@@ -139,6 +139,171 @@ function plainStructuralObject(value, label) {
   return value;
 }
 
+const STRUCTURAL_IDENTIFIERS = {
+  goal: /^GL-[A-Z0-9][A-Z0-9-]*$/,
+  criterion: /^AC-[0-9]{3}$/,
+  task: /^TASK-[0-9]{4}$/,
+  change: /^CR-[0-9]{4}$/,
+  event: /^EVT-[0-9]{6}$/,
+  evidence: /^EVID-[0-9]{4}$/,
+};
+const STRUCTURAL_DIGEST = /^[a-f0-9]{64}$/;
+const STRUCTURAL_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/;
+
+function requiredFields(value, label, fields) {
+  plainStructuralObject(value, label);
+  const missing = fields.filter((field) => !Object.hasOwn(value, field));
+  if (missing.length > 0) {
+    throw integrityError('OPTIONAL_STATE_INVALID', `${label} is missing required envelope fields.`);
+  }
+  return value;
+}
+
+function structuralIdentifier(value, pattern, label) {
+  if (typeof value !== 'string' || !pattern.test(value)) {
+    throw integrityError('OPTIONAL_STATE_INVALID', `${label} is not a valid identifier.`);
+  }
+  return value;
+}
+
+function structuralDigest(value, label) {
+  if (typeof value !== 'string' || !STRUCTURAL_DIGEST.test(value)) {
+    throw integrityError('OPTIONAL_STATE_INVALID', `${label} is not a SHA-256 digest.`);
+  }
+  return value;
+}
+
+function structuralText(value, label) {
+  if (typeof value !== 'string' || value.length === 0 || value.trim() !== value) {
+    throw integrityError('OPTIONAL_STATE_INVALID', `${label} must be non-empty trimmed text.`);
+  }
+  return value;
+}
+
+function structuralArray(value, label) {
+  if (!Array.isArray(value)) throw integrityError('OPTIONAL_STATE_INVALID', `${label} must be an array.`);
+  return value;
+}
+
+function structuralPositiveInteger(value, label) {
+  if (!Number.isSafeInteger(value) || value < 1) {
+    throw integrityError('OPTIONAL_STATE_INVALID', `${label} must be a positive integer.`);
+  }
+  return value;
+}
+
+function structuralTimestamp(value, label) {
+  if (typeof value !== 'string' || !STRUCTURAL_TIMESTAMP.test(value)) {
+    throw integrityError('OPTIONAL_STATE_INVALID', `${label} must be an RFC 3339 UTC timestamp.`);
+  }
+  return value;
+}
+
+function validateGoalReference(value, label) {
+  requiredFields(value, label, ['goal_id', 'goal_version', 'goal_digest']);
+  structuralIdentifier(value.goal_id, STRUCTURAL_IDENTIFIERS.goal, `${label}.goal_id`);
+  structuralPositiveInteger(value.goal_version, `${label}.goal_version`);
+  structuralDigest(value.goal_digest, `${label}.goal_digest`);
+}
+
+function validatePlanEnvelope(value, label) {
+  requiredFields(value, label, ['schema_version', 'goal', 'plan_revision', 'next_task_id', 'tasks', 'deferred']);
+  if (value.schema_version !== 1) throw integrityError('PLAN_STATE_INVALID', `${label}.schema_version must equal 1.`);
+  validateGoalReference(value.goal, `${label}.goal`);
+  structuralPositiveInteger(value.plan_revision, `${label}.plan_revision`);
+  if (value.next_task_id !== null) structuralIdentifier(value.next_task_id, STRUCTURAL_IDENTIFIERS.task, `${label}.next_task_id`);
+  structuralArray(value.tasks, `${label}.tasks`);
+  structuralArray(value.deferred, `${label}.deferred`);
+  for (const [index, task] of value.tasks.entries()) {
+    const taskLabel = `${label}.tasks[${index}]`;
+    requiredFields(task, taskLabel, ['id', 'outcome', 'acceptance_criteria', 'dependencies', 'permitted_paths', 'verification', 'status']);
+    structuralIdentifier(task.id, STRUCTURAL_IDENTIFIERS.task, `${taskLabel}.id`);
+    structuralText(task.outcome, `${taskLabel}.outcome`);
+    for (const criterion of structuralArray(task.acceptance_criteria, `${taskLabel}.acceptance_criteria`)) {
+      structuralIdentifier(criterion, STRUCTURAL_IDENTIFIERS.criterion, `${taskLabel}.acceptance_criteria`);
+    }
+    for (const dependency of structuralArray(task.dependencies, `${taskLabel}.dependencies`)) {
+      structuralIdentifier(dependency, STRUCTURAL_IDENTIFIERS.task, `${taskLabel}.dependencies`);
+    }
+    for (const permittedPath of structuralArray(task.permitted_paths, `${taskLabel}.permitted_paths`)) {
+      normalizeRelativePath(permittedPath, `${taskLabel}.permitted_paths`);
+    }
+    structuralText(task.verification, `${taskLabel}.verification`);
+    structuralText(task.status, `${taskLabel}.status`);
+  }
+  for (const [index, deferred] of value.deferred.entries()) {
+    const deferredLabel = `${label}.deferred[${index}]`;
+    requiredFields(deferred, deferredLabel, ['id', 'reason']);
+    structuralIdentifier(deferred.id, STRUCTURAL_IDENTIFIERS.task, `${deferredLabel}.id`);
+    structuralText(deferred.reason, `${deferredLabel}.reason`);
+  }
+  return value;
+}
+
+function validateProgressEnvelope(value) {
+  const label = 'progress event';
+  requiredFields(value, label, ['schema_version', 'event_id', 'recorded_at', 'goal', 'plan_revision', 'task_id', 'event_type', 'summary', 'evidence_refs', 'previous_event_digest', 'event_digest']);
+  if (value.schema_version !== 1) throw integrityError('PROGRESS_STATE_INVALID', 'Progress event schema_version must equal 1.');
+  structuralIdentifier(value.event_id, STRUCTURAL_IDENTIFIERS.event, `${label}.event_id`);
+  structuralTimestamp(value.recorded_at, `${label}.recorded_at`);
+  validateGoalReference(value.goal, `${label}.goal`);
+  structuralPositiveInteger(value.plan_revision, `${label}.plan_revision`);
+  if (value.task_id !== null) structuralIdentifier(value.task_id, STRUCTURAL_IDENTIFIERS.task, `${label}.task_id`);
+  structuralText(value.event_type, `${label}.event_type`);
+  structuralText(value.summary, `${label}.summary`);
+  for (const evidenceId of structuralArray(value.evidence_refs, `${label}.evidence_refs`)) {
+    structuralIdentifier(evidenceId, STRUCTURAL_IDENTIFIERS.evidence, `${label}.evidence_refs`);
+  }
+  if (value.previous_event_digest !== null) structuralDigest(value.previous_event_digest, `${label}.previous_event_digest`);
+  structuralDigest(value.event_digest, `${label}.event_digest`);
+  return value;
+}
+
+function validateChangeEnvelope(value, expectedId) {
+  const label = 'change request';
+  requiredFields(value, label, ['schema_version', 'id', 'status', 'base_goal', 'candidate_goal', 'candidate_digest', 'proposal_digest', 'changes', 'rationale', 'affected_tasks', 'affected_criteria', 'risks', 'validation', 'rollback', 'approval_phrase', 'recorded_at']);
+  if (value.schema_version !== 1) throw integrityError('CHANGE_STATE_INVALID', 'Change request schema_version must equal 1.');
+  structuralIdentifier(value.id, STRUCTURAL_IDENTIFIERS.change, `${label}.id`);
+  if (value.id !== expectedId) throw integrityError('CHANGE_STATE_INVALID', 'Change request ID does not match its filename.');
+  structuralText(value.status, `${label}.status`);
+  validateGoalReference(value.base_goal, `${label}.base_goal`);
+  requiredFields(value.candidate_goal, `${label}.candidate_goal`, ['schema_version', 'goal_id', 'goal_version', 'objective', 'scope', 'non_goals', 'constraints', 'acceptance_criteria', 'authorization_boundary', 'assumptions', 'predecessor', 'accepted_change_id']);
+  structuralDigest(value.candidate_digest, `${label}.candidate_digest`);
+  structuralDigest(value.proposal_digest, `${label}.proposal_digest`);
+  structuralArray(value.changes, `${label}.changes`);
+  structuralText(value.rationale, `${label}.rationale`);
+  for (const taskId of structuralArray(value.affected_tasks, `${label}.affected_tasks`)) structuralIdentifier(taskId, STRUCTURAL_IDENTIFIERS.task, `${label}.affected_tasks`);
+  for (const criterionId of structuralArray(value.affected_criteria, `${label}.affected_criteria`)) structuralIdentifier(criterionId, STRUCTURAL_IDENTIFIERS.criterion, `${label}.affected_criteria`);
+  for (const field of ['risks', 'validation', 'rollback']) {
+    for (const entry of structuralArray(value[field], `${label}.${field}`)) structuralText(entry, `${label}.${field}`);
+  }
+  structuralText(value.approval_phrase, `${label}.approval_phrase`);
+  structuralTimestamp(value.recorded_at, `${label}.recorded_at`);
+  return value;
+}
+
+function validateEvidenceEnvelope(value, expectedCriterion, expectedEvidence) {
+  const label = 'evidence record';
+  requiredFields(value, label, ['schema_version', 'evidence_id', 'acceptance_criterion_id', 'goal', 'plan_revision', 'task_id', 'method', 'observed_result', 'artifact_refs', 'workspace_fingerprint', 'state', 'supersedes', 'recorded_at']);
+  if (value.schema_version !== 1) throw integrityError('EVIDENCE_STATE_INVALID', 'Evidence schema_version must equal 1.');
+  structuralIdentifier(value.evidence_id, STRUCTURAL_IDENTIFIERS.evidence, `${label}.evidence_id`);
+  structuralIdentifier(value.acceptance_criterion_id, STRUCTURAL_IDENTIFIERS.criterion, `${label}.acceptance_criterion_id`);
+  if (value.evidence_id !== expectedEvidence || value.acceptance_criterion_id !== expectedCriterion) {
+    throw integrityError('EVIDENCE_STATE_INVALID', 'Evidence identifiers do not match their path.');
+  }
+  validateGoalReference(value.goal, `${label}.goal`);
+  structuralPositiveInteger(value.plan_revision, `${label}.plan_revision`);
+  structuralIdentifier(value.task_id, STRUCTURAL_IDENTIFIERS.task, `${label}.task_id`);
+  structuralText(value.method, `${label}.method`);
+  structuralText(value.observed_result, `${label}.observed_result`);
+  for (const artifactPath of structuralArray(value.artifact_refs, `${label}.artifact_refs`)) normalizeRelativePath(artifactPath, `${label}.artifact_refs`);
+  structuralDigest(value.workspace_fingerprint, `${label}.workspace_fingerprint`);
+  structuralText(value.state, `${label}.state`);
+  if (value.supersedes !== null) structuralIdentifier(value.supersedes, STRUCTURAL_IDENTIFIERS.evidence, `${label}.supersedes`);
+  structuralTimestamp(value.recorded_at, `${label}.recorded_at`);
+  return value;
+}
+
 async function readCanonicalObject(reader, relativePath, label) {
   const input = await reader.readFile(relativePath);
   try {
@@ -150,7 +315,10 @@ async function readCanonicalObject(reader, relativePath, label) {
 
 async function verifyPlanState(reader, rootNames) {
   const present = rootNames.includes('plan.json');
-  if (present) await readCanonicalObject(reader, '.goal-lock/plan.json', 'goal plan');
+  if (present) {
+    const plan = await readCanonicalObject(reader, '.goal-lock/plan.json', 'goal plan');
+    validatePlanEnvelope(plan.value, 'goal plan');
+  }
   const historyRoot = await reader.readDirectory('.goal-lock/history');
   if (!historyRoot.names.includes('plans')) return { present };
   const planHistory = await reader.readDirectory('.goal-lock/history/plans');
@@ -158,7 +326,12 @@ async function verifyPlanState(reader, rootNames) {
     if (!/^v[0-9]{4}-r[0-9]{4}\.json$/.test(name)) {
       throw integrityError('PLAN_STATE_INVALID', 'Plan history contains an unexpected entry.');
     }
-    await readCanonicalObject(reader, `.goal-lock/history/plans/${name}`, 'plan history record');
+    const record = await readCanonicalObject(reader, `.goal-lock/history/plans/${name}`, 'plan history record');
+    validatePlanEnvelope(record.value, 'plan history record');
+    const match = /^v([0-9]{4})-r([0-9]{4})\.json$/.exec(name);
+    if (record.value.goal.goal_version !== Number(match[1]) || record.value.plan_revision !== Number(match[2])) {
+      throw integrityError('PLAN_STATE_INVALID', 'Plan history envelope does not match its filename.');
+    }
   }
   if (!present && planHistory.names.length > 0) {
     throw integrityError('PLAN_STATE_MISSING', 'Current plan is missing after plan history began.');
@@ -179,8 +352,16 @@ async function verifyChangeState(reader, rootNames, lock) {
       throw integrityError('CHANGE_STATE_INVALID', 'Change state contains an unexpected entry.');
     }
     const record = await readCanonicalObject(reader, `.goal-lock/changes/${name}`, 'change request');
-    records.set(name.slice(0, -5), record.value);
+    const changeId = name.slice(0, -5);
+    validateChangeEnvelope(record.value, changeId);
+    records.set(changeId, record);
     if (record.value.status === 'proposed') pending = true;
+  }
+  if (lock.change_head !== null) {
+    const head = records.get(lock.change_head.change_request_id);
+    if (!head || head.digest !== lock.change_head.digest) {
+      throw integrityError('CHANGE_HEAD_MISMATCH', 'Lock change head does not match its change request record.');
+    }
   }
   return { count: records.size, pending, records };
 }
@@ -196,16 +377,21 @@ async function verifyProgressLedger(reader, rootNames, lock) {
   }
   let count = 0;
   let offset = 0;
+  let terminal = null;
   while (offset < input.bytes.length) {
     const terminator = input.bytes.indexOf(0x0a, offset);
     const line = input.bytes.subarray(offset, terminator + 1);
     try {
-      plainStructuralObject(parseCanonicalJson(line, 'progress event'), 'progress event');
+      terminal = validateProgressEnvelope(plainStructuralObject(parseCanonicalJson(line, 'progress event'), 'progress event'));
     } catch (error) {
       throw repositoryIntegrity('PROGRESS_STATE_INVALID', 'Progress ledger contains a malformed or noncanonical event.', error);
     }
     count += 1;
     offset = terminator + 1;
+  }
+  if (lock.progress_head !== null
+    && (terminal.event_id !== lock.progress_head.event_id || terminal.event_digest !== lock.progress_head.digest)) {
+    throw integrityError('PROGRESS_HEAD_MISMATCH', 'Lock progress head does not match the terminal progress event.');
   }
   return { count };
 }
@@ -217,6 +403,7 @@ async function verifyEvidenceState(reader, rootNames, lock) {
   }
   const evidenceRoot = await reader.readDirectory('.goal-lock/evidence');
   let count = 0;
+  const records = new Map();
   for (const criterion of evidenceRoot.names) {
     if (!/^AC-[0-9]{3}$/.test(criterion)) {
       throw integrityError('EVIDENCE_STATE_INVALID', 'Evidence state contains an unexpected criterion directory.');
@@ -226,8 +413,16 @@ async function verifyEvidenceState(reader, rootNames, lock) {
       if (!/^EVID-[0-9]{4}\.json$/.test(name)) {
         throw integrityError('EVIDENCE_STATE_INVALID', 'Evidence state contains an unexpected record.');
       }
-      await readCanonicalObject(reader, `.goal-lock/evidence/${criterion}/${name}`, 'evidence record');
+      const record = await readCanonicalObject(reader, `.goal-lock/evidence/${criterion}/${name}`, 'evidence record');
+      const evidenceId = name.slice(0, -5);
+      validateEvidenceEnvelope(record.value, criterion, evidenceId);
+      records.set(`${criterion}/${evidenceId}`, record.digest);
       count += 1;
+    }
+  }
+  for (const [criterion, head] of Object.entries(lock.evidence_heads)) {
+    if (records.get(`${criterion}/${head.evidence_id}`) !== head.digest) {
+      throw integrityError('EVIDENCE_HEAD_MISMATCH', 'Lock evidence head does not match its evidence record.');
     }
   }
   return { count };
@@ -311,10 +506,10 @@ function verifyLockBindings(current, lock, activeHistory, changeState) {
   if (lock.goal_version > 1) {
     const accepted = changeState.records.get(current.goal.accepted_change_id);
     if (!accepted
-      || accepted.id !== current.goal.accepted_change_id
-      || accepted.status !== 'approved'
-      || accepted.candidate_digest !== current.digest
-      || accepted.proposal_digest !== lock.proposal_digest) {
+      || accepted.value.id !== current.goal.accepted_change_id
+      || accepted.value.status !== 'approved'
+      || accepted.value.candidate_digest !== current.digest
+      || accepted.value.proposal_digest !== lock.proposal_digest) {
       throw integrityError('GOAL_LOCK_CHANGE_MISMATCH', 'Goal lock does not bind the accepted change request.');
     }
   }
