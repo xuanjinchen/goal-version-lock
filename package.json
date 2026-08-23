@@ -9,6 +9,7 @@
   },
   "scripts": {
     "init:skill": "node scripts/init-skill.js",
+    "goal-lock": "node scripts/goal-lock.js",
     "recover:lock": "node scripts/recover-lock.js",
     "test": "node --test",
     "validate": "node scripts/validate.js",
