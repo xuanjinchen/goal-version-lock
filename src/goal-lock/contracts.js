@@ -76,7 +76,21 @@ function digest(value, label) {
 }
 
 function timestamp(value, label) {
-  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/.test(value) || Number.isNaN(Date.parse(value))) {
+  const match = typeof value === 'string' && /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?Z$/.exec(value);
+  if (!match) {
+    fail('INVALID_CONTRACT', 'input', 2, `${label} must be an RFC 3339 UTC timestamp`);
+  }
+  const [, yearText, monthText, dayText, hourText, minuteText, secondText] = match;
+  const year = Number(yearText);
+  const month = Number(monthText);
+  const day = Number(dayText);
+  const hour = Number(hourText);
+  const minute = Number(minuteText);
+  const second = Number(secondText);
+  const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const daysInMonth = [31, leapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  // Date.parse 会把越界的日历分量滚动到下一日期，锁定契约必须拒绝这种输入。
+  if (month < 1 || month > 12 || day < 1 || day > daysInMonth[month - 1] || hour > 23 || minute > 59 || second > 59) {
     fail('INVALID_CONTRACT', 'input', 2, `${label} must be an RFC 3339 UTC timestamp`);
   }
   return value;
@@ -85,6 +99,10 @@ function timestamp(value, label) {
 function array(value, label, { nonEmpty = false } = {}) {
   if (!Array.isArray(value) || nonEmpty && value.length === 0) {
     fail('INVALID_CONTRACT', 'input', 2, `${label} must be ${nonEmpty ? 'a non-empty ' : 'an '}array`);
+  }
+  // map 会跳过空洞且忽略附加属性；两者都不能静默进入已锁定的语义数组。
+  if (Object.keys(value).length !== value.length) {
+    fail('INVALID_CONTRACT', 'input', 2, `${label} must not contain holes or non-index properties`);
   }
   return value;
 }

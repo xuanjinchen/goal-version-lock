@@ -1,4 +1,7 @@
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import { join } from 'node:path';
 import { test } from 'node:test';
 
 import { canonicalBytes, canonicalJson, parseCanonicalJson, sha256 } from '../src/goal-lock/canonical.js';
@@ -16,6 +19,13 @@ test('canonical JSON recursively orders object keys while preserving array order
   const value = { z: [{ b: 2, a: 1 }, 'last'], a: { z: true, a: false } };
 
   assert.equal(canonicalJson(value), '{"a":{"a":false,"z":true},"z":[{"a":1,"b":2},"last"]}\n');
+});
+
+test('canonical JSON preserves a valid __proto__ JSON key as data', () => {
+  const value = JSON.parse('{"a":1,"__proto__":{"safe":true}}');
+
+  assert.equal(canonicalJson(value), '{"__proto__":{"safe":true},"a":1}\n');
+  assert.deepEqual(parseCanonicalJson(Buffer.from('{"__proto__":{"safe":true},"a":1}\n'), 'goal'), value);
 });
 
 test('canonical JSON round-trips Unicode as UTF-8 bytes with one final LF', () => {
@@ -55,12 +65,31 @@ test('canonical JSON parser rejects noncanonical bytes and invalid UTF-8', () =>
   assert.throws(() => parseCanonicalJson(Buffer.from('{}\r\n'), 'goal'), /canonical/i);
 });
 
+test('canonical JSON parser rejects duplicate keys and missing or repeated terminators', () => {
+  assert.throws(() => parseCanonicalJson(Buffer.from('{"a":1,"a":1}\n'), 'goal'), /canonical/i);
+  assert.throws(() => parseCanonicalJson(Buffer.from('{"a":1}'), 'goal'), /canonical/i);
+  assert.throws(() => parseCanonicalJson(Buffer.from('{"a":1}\n\n'), 'goal'), /canonical/i);
+});
+
 test('goal lock fixture uses an isolated Git repository by default', (testContext) => {
   const fixture = createGoalLockFixture(testContext);
 
   assert.equal(fixture.now(), '2026-08-23T00:00:00.000Z');
   assert.equal(fixture.pid, 4242);
   assert.equal(fixture.isProcessAlive(1), false);
+});
+
+test('goal lock fixture initializes Git with the deterministic test identity', (testContext) => {
+  const fixture = createGoalLockFixture(testContext);
+
+  assert.equal(execFileSync('git', ['rev-parse', '--is-inside-work-tree'], { cwd: fixture.root, encoding: 'utf8' }).trim(), 'true');
+  assert.equal(execFileSync('git', ['config', 'user.email'], { cwd: fixture.root, encoding: 'utf8' }).trim(), 'tester@example.invalid');
+});
+
+test('goal lock fixture omits Git when explicitly disabled', (testContext) => {
+  const fixture = createGoalLockFixture(testContext, { git: false });
+
+  assert.equal(existsSync(join(fixture.root, '.git')), false);
 });
 
 function goalV1() {
@@ -124,6 +153,29 @@ test('goal contract names each missing required field', () => {
   }
 });
 
+test('goal contract validates the semantic boundary of every root field', () => {
+  const cases = [
+    ['schema_version', (goal) => { goal.schema_version = 2; }],
+    ['goal_id', (goal) => { goal.goal_id = 'GL-lowercase'; }],
+    ['goal_version', (goal) => { goal.goal_version = 0; }],
+    ['objective', (goal) => { goal.objective = ''; }],
+    ['scope', (goal) => { goal.scope = null; }],
+    ['non_goals', (goal) => { goal.non_goals = [' ']; }],
+    ['constraints', (goal) => { goal.constraints = [{ id: '', text: 'Use Node.js' }]; }],
+    ['acceptance_criteria', (goal) => { goal.acceptance_criteria = [{ id: 'AC-1', outcome: 'State is locked', verification: 'Run verification' }]; }],
+    ['authorization_boundary', (goal) => { goal.authorization_boundary = ['']; }],
+    ['assumptions', (goal) => { goal.assumptions = [{ statement: 'Git is installed', confidence: 'certain' }]; }],
+    ['predecessor', (goal) => { goal.predecessor = { goal_version: 1, goal_digest: '1111111111111111111111111111111111111111111111111111111111111111' }; }],
+    ['accepted_change_id', (goal) => { goal.accepted_change_id = 'CR-0001'; }],
+  ];
+
+  for (const [field, change] of cases) {
+    const input = goalV1();
+    change(input);
+    assert.throws(() => validateGoalContract(input), new RegExp(field));
+  }
+});
+
 test('goal contract rejects duplicate semantic IDs and untrimmed required text without echoing objective', () => {
   const duplicateCriterion = goalV1();
   duplicateCriterion.acceptance_criteria.push({ id: 'AC-001', outcome: 'Another result', verification: 'Another command' });
@@ -151,6 +203,17 @@ test('goal contract enforces scope, version, predecessor, and accepted-change re
   invalidV2.predecessor = { goal_version: 2, goal_digest: '1111111111111111111111111111111111111111111111111111111111111111' };
   invalidV2.accepted_change_id = 'CR-0001';
   assert.throws(() => validateGoalContract(invalidV2), /predecessor\.goal_version/i);
+});
+
+test('goal contract rejects sparse and property-bearing semantic arrays', () => {
+  const sparseScope = goalV1();
+  sparseScope.scope.in = [];
+  sparseScope.scope.in[1] = 'CLI';
+  assert.throws(() => validateGoalContract(sparseScope), /scope\.in/i);
+
+  const decoratedScope = goalV1();
+  decoratedScope.scope.in.extra = 'not JSON array data';
+  assert.throws(() => validateGoalContract(decoratedScope), /scope\.in/i);
 });
 
 test('relative artifact paths normalize only safe repository-relative paths', () => {
@@ -181,6 +244,38 @@ test('lock contract rejects malformed enums, heads, and record digests', () => {
   const badDigest = lockV1();
   badDigest.record_digest = '1111111111111111111111111111111111111111111111111111111111111111';
   assert.throws(() => validateLockRecord(badDigest), /record_digest/i);
+});
+
+test('lock contract validates the semantic boundary of every root field', () => {
+  const cases = [
+    ['schema_version', (lock) => { lock.schema_version = 2; }],
+    ['goal_id', (lock) => { lock.goal_id = 'GL-lowercase'; }],
+    ['goal_version', (lock) => { lock.goal_version = 0; }],
+    ['goal_digest', (lock) => { lock.goal_digest = 'not-a-digest'; }],
+    ['approval_type', (lock) => { lock.approval_type = 'implicit'; }],
+    ['proposal_digest', (lock) => { lock.proposal_digest = 'not-a-digest'; }],
+    ['approved_at', (lock) => { lock.approved_at = 'not-a-timestamp'; }],
+    ['predecessor_digest', (lock) => { lock.predecessor_digest = '1111111111111111111111111111111111111111111111111111111111111111'; }],
+    ['state_revision', (lock) => { lock.state_revision = 0; }],
+    ['progress_head', (lock) => { lock.progress_head = {}; }],
+    ['change_head', (lock) => { lock.change_head = {}; }],
+    ['evidence_heads', (lock) => { lock.evidence_heads = { invalid: {} }; }],
+    ['record_digest', (lock) => { lock.record_digest = 'not-a-digest'; }],
+  ];
+
+  for (const [field, change] of cases) {
+    const input = lockV1();
+    change(input);
+    assert.throws(() => validateLockRecord(input), new RegExp(field));
+  }
+});
+
+test('lock contract rejects impossible RFC 3339 calendar dates and times', () => {
+  for (const approvedAt of ['2026-02-30T00:00:00Z', '2026-08-23T24:00:00Z', '2026-08-23T23:60:00Z', '2026-08-23T23:59:60Z']) {
+    const input = lockV1();
+    input.approved_at = approvedAt;
+    assert.throws(() => validateLockRecord(input), /approved_at/i);
+  }
 });
 
 test('approval phrase builders bind the stable identifiers and digest fingerprints', () => {

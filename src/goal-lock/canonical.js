@@ -40,7 +40,8 @@ function normalizeValue(value, seen) {
     if (prototype !== Object.prototype && prototype !== null) {
       throw canonicalError('objects must have Object.prototype or null as their prototype');
     }
-    const normalized = {};
+    // 使用无原型容器，确保 __proto__ 仍是普通 JSON 数据键而不会触发旧式 setter。
+    const normalized = Object.create(null);
     for (const key of Object.keys(value).sort()) {
       normalized[key] = normalizeValue(value[key], seen);
     }
