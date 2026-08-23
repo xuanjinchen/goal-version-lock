@@ -199,16 +199,10 @@ export async function lockInitialGoal(root, approval, context = {}) {
     const lock = { ...record, record_digest: sha256(canonicalBytes(record)) };
     validateLockRecord(lock);
     await commitGoalFiles(root, [
+      { target: '.goal-lock/current.json', expected: { kind: 'sha256', digest: current.digest }, content: current.bytes },
       { target: '.goal-lock/lock.json', expected: { kind: 'absent' }, content: canonicalBytes(lock) },
       { target: '.goal-lock/history/goals/v0001.json', expected: { kind: 'absent' }, content: current.bytes },
-    ], {
-      ...context,
-      // 当前草稿只读参与整个提交的所有权校验，末次校验失败时锁与历史会被事务回滚。
-      readOnlyAssertions: [{
-        target: '.goal-lock/current.json',
-        expected: { kind: 'sha256', digest: current.digest },
-      }],
-    });
+    ], context);
     return { state: 'LOCKED', goal_id: current.goal.goal_id, goal_version: 1, goal_digest: current.digest };
   }, context);
 }

@@ -181,8 +181,9 @@ test('version 1 lock rolls back lock and history when either installation fails'
     await initializeGoal(fixture.root, goalV1(), fixture);
     const currentPath = join(fixture.root, '.goal-lock', 'current.json');
     const current = await readFile(currentPath);
-    fixture.transactionFaults.install = ({ index }) => {
-      if (index === failedInstallation) throw new Error(`install-${failedInstallation}`);
+    let installations = 0;
+    fixture.transactionFaults.install = () => {
+      if (installations++ === failedInstallation) throw new Error(`install-${failedInstallation}`);
     };
 
     await assert.rejects(lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 92d74f6bf766', fixture), new RegExp(`install-${failedInstallation}`));
@@ -471,6 +472,26 @@ test('transaction creates an expected-absent target through a cleaned same-direc
   assert.deepEqual(await readFile(join(fixture.root, '.goal-lock', 'current.json')), content);
   assert.deepEqual(await readdir(join(fixture.root, '.goal-lock')), ['current.json']);
   assert.deepEqual(receipt, { warnings: [] });
+});
+
+test('transaction retains target identity when exact bytes are a final ownership precondition', async (testContext) => {
+  const fixture = createGoalLockFixture(testContext);
+  const directory = join(fixture.root, '.goal-lock');
+  const currentPath = join(directory, 'current.json');
+  const current = canonicalBytes({ goal: 'draft' });
+  await mkdir(directory);
+  await writeFile(currentPath, current);
+  const before = await lstat(currentPath, { bigint: true });
+
+  await commitGoalFiles(fixture.root, [
+    { target: '.goal-lock/current.json', expected: { kind: 'sha256', digest: sha256(current) }, content: current },
+    { target: '.goal-lock/lock.json', expected: { kind: 'absent' }, content: canonicalBytes({ state: 'locked' }) },
+  ], fixture);
+
+  const after = await lstat(currentPath, { bigint: true });
+  assert.equal(after.dev, before.dev);
+  assert.equal(after.ino, before.ino);
+  assert.deepEqual(await readFile(currentPath), current);
 });
 
 test('transaction replaces only the target with the exact expected digest', async (testContext) => {

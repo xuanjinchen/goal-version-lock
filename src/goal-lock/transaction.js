@@ -258,41 +258,6 @@ function validateExpected(expected) {
   throw new GoalLockError('INVALID_TRANSACTION', 'input', 2, 'Transaction expected ownership is invalid.');
 }
 
-async function prepareReadOnlyAssertions(root, assertions, seenTargets) {
-  // 只读目标同样参与预检和末次复核，避免“读取后修改”留下跨版本混合状态。
-  if (assertions === undefined) return [];
-  if (!Array.isArray(assertions)) {
-    throw new GoalLockError('INVALID_TRANSACTION', 'input', 2, 'Read-only transaction assertions must be an array.');
-  }
-  const prepared = [];
-  for (const assertion of assertions) {
-    if (assertion === null || typeof assertion !== 'object' || Array.isArray(assertion)) {
-      throw new GoalLockError('INVALID_TRANSACTION', 'input', 2, 'Each read-only transaction assertion must be an object.');
-    }
-    const fields = ['target', 'expected'];
-    if (Object.keys(assertion).length !== fields.length || fields.some((field) => !Object.hasOwn(assertion, field))) {
-      throw new GoalLockError('INVALID_TRANSACTION', 'input', 2, 'Each read-only transaction assertion must contain exactly target and expected.');
-    }
-    validateExpected(assertion.expected);
-    if (assertion.expected.kind !== 'sha256') {
-      throw new GoalLockError('INVALID_TRANSACTION', 'input', 2, 'Read-only transaction assertions must require an existing SHA-256 target.');
-    }
-    const absolute = resolveGoalTarget(root, assertion.target);
-    const targetKey = comparablePath(absolute);
-    if (seenTargets.has(targetKey)) {
-      throw transactionIntegrity(`Duplicate transaction target: ${assertion.target}`);
-    }
-    seenTargets.add(targetKey);
-    await assertSafeAncestors(root, absolute);
-    const original = await readTransactionFile(absolute, 'Read-only transaction target');
-    if (original.digest !== assertion.expected.digest) {
-      throw transactionIntegrity(`Read-only transaction target digest changed: ${assertion.target}`);
-    }
-    prepared.push({ ...assertion, absolute, original });
-  }
-  return prepared;
-}
-
 async function isOwnerProcessAlive(pid, context) {
   if (typeof context.isProcessAlive === 'function') {
     try {
@@ -456,15 +421,16 @@ export async function commitGoalFiles(root, entries, context = {}) {
         throw transactionIntegrity(`Transaction target digest changed: ${entry.target}`);
       }
     }
-    prepared.push({ ...entry, absolute, original });
+    // 相同字节是只读所有权前提而非替换操作，保留 inode 才能在末次复核发现并发修改。
+    const readOnly = original !== null && entry.content !== null && original.bytes.equals(entry.content);
+    prepared.push({ ...entry, absolute, original, readOnly });
   }
-  const readOnlyAssertions = await prepareReadOnlyAssertions(canonicalRoot, context.readOnlyAssertions, seenTargets);
 
   const transactionId = (context.randomToken ?? randomUUID)();
   const createdDirectories = [];
   try {
     for (const [index, entry] of prepared.entries()) {
-      if (entry.content === null) continue;
+      if (entry.content === null || entry.readOnly) continue;
       await ensureParentDirectories(canonicalRoot, entry.absolute, createdDirectories);
       entry.stage = path.join(path.dirname(entry.absolute), `.${path.basename(entry.absolute)}.${transactionId}.${index}.stage`);
       const handle = await open(entry.stage, 'wx', 0o600);
@@ -484,6 +450,7 @@ export async function commitGoalFiles(root, entries, context = {}) {
     }
 
     for (const [index, entry] of prepared.entries()) {
+      if (entry.readOnly) continue;
       if (entry.original) {
         entry.backup = path.join(path.dirname(entry.absolute), `.${path.basename(entry.absolute)}.${transactionId}.${index}.backup`);
         await link(entry.absolute, entry.backup);
@@ -517,15 +484,11 @@ export async function commitGoalFiles(root, entries, context = {}) {
     await invokeFault(context, 'finalReadBack', { targets: prepared.map((entry) => entry.target) });
     for (const entry of prepared) {
       const actual = await optionalTransactionFile(entry.absolute, 'Committed transaction target');
-      if (entry.content === null ? actual !== null : !actual
+      if (entry.readOnly
+        ? !actual || !sameIdentity(actual.snapshot, entry.original.snapshot) || actual.digest !== entry.original.digest
+        : entry.content === null ? actual !== null : !actual
         || actual && (!sameIdentity(actual.snapshot, entry.staged.snapshot) || actual.digest !== entry.staged.digest)) {
         throw transactionIntegrity(`Final transaction verification failed: ${entry.target}`);
-      }
-    }
-    for (const assertion of readOnlyAssertions) {
-      const actual = await optionalTransactionFile(assertion.absolute, 'Read-only transaction target');
-      if (!actual || !sameIdentity(actual.snapshot, assertion.original.snapshot) || actual.digest !== assertion.original.digest) {
-        throw transactionIntegrity(`Read-only transaction target changed before final verification: ${assertion.target}`);
       }
     }
   } catch (originalError) {
