@@ -116,7 +116,7 @@ function completePlan(revision = 1) {
         dependencies: ['TASK-0001'],
         permitted_paths: ['tests/goal-lock.test.js'],
         verification: 'Run the complete goal-lock test file',
-        status: 'blocked',
+        status: 'pending',
       },
     ],
     deferred: [{ id: 'TASK-0003', reason: 'Not scheduled in this revision' }],
@@ -197,6 +197,7 @@ test('plan contract enforces normalized paths, verification text, statuses, and 
 
   const noExecutableTask = completePlan();
   noExecutableTask.tasks[0].status = 'complete';
+  noExecutableTask.tasks[1].status = 'complete';
   noExecutableTask.next_task_id = null;
   assert.deepEqual(validateCompletePlan(noExecutableTask), noExecutableTask);
 });
@@ -262,6 +263,50 @@ function withEventDigest(event, previousEventDigest) {
     ...payload,
     event_digest: independentSha256(canonicalBytes(payload)),
   };
+}
+
+async function rewriteTestProgressLedger(fixture, descriptors) {
+  let previousEventDigest = null;
+  const events = descriptors.map((descriptor, index) => {
+    const payload = {
+      schema_version: 1,
+      event_id: `EVT-${String(index + 1).padStart(6, '0')}`,
+      recorded_at: '2026-08-23T00:00:00.000Z',
+      goal: activeGoalReference(),
+      plan_revision: 1,
+      task_id: null,
+      event_type: 'plan-revision',
+      summary: `Test event ${index + 1}`,
+      evidence_refs: [],
+      ...descriptor,
+      previous_event_digest: previousEventDigest,
+    };
+    const event = {
+      ...payload,
+      event_digest: independentSha256(canonicalBytes(payload)),
+    };
+    previousEventDigest = event.event_digest;
+    return event;
+  });
+  await writeFile(
+    join(fixture.root, '.goal-lock', 'progress.jsonl'),
+    Buffer.concat(events.map((event) => canonicalBytes(event))),
+  );
+  await rewriteTestLock(fixture, (lock) => {
+    lock.state_revision = events.length + 1;
+    lock.progress_head = {
+      event_id: events.at(-1).event_id,
+      digest: events.at(-1).event_digest,
+    };
+  });
+  return events;
+}
+
+async function rewriteTestPlan(fixture, mutate) {
+  const planPath = join(fixture.root, '.goal-lock', 'plan.json');
+  const plan = parseCanonicalJson(await readFile(planPath), 'test plan');
+  mutate(plan);
+  await writeFile(planPath, canonicalBytes(plan));
 }
 
 test('plan revision creates revision 1 and its automatic progress event in one state revision', async (testContext) => {
@@ -349,6 +394,91 @@ test('plan revision rejects unsupported classifications and caller-owned envelop
 
   assert.equal(existsSync(join(directory, 'plan.json')), false);
   assert.equal(parseCanonicalJson(await readFile(join(directory, 'lock.json'))).state_revision, 1);
+});
+
+test('plan revision task status requires every first-plan task to begin pending', async (testContext) => {
+  const { initializeGoal, lockInitialGoal, revisePlan } = await goalRepository();
+  const cases = [
+    ['in_progress', 'TASK-0001'],
+    ['blocked', null],
+    ['complete', 'TASK-0002'],
+    ['stale', null],
+  ];
+  for (const [status, nextTaskId] of cases) {
+    const fixture = createGoalLockFixture(testContext);
+    await initializeGoal(fixture.root, goalV1(), fixture);
+    await lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 92d74f6bf766', fixture);
+    const candidate = planCandidate();
+    candidate.tasks[0].status = status;
+    candidate.next_task_id = nextTaskId;
+
+    await assert.rejects(
+      revisePlan(fixture.root, candidate, 'aligned', fixture),
+      (error) => error instanceof GoalLockError && error.kind === 'input',
+      status,
+    );
+    assert.equal(existsSync(join(fixture.root, '.goal-lock', 'plan.json')), false, status);
+  }
+});
+
+test('plan revision task status preserves shared tasks and requires new tasks to begin pending', async (testContext) => {
+  const { initializeGoal, lockInitialGoal, revisePlan } = await goalRepository();
+  const cases = [
+    ['shared in_progress', (candidate) => { candidate.tasks[0].status = 'in_progress'; }],
+    ['shared blocked', (candidate) => { candidate.tasks[0].status = 'blocked'; candidate.next_task_id = null; }],
+    ['shared complete', (candidate) => { candidate.tasks[0].status = 'complete'; candidate.next_task_id = 'TASK-0002'; }],
+    ['shared stale', (candidate) => { candidate.tasks[0].status = 'stale'; candidate.next_task_id = null; }],
+    ['new complete', (candidate) => {
+      candidate.tasks.push({
+        id: 'TASK-0004',
+        outcome: 'Bypass the progress ledger',
+        acceptance_criteria: ['AC-001'],
+        dependencies: [],
+        permitted_paths: ['src/goal-lock/repository.js'],
+        verification: 'Run the focused goal-lock tests',
+        status: 'complete',
+      });
+    }],
+  ];
+  for (const [label, mutate] of cases) {
+    const fixture = createGoalLockFixture(testContext);
+    await initializeGoal(fixture.root, goalV1(), fixture);
+    await lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 92d74f6bf766', fixture);
+    await revisePlan(fixture.root, planCandidate(), 'aligned', fixture);
+    const candidate = planCandidate('Refined implementation');
+    mutate(candidate);
+
+    await assert.rejects(
+      revisePlan(fixture.root, candidate, 'aligned', fixture),
+      (error) => error instanceof GoalLockError && error.kind === 'input',
+      label,
+    );
+  }
+});
+
+test('plan revision task status carries an already completed shared task without a new completion event', async (testContext) => {
+  const { fixture, repository } = await createPlannedFixture(testContext);
+  await installTestEvidence(fixture);
+  await repository.recordGoalEvent(fixture.root, progressInput('Started implementation', { event_type: 'task-start' }), fixture);
+  await repository.recordGoalEvent(fixture.root, progressInput('Completed implementation', {
+    event_type: 'task-complete',
+    evidence_refs: ['EVID-0001'],
+  }), fixture);
+  const current = parseCanonicalJson(await readFile(join(fixture.root, '.goal-lock', 'plan.json')), 'test plan');
+  const candidate = {
+    next_task_id: current.next_task_id,
+    tasks: current.tasks.map((task) => task.id === 'TASK-0001'
+      ? { ...task, outcome: 'Refined completed implementation' }
+      : task),
+    deferred: current.deferred,
+  };
+
+  await repository.revisePlan(fixture.root, candidate, 'aligned', fixture);
+
+  const revised = parseCanonicalJson(await readFile(join(fixture.root, '.goal-lock', 'plan.json')), 'test plan');
+  assert.equal(revised.tasks[0].status, 'complete');
+  assert.equal(revised.next_task_id, 'TASK-0002');
+  assert.equal((await repository.verifyGoalRepository(fixture.root, fixture)).state, 'LOCKED');
 });
 
 test('plan revision rejects wrong bindings, skipped revisions, and changed goal versions', async (testContext) => {
@@ -624,6 +754,88 @@ test('progress ledger verification rejects a validly redigested cross-version ev
   assert.equal((await repository.verifyGoalRepository(fixture.root, fixture)).state, 'TAMPERED');
 });
 
+test('progress ledger requires plan-revision to be the single first event for each plan revision', async (testContext) => {
+  const cases = [
+    ['first bound event is not lifecycle', [
+      { plan_revision: 1 },
+      { plan_revision: 2, event_type: 'verification-result', task_id: 'TASK-0001' },
+      { plan_revision: 2 },
+    ]],
+    ['duplicate lifecycle event', [
+      { plan_revision: 1 },
+      { plan_revision: 1 },
+    ]],
+  ];
+  for (const [label, descriptors] of cases) {
+    const { fixture, repository } = await createPlannedFixture(testContext);
+    if (descriptors.some((descriptor) => descriptor.plan_revision === 2)) {
+      await repository.revisePlan(fixture.root, planCandidate('Revision two'), 'aligned', fixture);
+    }
+    await rewriteTestProgressLedger(fixture, descriptors);
+
+    assert.equal((await repository.verifyGoalRepository(fixture.root, fixture)).state, 'TAMPERED', label);
+  }
+});
+
+test('progress ledger requires a lifecycle event for every archived plan revision', async (testContext) => {
+  const { fixture, repository } = await createPlannedFixture(testContext);
+  await repository.revisePlan(fixture.root, planCandidate('Revision two'), 'aligned', fixture);
+  await rewriteTestProgressLedger(fixture, [{ plan_revision: 2 }]);
+
+  assert.equal((await repository.verifyGoalRepository(fixture.root, fixture)).state, 'TAMPERED');
+});
+
+test('task status replay rejects task-complete while the task is pending', async (testContext) => {
+  const { fixture, repository } = await createPlannedFixture(testContext);
+  await installTestEvidence(fixture);
+  await rewriteTestPlan(fixture, (plan) => {
+    plan.tasks[0].status = 'complete';
+    plan.next_task_id = 'TASK-0002';
+  });
+  await rewriteTestProgressLedger(fixture, [
+    {},
+    { event_type: 'task-complete', task_id: 'TASK-0001', evidence_refs: ['EVID-0001'] },
+  ]);
+
+  assert.equal((await repository.verifyGoalRepository(fixture.root, fixture)).state, 'TAMPERED');
+});
+
+test('task status replay rejects repeated task-start transitions', async (testContext) => {
+  const { fixture, repository } = await createPlannedFixture(testContext);
+  await rewriteTestPlan(fixture, (plan) => { plan.tasks[0].status = 'in_progress'; });
+  await rewriteTestProgressLedger(fixture, [
+    {},
+    { event_type: 'task-start', task_id: 'TASK-0001' },
+    { event_type: 'task-start', task_id: 'TASK-0001' },
+  ]);
+
+  assert.equal((await repository.verifyGoalRepository(fixture.root, fixture)).state, 'TAMPERED');
+});
+
+test('task status replay rejects blocker while the task is pending', async (testContext) => {
+  const { fixture, repository } = await createPlannedFixture(testContext);
+  await rewriteTestPlan(fixture, (plan) => {
+    plan.tasks[0].status = 'blocked';
+    plan.next_task_id = null;
+  });
+  await rewriteTestProgressLedger(fixture, [
+    {},
+    { event_type: 'blocker', task_id: 'TASK-0001' },
+  ]);
+
+  assert.equal((await repository.verifyGoalRepository(fixture.root, fixture)).state, 'TAMPERED');
+});
+
+test('task status replay must equal the status stored in the plan record', async (testContext) => {
+  const { fixture, repository } = await createPlannedFixture(testContext);
+  await rewriteTestProgressLedger(fixture, [
+    {},
+    { event_type: 'task-start', task_id: 'TASK-0001' },
+  ]);
+
+  assert.equal((await repository.verifyGoalRepository(fixture.root, fixture)).state, 'TAMPERED');
+});
+
 async function installTestEvidence(fixture, evidenceId = 'EVID-0001') {
   const evidenceDirectory = join(fixture.root, '.goal-lock', 'evidence', 'AC-001');
   await mkdir(evidenceDirectory, { recursive: true });
@@ -643,13 +855,6 @@ test('task status task-start moves only pending tasks to in_progress without rev
   const { fixture, repository } = await createPlannedFixture(testContext);
   const directory = join(fixture.root, '.goal-lock');
 
-  await assert.rejects(
-    repository.recordGoalEvent(fixture.root, progressInput('Start blocked task', {
-      event_type: 'task-start',
-      task_id: 'TASK-0002',
-    }), fixture),
-    (error) => error instanceof GoalLockError && error.kind === 'state',
-  );
   await repository.recordGoalEvent(fixture.root, progressInput('Started implementation', {
     event_type: 'task-start',
   }), fixture);
@@ -657,7 +862,7 @@ test('task status task-start moves only pending tasks to in_progress without rev
   const plan = parseCanonicalJson(await readFile(join(directory, 'plan.json')), 'test plan');
   assert.equal(plan.plan_revision, 1);
   assert.equal(plan.tasks[0].status, 'in_progress');
-  assert.equal(plan.tasks[1].status, 'blocked');
+  assert.equal(plan.tasks[1].status, 'pending');
   assert.equal(existsSync(join(directory, 'history', 'plans')), false);
   await assert.rejects(
     repository.recordGoalEvent(fixture.root, progressInput('Start twice', { event_type: 'task-start' }), fixture),
@@ -694,7 +899,7 @@ test('task status task-complete requires an in_progress task and existing eviden
   const plan = parseCanonicalJson(await readFile(join(directory, 'plan.json')), 'test plan');
   assert.equal(plan.plan_revision, 1);
   assert.equal(plan.tasks[0].status, 'complete');
-  assert.equal(plan.next_task_id, null);
+  assert.equal(plan.next_task_id, 'TASK-0002');
   await assert.rejects(
     repository.recordGoalEvent(fixture.root, progressInput('Complete twice', {
       event_type: 'task-complete',
@@ -725,7 +930,14 @@ test('task status audit events never silently complete the active task', async (
   const directory = join(fixture.root, '.goal-lock');
   await repository.recordGoalEvent(fixture.root, progressInput('Started implementation', { event_type: 'task-start' }), fixture);
 
-  for (const eventType of ['verification-result', 'plan-revision', 'goal-change', 'evidence-invalidation', 'recovery', 'final-audit']) {
+  await assert.rejects(
+    repository.recordGoalEvent(fixture.root, progressInput('Caller lifecycle event', {
+      event_type: 'plan-revision',
+      task_id: null,
+    }), fixture),
+    (error) => error instanceof GoalLockError && error.kind === 'input',
+  );
+  for (const eventType of ['verification-result', 'goal-change', 'evidence-invalidation', 'recovery', 'final-audit']) {
     await repository.recordGoalEvent(fixture.root, progressInput(`Recorded ${eventType}`, {
       event_type: eventType,
       task_id: eventType === 'verification-result' ? 'TASK-0001' : null,

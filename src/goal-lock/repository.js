@@ -15,6 +15,11 @@ import { createWorkspaceReader } from './workspace.js';
 
 const ACTIVE_WRITE = Symbol('active goal writer');
 const RETURN_VERIFIED_SNAPSHOT = Symbol('return verified repository snapshot');
+const TASK_STATUS_TRANSITIONS = Object.freeze({
+  'task-start': Object.freeze({ from: 'pending', to: 'in_progress' }),
+  'task-complete': Object.freeze({ from: 'in_progress', to: 'complete' }),
+  blocker: Object.freeze({ from: 'in_progress', to: 'blocked' }),
+});
 
 function stateError(code, message) {
   return new GoalLockError(code, 'state', 3, message);
@@ -400,6 +405,7 @@ async function verifyProgressLedger(reader, rootNames, lock, goalHistory, planSt
       planState.current.value,
     );
   }
+  const eventsByPlan = new Map([...plans.keys()].map((key) => [key, []]));
   let count = 0;
   let offset = 0;
   let terminal = null;
@@ -426,7 +432,8 @@ async function verifyProgressLedger(reader, rootNames, lock, goalHistory, planSt
       || historicalGoal.digest !== event.goal.goal_digest) {
       throw integrityError('PROGRESS_GOAL_MISMATCH', 'Progress event does not bind a known goal version.');
     }
-    const plan = plans.get(`${event.goal.goal_version}/${event.plan_revision}`);
+    const planKey = `${event.goal.goal_version}/${event.plan_revision}`;
+    const plan = plans.get(planKey);
     if (!plan) throw integrityError('PROGRESS_PLAN_MISMATCH', 'Progress event does not bind a known plan revision.');
     if (event.task_id !== null && !plan.tasks.some((task) => task.id === event.task_id)) {
       throw integrityError('PROGRESS_TASK_UNKNOWN', 'Progress event references an unknown task.');
@@ -436,6 +443,7 @@ async function verifyProgressLedger(reader, rootNames, lock, goalHistory, planSt
     }
     terminal = event;
     events.push(event);
+    eventsByPlan.get(planKey).push(event);
     count += 1;
     offset = terminator + 1;
   }
@@ -444,7 +452,55 @@ async function verifyProgressLedger(reader, rootNames, lock, goalHistory, planSt
     || terminal.event_digest !== lock.progress_head.digest) {
     throw integrityError('PROGRESS_HEAD_MISMATCH', 'Lock progress head does not match the terminal progress event.');
   }
+  verifyProgressPlanState(plans, eventsByPlan);
   return { count, events, input, terminal };
+}
+
+function verifyProgressPlanState(plans, eventsByPlan) {
+  const orderedPlans = [...plans.values()].sort((left, right) => (
+    left.goal.goal_version - right.goal.goal_version
+    || left.plan_revision - right.plan_revision
+  ));
+  let previousGoalVersion = null;
+  let previousStatuses = new Map();
+  for (const plan of orderedPlans) {
+    if (plan.goal.goal_version !== previousGoalVersion) previousStatuses = new Map();
+    const planKey = `${plan.goal.goal_version}/${plan.plan_revision}`;
+    const planEvents = eventsByPlan.get(planKey);
+    const lifecycleCount = planEvents.filter((event) => event.event_type === 'plan-revision').length;
+    if (lifecycleCount !== 1 || planEvents[0]?.event_type !== 'plan-revision') {
+      throw integrityError(
+        'PROGRESS_PLAN_LIFECYCLE_INVALID',
+        'Every plan revision requires exactly one plan-revision event as its first bound event.',
+      );
+    }
+
+    // 每个 revision 只继承上一 revision 的共享任务终态；首次出现的任务必须从 pending 回放。
+    const replayedStatuses = new Map(plan.tasks.map((task) => [
+      task.id,
+      previousStatuses.get(task.id) ?? 'pending',
+    ]));
+    for (const event of planEvents) {
+      const transition = TASK_STATUS_TRANSITIONS[event.event_type];
+      if (!transition) continue;
+      const status = replayedStatuses.get(event.task_id);
+      if (status !== transition.from) {
+        throw integrityError(
+          'PROGRESS_TASK_TRANSITION_INVALID',
+          `${event.event_type} cannot transition task ${event.task_id} from ${status}.`,
+        );
+      }
+      replayedStatuses.set(event.task_id, transition.to);
+    }
+    if (plan.tasks.some((task) => replayedStatuses.get(task.id) !== task.status)) {
+      throw integrityError(
+        'PROGRESS_TASK_STATUS_MISMATCH',
+        'Replayed task statuses do not match the bound plan revision.',
+      );
+    }
+    previousGoalVersion = plan.goal.goal_version;
+    previousStatuses = replayedStatuses;
+  }
 }
 
 async function verifyEvidenceState(reader, rootNames, lock) {
@@ -765,6 +821,9 @@ function validateGoalEventInput(input) {
     throw inputError('INVALID_EVENT_INPUT', 'Progress event input must contain exactly kind, event_type, task_id, summary, and evidence_refs.');
   }
   if (input.kind !== 'progress') throw inputError('INVALID_EVENT_INPUT', 'Progress event kind must equal progress.');
+  if (input.event_type === 'plan-revision') {
+    throw inputError('INVALID_EVENT_INPUT', 'Plan revision lifecycle events are owned by plan revision commits.');
+  }
   return input;
 }
 
@@ -854,12 +913,7 @@ function nextExecutableTaskId(tasks, currentNextTaskId) {
 }
 
 function planAfterTaskEvent(plan, eventType, taskId, goal) {
-  const nextStatusByEvent = {
-    'task-start': { from: 'pending', to: 'in_progress' },
-    'task-complete': { from: 'in_progress', to: 'complete' },
-    blocker: { from: 'in_progress', to: 'blocked' },
-  };
-  const transition = nextStatusByEvent[eventType];
+  const transition = TASK_STATUS_TRANSITIONS[eventType];
   if (!transition) return plan;
   const task = plan.tasks.find((candidate) => candidate.id === taskId);
   if (task.status !== transition.from) {
@@ -875,6 +929,21 @@ function planAfterTaskEvent(plan, eventType, taskId, goal) {
     next_task_id: nextExecutableTaskId(tasks, plan.next_task_id),
   }, plan.goal);
   return validatePlanCriteria(updated, goal);
+}
+
+function validatePlanStatusOwnership(plan, priorPlan) {
+  const priorStatuses = new Map((priorPlan?.tasks ?? []).map((task) => [task.id, task.status]));
+  // 计划修订只描述工作结构；共享任务状态由上一 revision 继承，新任务只能从 pending 开始。
+  for (const task of plan.tasks) {
+    const expectedStatus = priorStatuses.get(task.id) ?? 'pending';
+    if (task.status !== expectedStatus) {
+      throw inputError(
+        'INVALID_PLAN_STATUS',
+        `Plan task ${task.id} must preserve status ${expectedStatus}.`,
+      );
+    }
+  }
+  return plan;
 }
 
 export async function revisePlan(root, candidate, classification, context = {}) {
@@ -904,14 +973,14 @@ export async function revisePlan(root, candidate, classification, context = {}) 
       goal_version: current.goal.goal_version,
       goal_digest: current.digest,
     };
-    const plan = validatePlanCriteria(validatePlan({
+    const plan = validatePlanStatusOwnership(validatePlanCriteria(validatePlan({
       schema_version: 1,
       goal: goalReference,
       plan_revision: planRevision,
       next_task_id: candidate.next_task_id,
       tasks: candidate.tasks,
       deferred: candidate.deferred,
-    }, goalReference), current.goal);
+    }, goalReference), current.goal), priorPlan?.value ?? null);
     const planBytes = canonicalBytes(plan);
     const event = buildProgressEvent(progressState, goalReference, planRevision, {
       event_type: 'plan-revision',
