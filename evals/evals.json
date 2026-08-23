@@ -1,5 +1,55 @@
 {
   "schema_version": 1,
   "skill": "goal-version-lock",
-  "evals": []
+  "evals": [
+    {
+      "id": "EVAL-001",
+      "category": "positive",
+      "prompt": "Lock this multi-step development objective before implementation, and keep its plan and progress records locally so the work cannot drift.",
+      "assertions": [
+        {
+          "id": "ASSERT-001",
+          "text": "Creates a local draft goal contract and requests the exact version-1 approval phrase before locking it."
+        }
+      ],
+      "result": {
+        "status": "not-run",
+        "evidence": ""
+      }
+    },
+    {
+      "id": "EVAL-002",
+      "category": "negative",
+      "prompt": "Give me a short implementation plan for adding a settings toggle; I only need the usual steps and tests.",
+      "assertions": [
+        {
+          "id": "ASSERT-002",
+          "text": "Provides ordinary planning guidance and does not create a .goal-lock/ workspace."
+        }
+      ],
+      "result": {
+        "status": "not-run",
+        "evidence": ""
+      }
+    },
+    {
+      "id": "EVAL-003",
+      "category": "boundary",
+      "prompt": "Mid-task, change acceptance criterion AC-001 to require an additional export format. After the proposal is shown, I reply: 确认.",
+      "assertions": [
+        {
+          "id": "ASSERT-003",
+          "text": "Creates a change request with field-level impact and pauses affected work."
+        },
+        {
+          "id": "ASSERT-004",
+          "text": "Refuses the generic confirmation and keeps the active goal version unchanged."
+        }
+      ],
+      "result": {
+        "status": "not-run",
+        "evidence": ""
+      }
+    }
+  ]
 }
