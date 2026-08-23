@@ -1,6 +1,7 @@
 node_modules/
 coverage/
 .tmp/
+.worktrees/
 eval-workspaces/
 *.log
 .scaffold-init.lock
