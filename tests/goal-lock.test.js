@@ -17,6 +17,169 @@ import {
 import { commitGoalFiles, recoverGoalLock, withGoalLock } from '../src/goal-lock/transaction.js';
 import { createGoalLockFixture } from './helpers/goal-lock-fixture.js';
 
+async function goalRepository() {
+  return import('../src/goal-lock/repository.js');
+}
+
+async function optionalBytes(target) {
+  try {
+    return await readFile(target);
+  } catch (error) {
+    if (error?.code === 'ENOENT') return null;
+    throw error;
+  }
+}
+
+test('initializes goal draft as the only initial repository record', async (testContext) => {
+  const fixture = createGoalLockFixture(testContext);
+  const draft = goalV1();
+  const expectedCurrent = Buffer.from('{"acceptance_criteria":[{"id":"AC-001","outcome":"State is locked","verification":"Run verification"}],"accepted_change_id":null,"assumptions":[{"confidence":"medium","statement":"Git is installed"}],"authorization_boundary":["Local workspace only"],"constraints":[{"id":"C-001","text":"Use Node.js"}],"goal_id":"GL-ALPHA","goal_version":1,"non_goals":["Remote publishing"],"objective":"Ship a safe lock","predecessor":null,"schema_version":1,"scope":{"in":["CLI"],"out":["Cloud sync"]}}\n');
+  const { initializeGoal } = await goalRepository();
+
+  const result = await initializeGoal(fixture.root, draft, fixture);
+
+  assert.deepEqual(result, {
+    state: 'DRAFT',
+    goal_id: 'GL-ALPHA',
+    goal_version: 1,
+    goal_digest: '92d74f6bf766e096e71b949ff57e2d9a12302a4519226d05cf67c2b544babaa6',
+    approval_required: 'APPROVE GOAL GL-ALPHA VERSION 1 92d74f6bf766',
+  });
+  assert.deepEqual(await readFile(join(fixture.root, '.goal-lock', 'current.json')), expectedCurrent);
+  assert.equal(await optionalBytes(join(fixture.root, '.goal-lock', 'lock.json')), null);
+  assert.equal(await optionalBytes(join(fixture.root, '.goal-lock', 'history', 'goals', 'v0001.json')), null);
+  assert.deepEqual(await readdir(join(fixture.root, '.goal-lock')), ['current.json']);
+});
+
+test('initializes goal draft validates before creating goal-lock state', async (testContext) => {
+  const fixture = createGoalLockFixture(testContext);
+  const invalid = goalV1();
+  invalid.goal_version = 2;
+  const { initializeGoal } = await goalRepository();
+
+  await assert.rejects(initializeGoal(fixture.root, invalid, fixture), (error) => error instanceof GoalLockError && error.code === 'INVALID_CONTRACT');
+
+  assert.equal(existsSync(join(fixture.root, '.goal-lock')), false);
+});
+
+test('initializes goal draft refuses pre-existing non-empty or linked goal-lock directories', async (testContext) => {
+  const { initializeGoal } = await goalRepository();
+  const occupied = createGoalLockFixture(testContext);
+  const occupiedDirectory = join(occupied.root, '.goal-lock');
+  const sentinel = join(occupiedDirectory, 'foreign.json');
+  await mkdir(occupiedDirectory);
+  await writeFile(sentinel, 'foreign bytes');
+
+  await assert.rejects(initializeGoal(occupied.root, goalV1(), occupied), /goal-lock|initial|state/i);
+  assert.deepEqual(await readFile(sentinel), Buffer.from('foreign bytes'));
+
+  const linked = createGoalLockFixture(testContext);
+  const externalDirectory = join(linked.root, 'external-goal-lock');
+  const externalSentinel = join(externalDirectory, 'foreign.json');
+  await mkdir(externalDirectory);
+  await writeFile(externalSentinel, 'linked foreign bytes');
+  try {
+    await symlink(externalDirectory, join(linked.root, '.goal-lock'), process.platform === 'win32' ? 'junction' : 'dir');
+  } catch (error) {
+    if (['EACCES', 'EPERM', 'ENOTSUP'].includes(error?.code)) {
+      testContext.skip(`directory links unavailable: ${error.code}`);
+      return;
+    }
+    throw error;
+  }
+
+  await assert.rejects(initializeGoal(linked.root, goalV1(), linked), /goal-lock|link|directory|state/i);
+  assert.deepEqual(await readFile(externalSentinel), Buffer.from('linked foreign bytes'));
+});
+
+test('initializes goal draft refuses a repeated initialization without changing bytes', async (testContext) => {
+  const fixture = createGoalLockFixture(testContext);
+  const { initializeGoal } = await goalRepository();
+  await initializeGoal(fixture.root, goalV1(), fixture);
+  const currentPath = join(fixture.root, '.goal-lock', 'current.json');
+  const before = await readFile(currentPath);
+
+  await assert.rejects(initializeGoal(fixture.root, goalV1(), fixture), /goal-lock|initial|state/i);
+
+  assert.deepEqual(await readFile(currentPath), before);
+  assert.deepEqual(await readdir(join(fixture.root, '.goal-lock')), ['current.json']);
+});
+
+test('version 1 lock rejects every approval other than the exact current phrase', async (testContext) => {
+  const fixture = createGoalLockFixture(testContext);
+  const { initializeGoal, lockInitialGoal } = await goalRepository();
+  await initializeGoal(fixture.root, goalV1(), fixture);
+  const approvals = [
+    'APPROVE GOAL',
+    'approve goal gl-alpha version 1 92d74f6bf766',
+    ' APPROVE GOAL GL-ALPHA VERSION 1 92d74f6bf766',
+    'APPROVE GOAL GL-BETA VERSION 1 92d74f6bf766',
+    'APPROVE GOAL GL-ALPHA VERSION 2 92d74f6bf766',
+    'APPROVE GOAL GL-ALPHA VERSION 1 000000000000',
+  ];
+
+  for (const approval of approvals) {
+    await assert.rejects(lockInitialGoal(fixture.root, approval, fixture), /approval|approve|confirmation/i);
+    assert.equal(await optionalBytes(join(fixture.root, '.goal-lock', 'lock.json')), null);
+    assert.equal(await optionalBytes(join(fixture.root, '.goal-lock', 'history', 'goals', 'v0001.json')), null);
+  }
+});
+
+test('version 1 lock records the exact approved current bytes in immutable history', async (testContext) => {
+  const fixture = createGoalLockFixture(testContext);
+  const { initializeGoal, lockInitialGoal } = await goalRepository();
+  await initializeGoal(fixture.root, goalV1(), fixture);
+  const currentPath = join(fixture.root, '.goal-lock', 'current.json');
+  const current = await readFile(currentPath);
+
+  await lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 92d74f6bf766', fixture);
+
+  const lock = parseCanonicalJson(await readFile(join(fixture.root, '.goal-lock', 'lock.json')), 'lock');
+  const { record_digest, ...lockWithoutDigest } = lock;
+  assert.deepEqual(lockWithoutDigest, {
+    schema_version: 1,
+    goal_id: 'GL-ALPHA',
+    goal_version: 1,
+    goal_digest: '92d74f6bf766e096e71b949ff57e2d9a12302a4519226d05cf67c2b544babaa6',
+    approval_type: 'explicit-version-1',
+    proposal_digest: '92d74f6bf766e096e71b949ff57e2d9a12302a4519226d05cf67c2b544babaa6',
+    approved_at: '2026-08-23T00:00:00.000Z',
+    predecessor_digest: null,
+    state_revision: 1,
+    progress_head: null,
+    change_head: null,
+    evidence_heads: {},
+  });
+  assert.equal(record_digest, sha256(canonicalBytes(lockWithoutDigest)));
+  assert.deepEqual(validateLockRecord(lock), lock);
+  assert.deepEqual(await readFile(currentPath), current);
+  assert.deepEqual(await readFile(join(fixture.root, '.goal-lock', 'history', 'goals', 'v0001.json')), current);
+
+  const lockBytes = await readFile(join(fixture.root, '.goal-lock', 'lock.json'));
+  await assert.rejects(lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 92d74f6bf766', fixture), /lock|state|initial/i);
+  assert.deepEqual(await readFile(join(fixture.root, '.goal-lock', 'lock.json')), lockBytes);
+});
+
+test('version 1 lock rolls back lock and history when either installation fails', async (testContext) => {
+  const { initializeGoal, lockInitialGoal } = await goalRepository();
+
+  for (const failedInstallation of [0, 1]) {
+    const fixture = createGoalLockFixture(testContext);
+    await initializeGoal(fixture.root, goalV1(), fixture);
+    const currentPath = join(fixture.root, '.goal-lock', 'current.json');
+    const current = await readFile(currentPath);
+    fixture.transactionFaults.install = ({ index }) => {
+      if (index === failedInstallation) throw new Error(`install-${failedInstallation}`);
+    };
+
+    await assert.rejects(lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 92d74f6bf766', fixture), new RegExp(`install-${failedInstallation}`));
+
+    assert.deepEqual(await readFile(currentPath), current);
+    assert.equal(await optionalBytes(join(fixture.root, '.goal-lock', 'lock.json')), null);
+    assert.equal(await optionalBytes(join(fixture.root, '.goal-lock', 'history', 'goals', 'v0001.json')), null);
+  }
+});
+
 test('cooperative lock writes canonical owner bytes and removes them after success', async (testContext) => {
   const fixture = createGoalLockFixture(testContext);
 
