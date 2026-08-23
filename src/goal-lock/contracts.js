@@ -7,6 +7,7 @@ const IDENTIFIERS = {
   change_request_id: /^CR-[0-9]{4}$/,
   event_id: /^EVT-[0-9]{6}$/,
   evidence_id: /^EVID-[0-9]{4}$/,
+  task_id: /^TASK-[0-9]{4}$/,
 };
 
 export class GoalLockError extends Error {
@@ -191,6 +192,107 @@ export function validateGoalContract(value, options = {}) {
     assumptions,
     predecessor,
     accepted_change_id: value.accepted_change_id,
+  });
+}
+
+export function validatePlanContract(value, options = {}) {
+  const fields = ['schema_version', 'goal', 'plan_revision', 'next_task_id', 'tasks', 'deferred'];
+  exactKeys(value, 'plan', fields);
+  if (value.schema_version !== 1) fail('INVALID_CONTRACT', 'input', 2, 'schema_version must equal 1');
+
+  const activeGoal = validateGoalContract(options.goal);
+  const activeDigest = digest(options.goal_digest, 'goal_digest');
+  exactKeys(value.goal, 'goal', ['goal_id', 'goal_version', 'goal_digest']);
+  const goal = {
+    goal_id: identifier(value.goal.goal_id, 'goal_id', 'goal.goal_id'),
+    goal_version: positiveInteger(value.goal.goal_version, 'goal.goal_version'),
+    goal_digest: digest(value.goal.goal_digest, 'goal.goal_digest'),
+  };
+  if (goal.goal_id !== activeGoal.goal_id) fail('INVALID_CONTRACT', 'input', 2, 'goal.goal_id does not match the current goal');
+  if (goal.goal_version !== activeGoal.goal_version) fail('INVALID_CONTRACT', 'input', 2, 'goal.goal_version does not match the current goal');
+  if (goal.goal_digest !== activeDigest) fail('INVALID_CONTRACT', 'input', 2, 'goal.goal_digest does not match the current goal');
+
+  const criterionIds = new Set(activeGoal.acceptance_criteria.map((criterion) => criterion.id));
+  const taskIds = new Set();
+  const tasks = array(value.tasks, 'tasks').map((task, index) => {
+    const label = `tasks[${index}]`;
+    exactKeys(task, label, ['id', 'outcome', 'acceptance_criteria', 'dependencies', 'permitted_paths', 'verification', 'status']);
+    const id = identifier(task.id, 'task_id', `${label}.id`);
+    if (taskIds.has(id)) fail('INVALID_CONTRACT', 'input', 2, `tasks contains duplicate task ID ${id}`);
+    taskIds.add(id);
+    const acceptanceCriteria = array(task.acceptance_criteria, `${label}.acceptance_criteria`, { nonEmpty: true })
+      .map((criterionId) => identifier(criterionId, 'acceptance_criterion_id', `${label}.acceptance_criteria`));
+    const uniqueCriteria = new Set(acceptanceCriteria);
+    if (uniqueCriteria.size !== acceptanceCriteria.length) fail('INVALID_CONTRACT', 'input', 2, `${label}.acceptance_criteria contains duplicates`);
+    for (const criterionId of acceptanceCriteria) {
+      if (!criterionIds.has(criterionId)) fail('INVALID_CONTRACT', 'input', 2, `${label}.acceptance_criteria references a criterion outside the goal`);
+    }
+    const dependencies = array(task.dependencies, `${label}.dependencies`)
+      .map((dependencyId) => identifier(dependencyId, 'task_id', `${label}.dependencies`));
+    if (new Set(dependencies).size !== dependencies.length) fail('INVALID_CONTRACT', 'input', 2, `${label}.dependencies contains duplicates`);
+    const permittedPaths = array(task.permitted_paths, `${label}.permitted_paths`)
+      .map((permittedPath) => normalizeRelativePath(permittedPath, `${label}.permitted_paths`));
+    if (new Set(permittedPaths).size !== permittedPaths.length) fail('INVALID_CONTRACT', 'input', 2, `${label}.permitted_paths contains duplicates`);
+    if (!['pending', 'in_progress', 'blocked', 'complete', 'stale'].includes(task.status)) {
+      fail('INVALID_CONTRACT', 'input', 2, `${label}.status is invalid`);
+    }
+    return {
+      id,
+      outcome: requiredText(task.outcome, `${label}.outcome`),
+      acceptance_criteria: acceptanceCriteria,
+      dependencies,
+      permitted_paths: permittedPaths,
+      verification: requiredText(task.verification, `${label}.verification`),
+      status: task.status,
+    };
+  });
+
+  for (const task of tasks) {
+    for (const dependencyId of task.dependencies) {
+      if (!taskIds.has(dependencyId)) fail('INVALID_CONTRACT', 'input', 2, `task ${task.id} dependency does not exist`);
+    }
+  }
+  const visiting = new Set();
+  const visited = new Set();
+  const dependenciesByTask = new Map(tasks.map((task) => [task.id, task.dependencies]));
+  function visit(taskId) {
+    if (visiting.has(taskId)) fail('INVALID_CONTRACT', 'input', 2, 'task dependency cycle is not permitted');
+    if (visited.has(taskId)) return;
+    // 三色遍历在接受计划前封闭依赖图，避免自引用和跨多任务环被执行顺序掩盖。
+    visiting.add(taskId);
+    for (const dependencyId of dependenciesByTask.get(taskId)) visit(dependencyId);
+    visiting.delete(taskId);
+    visited.add(taskId);
+  }
+  for (const task of tasks) visit(task.id);
+
+  const deferredIds = new Set();
+  const deferred = array(value.deferred, 'deferred').map((item, index) => {
+    const label = `deferred[${index}]`;
+    exactKeys(item, label, ['id', 'reason']);
+    const id = identifier(item.id, 'task_id', `${label}.id`);
+    if (taskIds.has(id)) fail('INVALID_CONTRACT', 'input', 2, `${label}.id duplicates a scheduled task`);
+    if (deferredIds.has(id)) fail('INVALID_CONTRACT', 'input', 2, `deferred contains duplicate task ID ${id}`);
+    deferredIds.add(id);
+    return { id, reason: requiredText(item.reason, `${label}.reason`) };
+  });
+
+  const executableIds = new Set(tasks.filter((task) => ['pending', 'in_progress'].includes(task.status)).map((task) => task.id));
+  let nextTaskId = null;
+  if (value.next_task_id !== null) {
+    nextTaskId = identifier(value.next_task_id, 'task_id', 'next_task_id');
+    if (!executableIds.has(nextTaskId)) fail('INVALID_CONTRACT', 'input', 2, 'next_task_id must reference an executable non-complete task');
+  } else if (executableIds.size > 0) {
+    fail('INVALID_CONTRACT', 'input', 2, 'next_task_id is required while an executable task remains');
+  }
+
+  return deepFreeze({
+    schema_version: 1,
+    goal,
+    plan_revision: positiveInteger(value.plan_revision, 'plan_revision'),
+    next_task_id: nextTaskId,
+    tasks,
+    deferred,
   });
 }
 
