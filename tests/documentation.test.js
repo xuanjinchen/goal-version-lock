@@ -3,6 +3,8 @@ import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
+import { canonicalBytes, sha256 } from '../src/goal-lock/canonical.js';
+import { validateGoalContract, validatePlan } from '../src/goal-lock/contracts.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const DOCUMENTS = [
@@ -17,6 +19,7 @@ const DOCUMENTS = [
   'templates/project/skill-brief.md.template',
 ];
 const PUBLIC_TEXT = [...DOCUMENTS, 'tests/documentation.test.js'];
+const README_GOAL_DIGEST = 'fd071f19616f06b4c410d0781a9d2c456582b279e95b4e49a59858795fb7b2c0';
 
 function read(relativePath) {
   return readFileSync(path.join(ROOT, ...relativePath.split('/')), 'utf8');
@@ -57,6 +60,16 @@ function parseMarkdownTable(source, heading, expectedHeaders) {
   assert.deepEqual(cells[0], expectedHeaders, `${heading} headers changed`);
   assert.equal(cells[1].every((value) => /^:?-{3,}:?$/u.test(value)), true, `${heading} separator is invalid`);
   return cells.slice(2).map((row) => Object.fromEntries(expectedHeaders.map((header, index) => [header, row[index]])));
+}
+
+function parseMarkedJsonExample(source, marker) {
+  const opening = `<!-- ${marker} -->\n\`\`\`json\n`;
+  const start = source.indexOf(opening);
+  assert.notEqual(start, -1, `missing marked JSON example: ${marker}`);
+  const jsonStart = start + opening.length;
+  const jsonEnd = source.indexOf('\n\`\`\`', jsonStart);
+  assert.notEqual(jsonEnd, -1, `unclosed marked JSON example: ${marker}`);
+  return JSON.parse(source.slice(jsonStart, jsonEnd));
 }
 
 // 这里只验证可解析的静态文档契约；Agent 的语义路由结论由 Task 14 的真实行为评测负责。
@@ -188,6 +201,116 @@ test('independent README presents a runnable user-guide contract', () => {
   const examples = new Set([...source.matchAll(/node scripts\/goal-lock\.js ([a-z][a-z-]+)/gu)].map((match) => match[1]));
   assert.deepEqual([...examples].sort(), contract.cli.commands.map(({ command }) => command).sort());
   assert.doesNotMatch(source, /works on (?:Windows|macOS|Linux)|compatible with (?:Claude|Codex|Cursor)/iu);
+});
+
+test('README quick start plan candidate passes the public goal-bound plan contract', () => {
+  const source = read('README.md');
+  const goalDraft = parseMarkedJsonExample(source, 'goal-lock-quick-start-goal:v1');
+  const planCandidate = parseMarkedJsonExample(source, 'goal-lock-quick-start-plan:v1');
+  const goal = validateGoalContract(goalDraft);
+  assert.equal(sha256(canonicalBytes(goal)), README_GOAL_DIGEST);
+  const goalReference = {
+    goal_id: 'GL-CATALOG-EXPORT',
+    goal_version: 1,
+    goal_digest: README_GOAL_DIGEST,
+  };
+  const expectedCandidate = {
+    next_task_id: 'TASK-0001',
+    tasks: [
+      {
+        id: 'TASK-0001',
+        outcome: 'Implement the reviewed CSV catalog export',
+        acceptance_criteria: ['AC-001'],
+        dependencies: [],
+        permitted_paths: ['src/catalog/export.js'],
+        verification: 'node --test tests/catalog-export.test.js',
+        status: 'pending',
+      },
+      {
+        id: 'TASK-0002',
+        outcome: 'Verify the CSV catalog export behavior',
+        acceptance_criteria: ['AC-001'],
+        dependencies: ['TASK-0001'],
+        permitted_paths: ['tests/catalog-export.test.js'],
+        verification: 'node --test tests/catalog-export.test.js',
+        status: 'pending',
+      },
+    ],
+    deferred: [],
+  };
+  assert.deepEqual(planCandidate, expectedCandidate);
+  const validated = validatePlan({
+    schema_version: 1,
+    goal: goalReference,
+    plan_revision: 1,
+    ...planCandidate,
+  }, goalReference);
+  assert.deepEqual(validated.goal, goalReference);
+  assert.equal(validated.next_task_id, 'TASK-0001');
+  const goalCriteria = new Set(goal.acceptance_criteria.map(({ id }) => id));
+  assert.equal(validated.tasks.every(({ acceptance_criteria: criteria }) => (
+    criteria.every((criterionId) => goalCriteria.has(criterionId))
+  )), true);
+});
+
+test('README quick start output envelopes stay consistent with the fictional goal and plan', () => {
+  const source = read('README.md');
+  const initEnvelope = parseMarkedJsonExample(source, 'goal-lock-quick-start-init-result:v1');
+  const planEnvelope = parseMarkedJsonExample(source, 'goal-lock-quick-start-plan-result:v1');
+  const verifyEnvelope = parseMarkedJsonExample(source, 'goal-lock-quick-start-verify-result:v1');
+  assert.deepEqual(initEnvelope, {
+    ok: true,
+    command: 'init',
+    result: {
+      state: 'DRAFT',
+      goal_id: 'GL-CATALOG-EXPORT',
+      goal_version: 1,
+      goal_digest: README_GOAL_DIGEST,
+      approval_required: 'APPROVE GOAL GL-CATALOG-EXPORT VERSION 1 fd071f19616f',
+    },
+  });
+  const lockCommand = /node scripts\/goal-lock\.js lock --approval "([^"]+)"/u.exec(source);
+  assert.notEqual(lockCommand, null, 'quick start lock command is missing');
+  assert.equal(lockCommand[1], initEnvelope.result.approval_required);
+  assert.deepEqual(planEnvelope, {
+    ok: true,
+    command: 'plan',
+    result: {
+      state: 'LOCKED',
+      goal_id: 'GL-CATALOG-EXPORT',
+      goal_version: 1,
+      goal_digest: README_GOAL_DIGEST,
+      plan_revision: 1,
+      classification: 'aligned',
+    },
+  });
+  assert.deepEqual(verifyEnvelope, {
+    ok: true,
+    command: 'verify',
+    result: {
+      state: 'LOCKED',
+      evidence: {
+        goal: {
+          goal_id: 'GL-CATALOG-EXPORT',
+          goal_version: 1,
+          goal_digest: README_GOAL_DIGEST,
+        },
+        inputs: [{
+          path: '.goal-lock/current.json',
+          kind: 'file',
+          digest: README_GOAL_DIGEST,
+        }],
+        optional: {
+          plan: true,
+          changes: 0,
+          progress_events: 1,
+          evidence_records: 0,
+        },
+        latest: {},
+        issues: [],
+      },
+    },
+  });
 });
 
 test('Task 10 文档存在且保持可移植文本格式', () => {

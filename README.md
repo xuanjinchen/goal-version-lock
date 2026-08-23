@@ -51,10 +51,11 @@ When the Skill is installed outside the governed project, use the installed scri
 
 ## Quick start
 
-The paths, goal ID, and digests below are fictional. Run the commands from the project you want to govern.
+The paths and goal below are fictional. The digest shown is the real canonical digest of this exact draft. If you change any field, use the `goal_digest` and `approval_required` returned by your own `init` command. Run every command from the project you want to govern.
 
 1. Save a complete version-1 draft as `goal-draft.json`:
 
+<!-- goal-lock-quick-start-goal:v1 -->
 ```json
 {
   "schema_version": 1,
@@ -84,26 +85,102 @@ node scripts/goal-lock.js init --input goal-draft.json
 
 Expected output shape:
 
+<!-- goal-lock-quick-start-init-result:v1 -->
 ```json
-{"ok":true,"command":"init","result":{"state":"DRAFT","goal_id":"GL-CATALOG-EXPORT","goal_version":1,"goal_digest":"<64-lowercase-hex>","approval_required":"APPROVE GOAL GL-CATALOG-EXPORT VERSION 1 <first-12-digest>"}}
+{"ok":true,"command":"init","result":{"state":"DRAFT","goal_id":"GL-CATALOG-EXPORT","goal_version":1,"goal_digest":"fd071f19616f06b4c410d0781a9d2c456582b279e95b4e49a59858795fb7b2c0","approval_required":"APPROVE GOAL GL-CATALOG-EXPORT VERSION 1 fd071f19616f"}}
 ```
 
 3. Show `approval_required` to the user. Paste the actual returned value only after they repeat it exactly:
 
 ```console
-node scripts/goal-lock.js lock --approval "APPROVE GOAL GL-CATALOG-EXPORT VERSION 1 0123456789ab"
+node scripts/goal-lock.js lock --approval "APPROVE GOAL GL-CATALOG-EXPORT VERSION 1 fd071f19616f"
 ```
 
-The digest in that command is a fictional example. A generic “yes” or “approved” is not accepted.
+This exact phrase applies only to the unchanged example draft. A generic “yes” or “approved” is not accepted.
 
-4. Save a plan candidate as `plan-input.json`, then bind it to the active goal:
+4. Save this complete plan candidate as `plan-input.json`. The CLI derives its goal ID, version, digest, and plan revision from the active lock:
+
+<!-- goal-lock-quick-start-plan:v1 -->
+```json
+{
+  "next_task_id": "TASK-0001",
+  "tasks": [
+    {
+      "id": "TASK-0001",
+      "outcome": "Implement the reviewed CSV catalog export",
+      "acceptance_criteria": ["AC-001"],
+      "dependencies": [],
+      "permitted_paths": ["src/catalog/export.js"],
+      "verification": "node --test tests/catalog-export.test.js",
+      "status": "pending"
+    },
+    {
+      "id": "TASK-0002",
+      "outcome": "Verify the CSV catalog export behavior",
+      "acceptance_criteria": ["AC-001"],
+      "dependencies": ["TASK-0001"],
+      "permitted_paths": ["tests/catalog-export.test.js"],
+      "verification": "node --test tests/catalog-export.test.js",
+      "status": "pending"
+    }
+  ],
+  "deferred": []
+}
+```
+
+5. Bind the plan to the active goal:
 
 ```console
 node scripts/goal-lock.js plan --input plan-input.json --classification aligned
+```
+
+Expected output:
+
+<!-- goal-lock-quick-start-plan-result:v1 -->
+```json
+{"ok":true,"command":"plan","result":{"state":"LOCKED","goal_id":"GL-CATALOG-EXPORT","goal_version":1,"goal_digest":"fd071f19616f06b4c410d0781a9d2c456582b279e95b4e49a59858795fb7b2c0","plan_revision":1,"classification":"aligned"}}
+```
+
+6. Verify the complete goal-bound state:
+
+```console
 node scripts/goal-lock.js verify
 ```
 
-Expected output from `verify` is one JSON success envelope whose result state reflects the verified repository, such as `LOCKED`. Errors use stderr, a JSON error envelope, and a nonzero documented exit code.
+Expected output shape:
+
+<!-- goal-lock-quick-start-verify-result:v1 -->
+```json
+{
+  "ok": true,
+  "command": "verify",
+  "result": {
+    "state": "LOCKED",
+    "evidence": {
+      "goal": {
+        "goal_id": "GL-CATALOG-EXPORT",
+        "goal_version": 1,
+        "goal_digest": "fd071f19616f06b4c410d0781a9d2c456582b279e95b4e49a59858795fb7b2c0"
+      },
+      "inputs": [{
+        "path": ".goal-lock/current.json",
+        "kind": "file",
+        "digest": "fd071f19616f06b4c410d0781a9d2c456582b279e95b4e49a59858795fb7b2c0"
+      }],
+      "optional": {
+        "plan": true,
+        "changes": 0,
+        "progress_events": 1,
+        "evidence_records": 0
+      },
+      "latest": {},
+      "issues": []
+    }
+  }
+}
+```
+
+The `inputs` array above is abbreviated to one stable representative entry. The actual envelope lists the full verified manifest, including lock and progress digests that depend on runtime timestamps. Errors use stderr, a JSON error envelope, and a nonzero documented exit code.
 
 ## CLI reference
 
