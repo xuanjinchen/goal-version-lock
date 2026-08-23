@@ -312,6 +312,56 @@ export function validatePlan(value, goalReference) {
   });
 }
 
+/** 证据沿袭只接受完整不可变封装，并精确绑定调用方已验证的目标版本。 */
+export function validateEvidence(value, goalReference) {
+  const fields = ['schema_version', 'evidence_id', 'acceptance_criterion_id', 'goal', 'plan_revision', 'task_id', 'method', 'observed_result', 'artifact_refs', 'workspace_fingerprint', 'state', 'supersedes', 'recorded_at'];
+  exactKeys(value, 'evidence', fields);
+  if (value.schema_version !== 1) fail('INVALID_CONTRACT', 'input', 2, 'schema_version must equal 1');
+
+  exactKeys(goalReference, 'goal reference', ['goal_id', 'goal_version', 'goal_digest']);
+  const expectedGoal = {
+    goal_id: identifier(goalReference.goal_id, 'goal_id', 'goal reference.goal_id'),
+    goal_version: positiveInteger(goalReference.goal_version, 'goal reference.goal_version'),
+    goal_digest: digest(goalReference.goal_digest, 'goal reference.goal_digest'),
+  };
+  exactKeys(value.goal, 'evidence.goal', ['goal_id', 'goal_version', 'goal_digest']);
+  const goal = {
+    goal_id: identifier(value.goal.goal_id, 'goal_id', 'evidence.goal.goal_id'),
+    goal_version: positiveInteger(value.goal.goal_version, 'evidence.goal.goal_version'),
+    goal_digest: digest(value.goal.goal_digest, 'evidence.goal.goal_digest'),
+  };
+  if (goal.goal_id !== expectedGoal.goal_id) fail('INVALID_CONTRACT', 'input', 2, 'evidence.goal.goal_id does not match the expected goal');
+  if (goal.goal_version !== expectedGoal.goal_version) fail('INVALID_CONTRACT', 'input', 2, 'evidence.goal.goal_version does not match the expected goal');
+  if (goal.goal_digest !== expectedGoal.goal_digest) fail('INVALID_CONTRACT', 'input', 2, 'evidence.goal.goal_digest does not match the expected goal');
+
+  const artifactRefs = array(value.artifact_refs, 'evidence.artifact_refs')
+    .map((artifactPath, index) => normalizeRelativePath(artifactPath, `evidence.artifact_refs[${index}]`));
+  if (new Set(artifactRefs).size !== artifactRefs.length) {
+    fail('INVALID_CONTRACT', 'input', 2, 'evidence.artifact_refs contains duplicates');
+  }
+  if (!['pass', 'fail', 'stale'].includes(value.state)) {
+    fail('INVALID_CONTRACT', 'input', 2, 'evidence.state is invalid');
+  }
+  const supersedes = value.supersedes === null
+    ? null
+    : identifier(value.supersedes, 'evidence_id', 'evidence.supersedes');
+  return deepFreeze({
+    schema_version: 1,
+    evidence_id: identifier(value.evidence_id, 'evidence_id', 'evidence.evidence_id'),
+    acceptance_criterion_id: identifier(value.acceptance_criterion_id, 'acceptance_criterion_id', 'evidence.acceptance_criterion_id'),
+    goal,
+    plan_revision: positiveInteger(value.plan_revision, 'evidence.plan_revision'),
+    task_id: identifier(value.task_id, 'task_id', 'evidence.task_id'),
+    method: requiredText(value.method, 'evidence.method'),
+    observed_result: requiredText(value.observed_result, 'evidence.observed_result'),
+    artifact_refs: artifactRefs,
+    workspace_fingerprint: digest(value.workspace_fingerprint, 'evidence.workspace_fingerprint'),
+    state: value.state,
+    supersedes,
+    recorded_at: timestamp(value.recorded_at, 'evidence.recorded_at'),
+  });
+}
+
 /** 验证进度事件的完整封装、自身摘要及其与前一事件摘要的精确链接。 */
 export function validateProgressEvent(value, previousDigest) {
   const fields = ['schema_version', 'event_id', 'recorded_at', 'goal', 'plan_revision', 'task_id', 'event_type', 'summary', 'evidence_refs', 'previous_event_digest', 'event_digest'];

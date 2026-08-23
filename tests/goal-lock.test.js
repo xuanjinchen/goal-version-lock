@@ -245,6 +245,26 @@ function progressInput(summary = 'Focused tests passed', overrides = {}) {
   };
 }
 
+function evidenceInput(overrides = {}) {
+  return {
+    kind: 'evidence',
+    acceptance_criterion_id: 'AC-001',
+    task_id: 'TASK-0001',
+    method: 'node --test tests/goal-lock.test.js',
+    observed_result: 'Focused tests passed',
+    artifact_refs: ['reports/focused.txt', 'src/goal-lock/repository.js'],
+    workspace_fingerprint: 'a'.repeat(64),
+    state: 'pass',
+    supersedes: null,
+    ...overrides,
+  };
+}
+
+const FIRST_EVIDENCE_DIGEST = '5bdd5f99d1f3043cd6922e97b9a15551e9dbf2c0163f57110008929c961c13cd';
+const FIRST_EVIDENCE_BYTES = '{"acceptance_criterion_id":"AC-001","artifact_refs":["reports/focused.txt","src/goal-lock/repository.js"],"evidence_id":"EVID-0001","goal":{"goal_digest":"92d74f6bf766e096e71b949ff57e2d9a12302a4519226d05cf67c2b544babaa6","goal_id":"GL-ALPHA","goal_version":1},"method":"node --test tests/goal-lock.test.js","observed_result":"Focused tests passed","plan_revision":1,"recorded_at":"2026-08-23T00:00:00.000Z","schema_version":1,"state":"pass","supersedes":null,"task_id":"TASK-0001","workspace_fingerprint":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}\n';
+const FIRST_EVIDENCE_EVENT_DIGEST = '9a5a639ffb4eabf33adaf67230359d49a89e38cac4c1c0d9f9ec58d1c7c2555c';
+const FIRST_EVIDENCE_EVENT_LINE = '{"event_digest":"9a5a639ffb4eabf33adaf67230359d49a89e38cac4c1c0d9f9ec58d1c7c2555c","event_id":"EVT-000002","event_type":"verification-result","evidence_refs":["EVID-0001"],"goal":{"goal_digest":"92d74f6bf766e096e71b949ff57e2d9a12302a4519226d05cf67c2b544babaa6","goal_id":"GL-ALPHA","goal_version":1},"plan_revision":1,"previous_event_digest":"bdda7b3968a011b2229bb86936f21a2d51e9a070a992dcd573c91c4bb61e4b72","recorded_at":"2026-08-23T00:00:00.000Z","schema_version":1,"summary":"Recorded evidence AC-001/EVID-0001 sha256:5bdd5f99d1f3043cd6922e97b9a15551e9dbf2c0163f57110008929c961c13cd as pass","task_id":"TASK-0001"}\n';
+
 async function createProgressFixture(testContext) {
   const fixture = createGoalLockFixture(testContext);
   const repository = await goalRepository();
@@ -866,9 +886,9 @@ test('task status replay must equal the status stored in the plan record', async
 });
 
 async function installTestEvidence(fixture, evidenceId = 'EVID-0001') {
-  const evidenceDirectory = join(fixture.root, '.goal-lock', 'evidence', 'AC-001');
-  await mkdir(evidenceDirectory, { recursive: true });
-  await writeFile(join(evidenceDirectory, `${evidenceId}.json`), canonicalBytes(structuralEvidence(evidenceId)));
+  const repository = await goalRepository();
+  const receipt = await repository.recordGoalEvent(fixture.root, evidenceInput(), fixture);
+  assert.equal(receipt.evidence_id, evidenceId);
 }
 
 async function createPlannedFixture(testContext) {
@@ -879,6 +899,369 @@ async function createPlannedFixture(testContext) {
   await repository.revisePlan(fixture.root, planCandidate(), 'aligned', fixture);
   return { fixture, repository };
 }
+
+test('evidence public API validates the fixed complete envelope without mutating input', () => {
+  assert.equal(typeof goalContracts.validateEvidence, 'function');
+  assert.equal(Object.hasOwn(goalContracts, 'validateEvidenceContract'), false);
+  const input = structuralEvidence();
+  const original = structuredClone(input);
+
+  const validated = goalContracts.validateEvidence(input, activeGoalReference());
+
+  assert.deepEqual(validated, original);
+  assert.deepEqual(input, original);
+  assert.equal(Object.isFrozen(validated), true);
+  assert.equal(Object.isFrozen(validated.goal), true);
+  assert.equal(Object.isFrozen(validated.artifact_refs), true);
+});
+
+test('evidence contract rejects invalid envelope, bindings, method, result, artifacts, fingerprint, state, and supersedes', () => {
+  const cases = [
+    ['schema', (record) => { record.schema_version = 2; }],
+    ['evidence ID', (record) => { record.evidence_id = 'EVID-1'; }],
+    ['criterion ID', (record) => { record.acceptance_criterion_id = 'AC-1'; }],
+    ['goal ID', (record) => { record.goal.goal_id = 'GL-OTHER'; }],
+    ['goal version', (record) => { record.goal.goal_version = 2; }],
+    ['goal digest', (record) => { record.goal.goal_digest = 'f'.repeat(64); }],
+    ['plan revision', (record) => { record.plan_revision = 0; }],
+    ['task ID', (record) => { record.task_id = 'TASK-1'; }],
+    ['method', (record) => { record.method = ' manual '; }],
+    ['observed result', (record) => { record.observed_result = ''; }],
+    ['unsafe artifact', (record) => { record.artifact_refs = ['../secret.txt']; }],
+    ['duplicate artifact', (record) => { record.artifact_refs = ['reports/result.txt', 'reports/result.txt']; }],
+    ['workspace fingerprint', (record) => { record.workspace_fingerprint = 'A'.repeat(64); }],
+    ['state', (record) => { record.state = 'passed'; }],
+    ['supersedes', (record) => { record.supersedes = 'EVID-1'; }],
+    ['recorded at', (record) => { record.recorded_at = '2026-02-30T00:00:00Z'; }],
+    ['unknown field', (record) => { record.digest = 'b'.repeat(64); }],
+  ];
+  for (const [label, mutate] of cases) {
+    const record = structuralEvidence();
+    mutate(record);
+    assert.throws(() => goalContracts.validateEvidence(record, activeGoalReference()), GoalLockError, label);
+  }
+
+  assert.throws(
+    () => goalContracts.validateEvidence(structuralEvidence(), { ...activeGoalReference(), plan_revision: 1 }),
+    GoalLockError,
+  );
+  for (const state of ['pass', 'fail', 'stale']) {
+    assert.equal(goalContracts.validateEvidence({ ...structuralEvidence(), state }, activeGoalReference()).state, state);
+  }
+  assert.equal(goalContracts.validateEvidence({
+    ...structuralEvidence('EVID-0002'),
+    supersedes: 'EVID-0001',
+  }, activeGoalReference()).supersedes, 'EVID-0001');
+});
+
+test('evidence recording creates literal canonical evidence, one linked event, and both lock heads atomically', async (testContext) => {
+  const { fixture, repository } = await createPlannedFixture(testContext);
+  const directory = join(fixture.root, '.goal-lock');
+  const planBefore = await readFile(join(directory, 'plan.json'));
+  const currentBefore = await readFile(join(directory, 'current.json'));
+  const historyBefore = await readFile(join(directory, 'history', 'goals', 'v0001.json'));
+
+  const receipt = await repository.recordGoalEvent(fixture.root, evidenceInput(), fixture);
+
+  assert.deepEqual(receipt, {
+    state: 'LOCKED',
+    evidence_id: 'EVID-0001',
+    evidence_digest: FIRST_EVIDENCE_DIGEST,
+    acceptance_criterion_id: 'AC-001',
+    event_id: 'EVT-000002',
+    event_digest: FIRST_EVIDENCE_EVENT_DIGEST,
+    goal_id: 'GL-ALPHA',
+    goal_version: 1,
+    plan_revision: 1,
+    task_id: 'TASK-0001',
+  });
+  assert.deepEqual(
+    await readFile(join(directory, 'evidence', 'AC-001', 'EVID-0001.json')),
+    Buffer.from(FIRST_EVIDENCE_BYTES),
+  );
+  assert.deepEqual(
+    await readFile(join(directory, 'progress.jsonl')),
+    Buffer.from(PLAN_REVISION_EVENT_LINE + FIRST_EVIDENCE_EVENT_LINE),
+  );
+  assert.deepEqual(await readFile(join(directory, 'plan.json')), planBefore);
+  assert.deepEqual(await readFile(join(directory, 'current.json')), currentBefore);
+  assert.deepEqual(await readFile(join(directory, 'history', 'goals', 'v0001.json')), historyBefore);
+  assert.equal(existsSync(join(directory, 'history', 'plans')), false);
+  const lock = parseCanonicalJson(await readFile(join(directory, 'lock.json')), 'test lock');
+  assert.equal(lock.state_revision, 3);
+  assert.deepEqual(lock.progress_head, { event_id: 'EVT-000002', digest: FIRST_EVIDENCE_EVENT_DIGEST });
+  assert.equal(lock.change_head, null);
+  assert.deepEqual(lock.evidence_heads, {
+    'AC-001': { evidence_id: 'EVID-0001', digest: FIRST_EVIDENCE_DIGEST },
+  });
+  const { record_digest: recordDigest, ...lockWithoutDigest } = lock;
+  assert.equal(recordDigest, independentSha256(canonicalBytes(lockWithoutDigest)));
+  assert.equal((await repository.verifyGoalRepository(fixture.root, fixture)).state, 'LOCKED');
+});
+
+test('evidence IDs and supersession are contiguous per criterion while preserving other criterion heads', async (testContext) => {
+  const fixture = createGoalLockFixture(testContext);
+  const repository = await goalRepository();
+  const goal = goalV1();
+  goal.acceptance_criteria.push({
+    id: 'AC-002',
+    outcome: 'Independent verification is retained',
+    verification: 'Inspect the second evidence chain',
+  });
+  await repository.initializeGoal(fixture.root, goal, fixture);
+  await repository.lockInitialGoal(fixture.root, approvalPhraseForGoal(goal), fixture);
+  const candidate = planCandidate();
+  candidate.tasks[1].acceptance_criteria = ['AC-002'];
+  await repository.revisePlan(fixture.root, candidate, 'aligned', fixture);
+
+  const firstA = await repository.recordGoalEvent(fixture.root, evidenceInput(), fixture);
+  const firstB = await repository.recordGoalEvent(fixture.root, evidenceInput({
+    acceptance_criterion_id: 'AC-002',
+    task_id: 'TASK-0002',
+    method: 'Inspect the second criterion manually',
+    observed_result: 'The independent criterion failed',
+    artifact_refs: [],
+    workspace_fingerprint: 'b'.repeat(64),
+    state: 'fail',
+  }), fixture);
+  const headBAfterFirst = parseCanonicalJson(
+    await readFile(join(fixture.root, '.goal-lock', 'lock.json')),
+    'test lock',
+  ).evidence_heads['AC-002'];
+  const secondA = await repository.recordGoalEvent(fixture.root, evidenceInput({
+    method: 'Review the criterion without a command',
+    observed_result: 'The former passing evidence is now stale',
+    artifact_refs: ['reports/manual-review.txt'],
+    workspace_fingerprint: 'c'.repeat(64),
+    state: 'stale',
+    supersedes: 'EVID-0001',
+  }), fixture);
+
+  assert.equal(firstA.evidence_id, 'EVID-0001');
+  assert.equal(firstB.evidence_id, 'EVID-0001');
+  assert.equal(secondA.evidence_id, 'EVID-0002');
+  assert.equal(parseCanonicalJson(
+    await readFile(join(fixture.root, '.goal-lock', 'evidence', 'AC-001', 'EVID-0002.json')),
+    'test evidence',
+  ).supersedes, 'EVID-0001');
+  const lock = parseCanonicalJson(await readFile(join(fixture.root, '.goal-lock', 'lock.json')), 'test lock');
+  assert.deepEqual(lock.evidence_heads['AC-002'], headBAfterFirst);
+  assert.equal(lock.evidence_heads['AC-001'].evidence_id, 'EVID-0002');
+  const verified = await repository.verifyGoalRepository(fixture.root, fixture);
+  assert.equal(verified.state, 'LOCKED');
+  assert.equal(verified.evidence.latest['AC-001'].state, 'stale');
+  assert.equal(verified.evidence.latest['AC-002'].state, 'fail');
+});
+
+test('evidence recording rejects derived fields, unknown bindings, and inexact supersession without partial state', async (testContext) => {
+  const { fixture, repository } = await createPlannedFixture(testContext);
+  const directory = join(fixture.root, '.goal-lock');
+  const initialCases = [
+    evidenceInput({ evidence_id: 'EVID-9999' }),
+    evidenceInput({ recorded_at: '2026-08-23T01:00:00.000Z' }),
+    evidenceInput({ acceptance_criterion_id: 'AC-999' }),
+    evidenceInput({ task_id: 'TASK-9999' }),
+    evidenceInput({ supersedes: 'EVID-0001' }),
+  ];
+  for (const input of initialCases) {
+    await assert.rejects(
+      repository.recordGoalEvent(fixture.root, input, fixture),
+      (error) => error instanceof GoalLockError && error.kind === 'input',
+    );
+  }
+  assert.equal(existsSync(join(directory, 'evidence')), false);
+  const ledgerBeforeFirst = await readFile(join(directory, 'progress.jsonl'));
+  const lockBeforeFirst = await readFile(join(directory, 'lock.json'));
+  assert.deepEqual(await readFile(join(directory, 'progress.jsonl')), ledgerBeforeFirst);
+  assert.deepEqual(await readFile(join(directory, 'lock.json')), lockBeforeFirst);
+
+  await repository.recordGoalEvent(fixture.root, evidenceInput(), fixture);
+  const firstBytes = await readFile(join(directory, 'evidence', 'AC-001', 'EVID-0001.json'));
+  const ledgerBeforeSecond = await readFile(join(directory, 'progress.jsonl'));
+  const lockBeforeSecond = await readFile(join(directory, 'lock.json'));
+  for (const supersedes of [null, 'EVID-0002', 'EVID-9999']) {
+    await assert.rejects(
+      repository.recordGoalEvent(fixture.root, evidenceInput({ supersedes, state: 'fail' }), fixture),
+      (error) => error instanceof GoalLockError && error.kind === 'input',
+    );
+  }
+  assert.deepEqual(await readFile(join(directory, 'evidence', 'AC-001', 'EVID-0001.json')), firstBytes);
+  assert.equal(existsSync(join(directory, 'evidence', 'AC-001', 'EVID-0002.json')), false);
+  assert.deepEqual(await readFile(join(directory, 'progress.jsonl')), ledgerBeforeSecond);
+  assert.deepEqual(await readFile(join(directory, 'lock.json')), lockBeforeSecond);
+});
+
+test('evidence transaction rolls back the new file, event, head, and directories after a late install failure', async (testContext) => {
+  const { fixture, repository } = await createPlannedFixture(testContext);
+  const directory = join(fixture.root, '.goal-lock');
+  const planBefore = await readFile(join(directory, 'plan.json'));
+  const ledgerBefore = await readFile(join(directory, 'progress.jsonl'));
+  const lockBefore = await readFile(join(directory, 'lock.json'));
+  fixture.transactionFaults.install = ({ target }) => {
+    if (target === '.goal-lock/lock.json') throw new Error('injected evidence head install failure');
+  };
+
+  await assert.rejects(
+    repository.recordGoalEvent(fixture.root, evidenceInput(), fixture),
+    /injected evidence head install failure/,
+  );
+
+  assert.equal(existsSync(join(directory, 'evidence')), false);
+  assert.deepEqual(await readFile(join(directory, 'plan.json')), planBefore);
+  assert.deepEqual(await readFile(join(directory, 'progress.jsonl')), ledgerBefore);
+  assert.deepEqual(await readFile(join(directory, 'lock.json')), lockBefore);
+});
+
+test('evidence immutable predecessors remain read-only transaction inputs during supersession', async (testContext) => {
+  const { fixture, repository } = await createPlannedFixture(testContext);
+  const directory = join(fixture.root, '.goal-lock');
+  await repository.recordGoalEvent(fixture.root, evidenceInput(), fixture);
+  const firstPath = join(directory, 'evidence', 'AC-001', 'EVID-0001.json');
+  const replacement = canonicalBytes({
+    ...parseCanonicalJson(await readFile(firstPath), 'test evidence'),
+    observed_result: 'Foreign replacement during the transaction',
+  });
+  const ledgerBefore = await readFile(join(directory, 'progress.jsonl'));
+  const lockBefore = await readFile(join(directory, 'lock.json'));
+  let replaced = false;
+  fixture.transactionFaults.stageWrite = async ({ target }) => {
+    if (!replaced && target === '.goal-lock/evidence/AC-001/EVID-0002.json') {
+      replaced = true;
+      await writeFile(firstPath, replacement);
+    }
+  };
+
+  await assert.rejects(
+    repository.recordGoalEvent(fixture.root, evidenceInput({
+      state: 'fail',
+      observed_result: 'Second observation failed',
+      supersedes: 'EVID-0001',
+    }), fixture),
+    (error) => error instanceof GoalLockError && error.kind === 'integrity',
+  );
+
+  assert.equal(replaced, true);
+  assert.deepEqual(await readFile(firstPath), replacement);
+  assert.equal(existsSync(join(directory, 'evidence', 'AC-001', 'EVID-0002.json')), false);
+  assert.deepEqual(await readFile(join(directory, 'progress.jsonl')), ledgerBefore);
+  assert.deepEqual(await readFile(join(directory, 'lock.json')), lockBefore);
+});
+
+async function createEvidenceHistoryFixture(testContext) {
+  const planned = await createPlannedFixture(testContext);
+  await planned.repository.recordGoalEvent(planned.fixture.root, evidenceInput(), planned.fixture);
+  await planned.repository.recordGoalEvent(planned.fixture.root, evidenceInput({
+    method: 'Run the focused tests again',
+    observed_result: 'Focused tests failed',
+    artifact_refs: ['reports/failed.txt'],
+    workspace_fingerprint: 'b'.repeat(64),
+    state: 'fail',
+    supersedes: 'EVID-0001',
+  }), planned.fixture);
+  await planned.repository.recordGoalEvent(planned.fixture.root, evidenceInput({
+    method: 'Review the superseded result manually',
+    observed_result: 'Evidence is stale after review',
+    artifact_refs: [],
+    workspace_fingerprint: 'c'.repeat(64),
+    state: 'stale',
+    supersedes: 'EVID-0002',
+  }), planned.fixture);
+  return planned;
+}
+
+test('evidence verification rejects links, gaps, edits, path mismatches, unknown refs, supersession, event, and head tampering', async (testContext) => {
+  const cases = [
+    ['linked record', async (fixture, directory) => {
+      await link(
+        join(directory, 'evidence', 'AC-001', 'EVID-0001.json'),
+        join(fixture.root, 'linked-evidence.json'),
+      );
+    }],
+    ['ordinal gap', async (_fixture, directory) => {
+      await unlink(join(directory, 'evidence', 'AC-001', 'EVID-0002.json'));
+    }],
+    ['historical edit', async (_fixture, directory) => {
+      const target = join(directory, 'evidence', 'AC-001', 'EVID-0001.json');
+      const record = parseCanonicalJson(await readFile(target), 'test evidence');
+      record.observed_result = 'Edited historical evidence';
+      await writeFile(target, canonicalBytes(record));
+    }],
+    ['path ID mismatch', async (fixture, directory) => {
+      const target = join(directory, 'evidence', 'AC-001', 'EVID-0003.json');
+      const record = parseCanonicalJson(await readFile(target), 'test evidence');
+      record.evidence_id = 'EVID-0002';
+      const bytes = canonicalBytes(record);
+      await writeFile(target, bytes);
+      await rewriteTestLock(fixture, (lock) => {
+        lock.evidence_heads['AC-001'].digest = independentSha256(bytes);
+      });
+    }],
+    ['unknown criterion', async (fixture, directory) => {
+      await rename(join(directory, 'evidence', 'AC-001'), join(directory, 'evidence', 'AC-999'));
+      for (const name of await readdir(join(directory, 'evidence', 'AC-999'))) {
+        const target = join(directory, 'evidence', 'AC-999', name);
+        const record = parseCanonicalJson(await readFile(target), 'test evidence');
+        record.acceptance_criterion_id = 'AC-999';
+        await writeFile(target, canonicalBytes(record));
+      }
+      const latestBytes = await readFile(join(directory, 'evidence', 'AC-999', 'EVID-0003.json'));
+      await rewriteTestLock(fixture, (lock) => {
+        delete lock.evidence_heads['AC-001'];
+        lock.evidence_heads['AC-999'] = {
+          evidence_id: 'EVID-0003',
+          digest: independentSha256(latestBytes),
+        };
+      });
+    }],
+    ['unknown task', async (fixture, directory) => {
+      const target = join(directory, 'evidence', 'AC-001', 'EVID-0003.json');
+      const record = parseCanonicalJson(await readFile(target), 'test evidence');
+      record.task_id = 'TASK-9999';
+      const bytes = canonicalBytes(record);
+      await writeFile(target, bytes);
+      await rewriteTestLock(fixture, (lock) => {
+        lock.evidence_heads['AC-001'].digest = independentSha256(bytes);
+      });
+    }],
+    ['invalid supersession', async (fixture, directory) => {
+      const target = join(directory, 'evidence', 'AC-001', 'EVID-0003.json');
+      const record = parseCanonicalJson(await readFile(target), 'test evidence');
+      record.supersedes = 'EVID-0001';
+      const bytes = canonicalBytes(record);
+      await writeFile(target, bytes);
+      await rewriteTestLock(fixture, (lock) => {
+        lock.evidence_heads['AC-001'].digest = independentSha256(bytes);
+      });
+    }],
+    ['missing evidence event', async (fixture, directory) => {
+      await writeFile(join(directory, 'progress.jsonl'), Buffer.from(PLAN_REVISION_EVENT_LINE));
+      await rewriteTestLock(fixture, (lock) => {
+        lock.progress_head = { event_id: 'EVT-000001', digest: PLAN_REVISION_EVENT_DIGEST };
+      });
+    }],
+    ['nonterminal head', async (fixture, directory) => {
+      const firstBytes = await readFile(join(directory, 'evidence', 'AC-001', 'EVID-0001.json'));
+      await rewriteTestLock(fixture, (lock) => {
+        lock.evidence_heads['AC-001'] = {
+          evidence_id: 'EVID-0001',
+          digest: independentSha256(firstBytes),
+        };
+      });
+    }],
+    ['missing head', async (fixture) => {
+      await rewriteTestLock(fixture, (lock) => { delete lock.evidence_heads['AC-001']; });
+    }],
+  ];
+  for (const [label, tamper] of cases) {
+    const { fixture, repository } = await createEvidenceHistoryFixture(testContext);
+    const directory = join(fixture.root, '.goal-lock');
+    await tamper(fixture, directory);
+
+    const result = await repository.verifyGoalRepository(fixture.root, fixture);
+
+    assert.equal(result.state, 'TAMPERED', label);
+  }
+});
 
 test('task status task-start moves only pending tasks to in_progress without revising or archiving the plan', async (testContext) => {
   const { fixture, repository } = await createPlannedFixture(testContext);
@@ -1627,25 +2010,25 @@ test('verifies goal history follows predecessor versions, digests, and accepted 
 
 test('verifies goal history preflights optional state and reports a pending change', async (testContext) => {
   const fixture = createGoalLockFixture(testContext);
-  const { initializeGoal, lockInitialGoal, verifyGoalRepository } = await goalRepository();
+  const {
+    initializeGoal,
+    lockInitialGoal,
+    recordGoalEvent,
+    revisePlan,
+    verifyGoalRepository,
+  } = await goalRepository();
   await initializeGoal(fixture.root, goalV1(), fixture);
   await lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 92d74f6bf766', fixture);
   const directory = join(fixture.root, '.goal-lock');
-  await writeFile(join(directory, 'plan.json'), canonicalBytes(structuralPlan()));
-  await writeFile(join(directory, 'progress.jsonl'), Buffer.from(PLAN_REVISION_EVENT_LINE));
-  await rewriteTestLock(fixture, (lock) => {
-    lock.state_revision = 2;
-    lock.progress_head = { event_id: 'EVT-000001', digest: PLAN_REVISION_EVENT_DIGEST };
-  });
+  await revisePlan(fixture.root, planCandidate(), 'aligned', fixture);
+  await recordGoalEvent(fixture.root, evidenceInput(), fixture);
   await mkdir(join(directory, 'changes'));
   await writeFile(join(directory, 'changes', 'CR-0001.json'), canonicalBytes({ ...structuralChange(), status: 'proposed' }));
-  await mkdir(join(directory, 'evidence', 'AC-001'), { recursive: true });
-  await writeFile(join(directory, 'evidence', 'AC-001', 'EVID-0001.json'), canonicalBytes(structuralEvidence()));
 
   const result = await verifyGoalRepository(fixture.root, fixture);
 
   assert.equal(result.state, 'CHANGE_PENDING');
-  assert.deepEqual(result.evidence.optional, { plan: true, changes: 1, progress_events: 1, evidence_records: 1 });
+  assert.deepEqual(result.evidence.optional, { plan: true, changes: 1, progress_events: 2, evidence_records: 1 });
 });
 
 test('detects tampering when optional state is unsafe or noncanonical', async (testContext) => {

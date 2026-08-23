@@ -4,7 +4,7 @@ import path from 'node:path';
 import { canonicalBytes, parseCanonicalJson, sha256 } from './canonical.js';
 import {
   GoalLockError,
-  normalizeRelativePath,
+  validateEvidence,
   validateGoalContract,
   validateLockRecord,
   validatePlan,
@@ -164,7 +164,6 @@ const STRUCTURAL_IDENTIFIERS = {
   task: /^TASK-[0-9]{4}$/,
   change: /^CR-[0-9]{4}$/,
   event: /^EVT-[0-9]{6}$/,
-  evidence: /^EVID-[0-9]{4}$/,
 };
 const STRUCTURAL_DIGEST = /^[a-f0-9]{64}$/;
 const STRUCTURAL_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/;
@@ -246,28 +245,6 @@ function validateChangeEnvelope(value, expectedId) {
     for (const entry of structuralArray(value[field], `${label}.${field}`)) structuralText(entry, `${label}.${field}`);
   }
   structuralText(value.approval_phrase, `${label}.approval_phrase`);
-  structuralTimestamp(value.recorded_at, `${label}.recorded_at`);
-  return value;
-}
-
-function validateEvidenceEnvelope(value, expectedCriterion, expectedEvidence) {
-  const label = 'evidence record';
-  requiredFields(value, label, ['schema_version', 'evidence_id', 'acceptance_criterion_id', 'goal', 'plan_revision', 'task_id', 'method', 'observed_result', 'artifact_refs', 'workspace_fingerprint', 'state', 'supersedes', 'recorded_at']);
-  if (value.schema_version !== 1) throw integrityError('EVIDENCE_STATE_INVALID', 'Evidence schema_version must equal 1.');
-  structuralIdentifier(value.evidence_id, STRUCTURAL_IDENTIFIERS.evidence, `${label}.evidence_id`);
-  structuralIdentifier(value.acceptance_criterion_id, STRUCTURAL_IDENTIFIERS.criterion, `${label}.acceptance_criterion_id`);
-  if (value.evidence_id !== expectedEvidence || value.acceptance_criterion_id !== expectedCriterion) {
-    throw integrityError('EVIDENCE_STATE_INVALID', 'Evidence identifiers do not match their path.');
-  }
-  validateGoalReference(value.goal, `${label}.goal`);
-  structuralPositiveInteger(value.plan_revision, `${label}.plan_revision`);
-  structuralIdentifier(value.task_id, STRUCTURAL_IDENTIFIERS.task, `${label}.task_id`);
-  structuralText(value.method, `${label}.method`);
-  structuralText(value.observed_result, `${label}.observed_result`);
-  for (const artifactPath of structuralArray(value.artifact_refs, `${label}.artifact_refs`)) normalizeRelativePath(artifactPath, `${label}.artifact_refs`);
-  structuralDigest(value.workspace_fingerprint, `${label}.workspace_fingerprint`);
-  structuralText(value.state, `${label}.state`);
-  if (value.supersedes !== null) structuralIdentifier(value.supersedes, STRUCTURAL_IDENTIFIERS.evidence, `${label}.supersedes`);
   structuralTimestamp(value.recorded_at, `${label}.recorded_at`);
   return value;
 }
@@ -459,7 +436,7 @@ async function verifyProgressLedger(reader, rootNames, lock, goalHistory, planSt
     if (event.task_id !== null && !plan.tasks.some((task) => task.id === event.task_id)) {
       throw integrityError('PROGRESS_TASK_UNKNOWN', 'Progress event references an unknown task.');
     }
-    if (event.evidence_refs.some((evidenceId) => !evidenceState.recordsById.has(evidenceId))) {
+    if (event.evidence_refs.some((evidenceId) => !evidenceState.knownIds.has(evidenceId))) {
       throw integrityError('PROGRESS_EVIDENCE_UNKNOWN', 'Progress event references unknown evidence.');
     }
     verifyProgressChronology(terminal, event);
@@ -475,6 +452,24 @@ async function verifyProgressLedger(reader, rootNames, lock, goalHistory, planSt
     throw integrityError('PROGRESS_HEAD_MISMATCH', 'Lock progress head does not match the terminal progress event.');
   }
   verifyProgressPlanState(plans, eventsByPlan);
+  for (const record of evidenceState.records) {
+    const matches = events.filter((event) => event.event_type === 'verification-result'
+      && event.evidence_refs.length === 1
+      && event.evidence_refs[0] === record.value.evidence_id
+      && event.summary === evidenceEventSummary(record.value, record.digest)
+      && event.recorded_at === record.value.recorded_at
+      && event.plan_revision === record.value.plan_revision
+      && event.task_id === record.value.task_id
+      && event.goal.goal_id === record.value.goal.goal_id
+      && event.goal.goal_version === record.value.goal.goal_version
+      && event.goal.goal_digest === record.value.goal.goal_digest);
+    if (matches.length !== 1) {
+      throw integrityError(
+        'EVIDENCE_EVENT_MISMATCH',
+        'Each immutable evidence record requires exactly one digest-bound verification-result event.',
+      );
+    }
+  }
   return { count, events, input, terminal };
 }
 
@@ -525,41 +520,124 @@ function verifyProgressPlanState(plans, eventsByPlan) {
   }
 }
 
-async function verifyEvidenceState(reader, rootNames, lock) {
+// 将每份历史证据摘要固化进事件链；最新 head 之外的旧文件改写也会因此失配。
+function evidenceEventSummary(evidence, evidenceDigest) {
+  return `Recorded evidence ${evidence.acceptance_criterion_id}/${evidence.evidence_id} sha256:${evidenceDigest} as ${evidence.state}`;
+}
+
+function plansByReference(planState) {
+  const plans = new Map(planState.archives.map((archive) => [
+    `${archive.value.goal.goal_version}/${archive.value.plan_revision}`,
+    archive.value,
+  ]));
+  if (planState.current) {
+    plans.set(
+      `${planState.current.value.goal.goal_version}/${planState.current.value.plan_revision}`,
+      planState.current.value,
+    );
+  }
+  return plans;
+}
+
+async function verifyEvidenceState(reader, rootNames, lock, goalHistory, planState) {
   if (!rootNames.includes('evidence')) {
     if (Object.keys(lock.evidence_heads).length > 0) throw integrityError('EVIDENCE_STATE_MISSING', 'Lock evidence heads require evidence state.');
-    return { count: 0, recordsById: new Map() };
+    return {
+      count: 0,
+      knownIds: new Set(),
+      latestByCriterion: new Map(),
+      publicLatest: {},
+      records: [],
+      recordsByCriterion: new Map(),
+    };
   }
   const evidenceRoot = await reader.readDirectory('.goal-lock/evidence');
+  if (evidenceRoot.names.length === 0) {
+    throw integrityError('EVIDENCE_STATE_INVALID', 'Evidence state must not contain an empty root directory.');
+  }
+  const plans = plansByReference(planState);
   let count = 0;
-  const records = new Map();
-  const recordsById = new Map();
+  const records = [];
+  const knownIds = new Set();
+  const latestByCriterion = new Map();
+  const recordsByCriterion = new Map();
   for (const criterion of evidenceRoot.names) {
     if (!/^AC-[0-9]{3}$/.test(criterion)) {
       throw integrityError('EVIDENCE_STATE_INVALID', 'Evidence state contains an unexpected criterion directory.');
     }
     const criterionDirectory = await reader.readDirectory(`.goal-lock/evidence/${criterion}`);
-    for (const name of criterionDirectory.names) {
-      if (!/^EVID-[0-9]{4}\.json$/.test(name)) {
-        throw integrityError('EVIDENCE_STATE_INVALID', 'Evidence state contains an unexpected record.');
-      }
+    const expectedNames = Array.from(
+      { length: criterionDirectory.names.length },
+      (_, index) => `EVID-${String(index + 1).padStart(4, '0')}.json`,
+    );
+    if (expectedNames.length === 0
+      || criterionDirectory.names.some((name, index) => name !== expectedNames[index])) {
+      throw integrityError(
+        'EVIDENCE_SEQUENCE_INVALID',
+        'Evidence IDs must be unique and contiguous from EVID-0001 within each criterion directory.',
+      );
+    }
+    const criterionRecords = [];
+    for (const [index, name] of criterionDirectory.names.entries()) {
       const record = await readCanonicalObject(reader, `.goal-lock/evidence/${criterion}/${name}`, 'evidence record');
       const evidenceId = name.slice(0, -5);
-      validateEvidenceEnvelope(record.value, criterion, evidenceId);
-      if (recordsById.has(evidenceId)) {
-        throw integrityError('EVIDENCE_STATE_INVALID', 'Evidence IDs must be unique across the repository.');
+      const goalRecord = goalHistory.get(record.value.goal?.goal_version);
+      if (!goalRecord) {
+        throw integrityError('EVIDENCE_GOAL_UNKNOWN', 'Evidence references an unknown goal version.');
       }
-      records.set(`${criterion}/${evidenceId}`, record.digest);
-      recordsById.set(evidenceId, record);
+      let value;
+      try {
+        value = validateEvidence(record.value, {
+          goal_id: goalRecord.goal.goal_id,
+          goal_version: goalRecord.goal.goal_version,
+          goal_digest: goalRecord.digest,
+        });
+      } catch (error) {
+        throw repositoryIntegrity('EVIDENCE_STATE_INVALID', 'Evidence record violates the evidence contract.', error);
+      }
+      if (value.evidence_id !== evidenceId || value.acceptance_criterion_id !== criterion) {
+        throw integrityError('EVIDENCE_PATH_MISMATCH', 'Evidence identifiers do not match their directory path.');
+      }
+      if (!goalRecord.goal.acceptance_criteria.some((candidate) => candidate.id === criterion)) {
+        throw integrityError('EVIDENCE_CRITERION_UNKNOWN', 'Evidence references an unknown acceptance criterion.');
+      }
+      const plan = plans.get(`${value.goal.goal_version}/${value.plan_revision}`);
+      const task = plan?.tasks.find((candidate) => candidate.id === value.task_id);
+      if (!task || !task.acceptance_criteria.includes(criterion)) {
+        throw integrityError('EVIDENCE_TASK_UNKNOWN', 'Evidence task must exist in its bound plan and own the criterion.');
+      }
+      const expectedSupersedes = index === 0 ? null : `EVID-${String(index).padStart(4, '0')}`;
+      if (value.supersedes !== expectedSupersedes) {
+        throw integrityError('EVIDENCE_SUPERSESSION_INVALID', 'Evidence must supersede the immediately preceding record for its criterion.');
+      }
+      const normalizedRecord = {
+        ...record,
+        value,
+        target: `.goal-lock/evidence/${criterion}/${name}`,
+      };
+      criterionRecords.push(normalizedRecord);
+      records.push(normalizedRecord);
+      knownIds.add(evidenceId);
       count += 1;
     }
+    recordsByCriterion.set(criterion, criterionRecords);
+    latestByCriterion.set(criterion, criterionRecords.at(-1));
   }
-  for (const [criterion, head] of Object.entries(lock.evidence_heads)) {
-    if (records.get(`${criterion}/${head.evidence_id}`) !== head.digest) {
+  const headCriteria = Object.keys(lock.evidence_heads).sort();
+  if (headCriteria.length !== evidenceRoot.names.length
+    || headCriteria.some((criterion, index) => criterion !== evidenceRoot.names[index])) {
+    throw integrityError('EVIDENCE_HEAD_MISMATCH', 'Lock evidence heads must cover exactly the evidence criterion directories.');
+  }
+  const publicLatest = {};
+  for (const criterion of evidenceRoot.names) {
+    const latest = latestByCriterion.get(criterion);
+    const head = lock.evidence_heads[criterion];
+    if (head.evidence_id !== latest.value.evidence_id || head.digest !== latest.digest) {
       throw integrityError('EVIDENCE_HEAD_MISMATCH', 'Lock evidence head does not match its evidence record.');
     }
+    publicLatest[criterion] = { ...latest.value, digest: latest.digest };
   }
-  return { count, recordsById };
+  return { count, knownIds, latestByCriterion, publicLatest, records, recordsByCriterion };
 }
 
 async function readCurrentGoal(reader) {
@@ -651,7 +729,7 @@ function verifyLockBindings(current, lock, activeHistory, changeState) {
   }
 }
 
-function verificationEvidence(reader, current, optional, issues = []) {
+function verificationEvidence(reader, current, optional, issues = [], latest = {}) {
   return {
     goal: current ? {
       goal_id: current.goal.goal_id,
@@ -660,6 +738,7 @@ function verificationEvidence(reader, current, optional, issues = []) {
     } : null,
     inputs: reader?.inputs() ?? [],
     optional,
+    latest,
     issues,
   };
 }
@@ -695,9 +774,15 @@ export async function verifyGoalRepository(root, context = {}) {
 
     const lockInput = await readLock(reader);
     const changeState = await verifyChangeState(reader, rootNames, lockInput.lock);
-    const evidenceState = await verifyEvidenceState(reader, rootNames, lockInput.lock);
     const history = await verifyGoalHistory(reader, current, lockInput.lock);
     const planState = await verifyPlanState(reader, rootNames, current, history.goals);
+    const evidenceState = await verifyEvidenceState(
+      reader,
+      rootNames,
+      lockInput.lock,
+      history.goals,
+      planState,
+    );
     const progressState = await verifyProgressLedger(
       reader,
       rootNames,
@@ -716,7 +801,7 @@ export async function verifyGoalRepository(root, context = {}) {
     };
     const result = {
       state: changeState.pending ? 'CHANGE_PENDING' : 'LOCKED',
-      evidence: verificationEvidence(reader, current, optional),
+      evidence: verificationEvidence(reader, current, optional, [], evidenceState.publicLatest),
     };
     return context[RETURN_VERIFIED_SNAPSHOT] === true
       ? { result, reader, current, rootNames, lockInput, planState, progressState, evidenceState, history }
@@ -835,26 +920,30 @@ function validateGoalEventInput(input) {
     || typeof input !== 'object'
     || Array.isArray(input)
     || (Object.getPrototypeOf(input) !== Object.prototype && Object.getPrototypeOf(input) !== null)) {
-    throw inputError('INVALID_EVENT_INPUT', 'Progress event input must be an object.');
+    throw inputError('INVALID_EVENT_INPUT', 'Goal event input must be an object.');
   }
-  const fields = ['kind', 'event_type', 'task_id', 'summary', 'evidence_refs'];
+  const fields = input.kind === 'evidence'
+    ? ['kind', 'acceptance_criterion_id', 'task_id', 'method', 'observed_result', 'artifact_refs', 'workspace_fingerprint', 'state', 'supersedes']
+    : ['kind', 'event_type', 'task_id', 'summary', 'evidence_refs'];
   const keys = Object.keys(input);
   if (keys.length !== fields.length || fields.some((field) => !Object.hasOwn(input, field))) {
-    throw inputError('INVALID_EVENT_INPUT', 'Progress event input must contain exactly kind, event_type, task_id, summary, and evidence_refs.');
+    throw inputError('INVALID_EVENT_INPUT', `Goal ${input.kind === 'evidence' ? 'evidence' : 'progress'} input contains missing or derived fields.`);
   }
-  if (input.kind !== 'progress') throw inputError('INVALID_EVENT_INPUT', 'Progress event kind must equal progress.');
+  if (!['evidence', 'progress'].includes(input.kind)) {
+    throw inputError('INVALID_EVENT_INPUT', 'Goal event kind must equal evidence or progress.');
+  }
   if (input.event_type === 'plan-revision') {
     throw inputError('INVALID_EVENT_INPUT', 'Plan revision lifecycle events are owned by plan revision commits.');
   }
   return input;
 }
 
-function buildProgressEvent(progressState, goalReference, planRevision, input, context) {
+function buildProgressEvent(progressState, goalReference, planRevision, input, context, recordedAt) {
   const eventId = `EVT-${String(progressState.count + 1).padStart(6, '0')}`;
   const withoutDigest = {
     schema_version: 1,
     event_id: eventId,
-    recorded_at: (context.now ?? (() => new Date().toISOString()))(),
+    recorded_at: recordedAt ?? (context.now ?? (() => new Date().toISOString()))(),
     goal: goalReference,
     plan_revision: planRevision,
     task_id: input.task_id,
@@ -903,6 +992,27 @@ function nextLockForEvent(lockInput, event) {
   });
 }
 
+function nextLockForEvidence(lockInput, event, evidence, evidenceDigest) {
+  const { record_digest: _recordDigest, ...withoutDigest } = lockInput.lock;
+  const nextWithoutDigest = {
+    ...withoutDigest,
+    state_revision: lockInput.lock.state_revision + 1,
+    progress_head: { event_id: event.event_id, digest: event.event_digest },
+    evidence_heads: {
+      ...lockInput.lock.evidence_heads,
+      [evidence.acceptance_criterion_id]: {
+        evidence_id: evidence.evidence_id,
+        digest: evidenceDigest,
+      },
+    },
+  };
+  // 两个 head 与一次 revision 共享同一摘要载荷，避免任何一个索引单独成为已接受状态。
+  return validateLockRecord({
+    ...nextWithoutDigest,
+    record_digest: sha256(canonicalBytes(nextWithoutDigest)),
+  });
+}
+
 function verifiedHistoryEntries(current, history, planState) {
   const entries = [{
     target: '.goal-lock/current.json',
@@ -924,6 +1034,15 @@ function verifiedHistoryEntries(current, history, planState) {
     });
   }
   return entries;
+}
+
+function verifiedEvidenceEntries(evidenceState) {
+  // 历史证据只作为精确字节所有权输入参与提交，supersession 永不覆盖或重编码旧文件。
+  return evidenceState.records.map((record) => ({
+    target: record.target,
+    expected: { kind: 'sha256', digest: record.digest },
+    content: record.bytes,
+  }));
 }
 
 function nextExecutableTaskId(tasks, currentNextTaskId) {
@@ -1072,11 +1191,96 @@ export async function recordGoalEvent(root, input, context = {}) {
       goal_version: current.goal.goal_version,
       goal_digest: current.digest,
     };
+    if (input.kind === 'evidence') {
+      const criterion = current.goal.acceptance_criteria.find(
+        (candidate) => candidate.id === input.acceptance_criterion_id,
+      );
+      if (!criterion) {
+        throw inputError('INVALID_EVIDENCE_REFERENCE', 'Evidence acceptance_criterion_id must reference the current goal.');
+      }
+      const task = plan.tasks.find((candidate) => candidate.id === input.task_id);
+      if (!task || !task.acceptance_criteria.includes(criterion.id)) {
+        throw inputError(
+          'INVALID_EVIDENCE_REFERENCE',
+          'Evidence task_id must reference a current-plan task that owns the criterion.',
+        );
+      }
+      const priorRecords = evidenceState.recordsByCriterion.get(criterion.id) ?? [];
+      const preceding = priorRecords.at(-1)?.value.evidence_id ?? null;
+      if (input.supersedes !== preceding) {
+        throw inputError(
+          'INVALID_EVIDENCE_SUPERSESSION',
+          'Evidence supersedes must equal the immediately preceding latest evidence ID.',
+        );
+      }
+      if (priorRecords.length >= 9999) {
+        throw stateError('EVIDENCE_SEQUENCE_EXHAUSTED', 'Evidence sequence exhausted its four-digit identifier space.');
+      }
+      const evidenceId = `EVID-${String(priorRecords.length + 1).padStart(4, '0')}`;
+      const recordedAt = (context.now ?? (() => new Date().toISOString()))();
+      const evidence = validateEvidence({
+        schema_version: 1,
+        evidence_id: evidenceId,
+        acceptance_criterion_id: criterion.id,
+        goal: goalReference,
+        plan_revision: plan.plan_revision,
+        task_id: task.id,
+        method: input.method,
+        observed_result: input.observed_result,
+        artifact_refs: input.artifact_refs,
+        workspace_fingerprint: input.workspace_fingerprint,
+        state: input.state,
+        supersedes: input.supersedes,
+        recorded_at: recordedAt,
+      }, goalReference);
+      const evidenceBytes = canonicalBytes(evidence);
+      const evidenceDigest = sha256(evidenceBytes);
+      const event = buildProgressEvent(progressState, goalReference, plan.plan_revision, {
+        event_type: 'verification-result',
+        task_id: task.id,
+        summary: evidenceEventSummary(evidence, evidenceDigest),
+        evidence_refs: [evidenceId],
+      }, context, recordedAt);
+      const nextLock = nextLockForEvidence(lockInput, event, evidence, evidenceDigest);
+      const entries = verifiedHistoryEntries(current, history, planState);
+      entries.push({
+        target: '.goal-lock/plan.json',
+        expected: { kind: 'sha256', digest: planState.current.digest },
+        content: planState.current.bytes,
+      });
+      entries.push(...verifiedEvidenceEntries(evidenceState));
+      entries.push({
+        target: `.goal-lock/evidence/${criterion.id}/${evidenceId}.json`,
+        expected: { kind: 'absent' },
+        content: evidenceBytes,
+      });
+      entries.push(appendProgressEntry(progressState, event));
+      entries.push({
+        target: '.goal-lock/lock.json',
+        expected: { kind: 'sha256', digest: lockInput.digest },
+        content: canonicalBytes(nextLock),
+      });
+      // 新证据、关联事件和两个 head 在一次最终复验后共同提交，失败时整体回滚。
+      await reader.verifyInputs();
+      await commitGoalFiles(root, entries, context);
+      return {
+        state: 'LOCKED',
+        evidence_id: evidenceId,
+        evidence_digest: evidenceDigest,
+        acceptance_criterion_id: criterion.id,
+        event_id: event.event_id,
+        event_digest: event.event_digest,
+        goal_id: current.goal.goal_id,
+        goal_version: current.goal.goal_version,
+        plan_revision: plan.plan_revision,
+        task_id: task.id,
+      };
+    }
     const event = buildProgressEvent(progressState, goalReference, plan.plan_revision, input, context);
     if (event.task_id !== null && !plan.tasks.some((task) => task.id === event.task_id)) {
       throw inputError('INVALID_EVENT_REFERENCE', 'Progress event task_id must reference the current plan.');
     }
-    if (event.evidence_refs.some((evidenceId) => !evidenceState.recordsById.has(evidenceId))) {
+    if (event.evidence_refs.some((evidenceId) => !evidenceState.knownIds.has(evidenceId))) {
       throw inputError('INVALID_EVENT_REFERENCE', 'Progress event evidence_refs must reference existing evidence.');
     }
     const updatedPlan = planAfterTaskEvent(plan, event.event_type, event.task_id, current.goal);
