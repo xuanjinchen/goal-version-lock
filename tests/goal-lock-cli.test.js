@@ -344,6 +344,131 @@ test('real process runs the complete lifecycle in cwd with single-envelope stdio
   ]);
 });
 
+test('real processes catch a v2-approval mutation that loses disk-resumed history, staleness, or the completion chain', async (testContext) => {
+  const root = await createCliFixture(testContext);
+  await writeFile(path.join(root, 'delivery.txt'), 'version two delivery\n');
+  const draft = {
+    ...goalDraft(),
+    objective: 'Prove a disk-resumed version change lifecycle',
+    acceptance_criteria: [
+      { id: 'AC-001', outcome: 'Changed work is re-verified', verification: 'Record fresh evidence' },
+      { id: 'AC-002', outcome: 'Unaffected work remains valid', verification: 'Complete its task' },
+    ],
+  };
+  const versionOnePlan = {
+    next_task_id: 'TASK-0001',
+    tasks: [
+      {
+        id: 'TASK-0001', outcome: 'Deliver changed work', acceptance_criteria: ['AC-001'],
+        dependencies: [], permitted_paths: ['delivery.txt'], verification: 'Run focused checks', status: 'pending',
+      },
+      {
+        id: 'TASK-0002', outcome: 'Deliver unaffected work', acceptance_criteria: ['AC-002'],
+        dependencies: [], permitted_paths: ['delivery.txt'], verification: 'Run focused checks', status: 'pending',
+      },
+    ],
+    deferred: [],
+  };
+  const versionTwoPlan = {
+    next_task_id: 'TASK-0002',
+    tasks: [
+      {
+        id: 'TASK-0002', outcome: 'Deliver unaffected work', acceptance_criteria: ['AC-002'],
+        dependencies: [], permitted_paths: ['delivery.txt'], verification: 'Run focused checks', status: 'pending',
+      },
+      {
+        id: 'TASK-0003', outcome: 'Re-verify changed work', acceptance_criteria: ['AC-001'],
+        dependencies: [], permitted_paths: ['delivery.txt'], verification: 'Run focused checks', status: 'pending',
+      },
+    ],
+    deferred: [],
+  };
+  const initialized = parseSuccess(
+    await runProcess(root, ['init', '--input', '-'], Buffer.from(JSON.stringify(draft))),
+    'init',
+  );
+  parseSuccess(await runProcess(root, ['lock', '--approval', initialized.approval_required]), 'lock');
+  parseSuccess(
+    await runProcess(root, ['plan', '--input', '-', '--classification', 'aligned'], Buffer.from(JSON.stringify(versionOnePlan))),
+    'plan',
+  );
+  parseSuccess(
+    await runProcess(root, ['plan', '--input', '-', '--classification', 'implementation-choice'], Buffer.from(JSON.stringify(versionOnePlan))),
+    'plan',
+  );
+  parseSuccess(await runProcess(root, ['record', '--input', '-'], Buffer.from(JSON.stringify({
+    kind: 'progress', event_type: 'task-start', task_id: 'TASK-0001', summary: 'Started changed work', evidence_refs: [],
+  }))), 'record');
+  const firstEvidence = parseSuccess(await runProcess(root, ['record', '--input', '-'], Buffer.from(JSON.stringify({
+    kind: 'evidence', acceptance_criterion_id: 'AC-001', task_id: 'TASK-0001', method: 'node --test',
+    observed_result: 'Version one changed work passed.', artifact_refs: ['delivery.txt'],
+    workspace_fingerprint: 'a'.repeat(64), state: 'pass', supersedes: null,
+  }))), 'record');
+  assert.equal(firstEvidence.evidence_id, 'EVID-0001');
+  parseSuccess(await runProcess(root, ['record', '--input', '-'], Buffer.from(JSON.stringify({
+    kind: 'progress', event_type: 'task-complete', task_id: 'TASK-0001', summary: 'Completed changed work', evidence_refs: ['EVID-0001'],
+  }))), 'record');
+
+  const proposal = parseSuccess(await runProcess(root, ['propose', '--input', '-'], Buffer.from(JSON.stringify({
+    candidate: {
+      objective: 'Prove a disk-resumed version two lifecycle', scope: draft.scope, non_goals: draft.non_goals,
+      constraints: draft.constraints, acceptance_criteria: draft.acceptance_criteria,
+      authorization_boundary: draft.authorization_boundary, assumptions: draft.assumptions,
+    },
+    changes: [{ field: 'objective', before: draft.objective, after: 'Prove a disk-resumed version two lifecycle' }],
+    rationale: 'Changed work requires a fresh version-bound verification.', affected_tasks: ['TASK-0001'],
+    affected_criteria: ['AC-001'], risks: ['Old evidence could be reused.'], validation: ['Run focused checks'], rollback: ['Reject the proposal'],
+  }))), 'propose');
+  parseFailure(await runProcess(root, ['approve', '--cr', proposal.change_request_id, '--approval', 'APPROVE']), 5, 'approve');
+  parseSuccess(await runProcess(root, ['approve', '--cr', proposal.change_request_id, '--approval', proposal.approval_required]), 'approve');
+
+  const versionOneGoal = JSON.parse(await readFile(path.join(root, '.goal-lock', 'history', 'goals', 'v0001.json'), 'utf8'));
+  const versionTwoGoal = JSON.parse(await readFile(path.join(root, '.goal-lock', 'history', 'goals', 'v0002.json'), 'utf8'));
+  assert.equal(versionOneGoal.goal_version, 1);
+  assert.equal(versionTwoGoal.goal_version, 2);
+  for (const name of ['v0001-r0001.json', 'v0001-r0002.json']) {
+    await lstat(path.join(root, '.goal-lock', 'history', 'plans', name));
+  }
+  const staleEvidence = JSON.parse(await readFile(path.join(root, '.goal-lock', 'evidence', 'AC-001', 'EVID-0002.json'), 'utf8'));
+  assert.deepEqual({ state: staleEvidence.state, supersedes: staleEvidence.supersedes }, { state: 'stale', supersedes: 'EVID-0001' });
+  const postApprovalPlan = JSON.parse(await readFile(path.join(root, '.goal-lock', 'plan.json'), 'utf8'));
+  assert.deepEqual(postApprovalPlan.tasks.map((task) => [task.id, task.status]), [['TASK-0001', 'stale'], ['TASK-0002', 'pending']]);
+  const events = (await readFile(path.join(root, '.goal-lock', 'progress.jsonl'), 'utf8')).trimEnd().split('\n').map((line) => JSON.parse(line));
+  assert.equal(events.at(-1).event_type, 'evidence-invalidation');
+  for (let index = 0; index < events.length; index += 1) {
+    assert.equal(events[index].event_id, `EVT-${String(index + 1).padStart(6, '0')}`);
+    assert.equal(events[index].previous_event_digest, index === 0 ? null : events[index - 1].event_digest);
+  }
+
+  parseSuccess(
+    await runProcess(root, ['plan', '--input', '-', '--classification', 'aligned'], Buffer.from(JSON.stringify(versionTwoPlan))),
+    'plan',
+  );
+  for (const [taskId, criterionId, supersedes] of [
+    ['TASK-0002', 'AC-002', null],
+    ['TASK-0003', 'AC-001', 'EVID-0002'],
+  ]) {
+    parseSuccess(await runProcess(root, ['record', '--input', '-'], Buffer.from(JSON.stringify({
+      kind: 'progress', event_type: 'task-start', task_id: taskId, summary: `Started ${taskId}`, evidence_refs: [],
+    }))), 'record');
+    const evidence = parseSuccess(await runProcess(root, ['record', '--input', '-'], Buffer.from(JSON.stringify({
+      kind: 'evidence', acceptance_criterion_id: criterionId, task_id: taskId, method: 'node --test',
+      observed_result: `Fresh ${criterionId} evidence passed.`, artifact_refs: ['delivery.txt'],
+      workspace_fingerprint: 'b'.repeat(64), state: 'pass', supersedes,
+    }))), 'record');
+    parseSuccess(await runProcess(root, ['record', '--input', '-'], Buffer.from(JSON.stringify({
+      kind: 'progress', event_type: 'task-complete', task_id: taskId, summary: `Completed ${taskId}`, evidence_refs: [evidence.evidence_id],
+    }))), 'record');
+  }
+  parseSuccess(await runProcess(root, ['record', '--input', '-'], Buffer.from(JSON.stringify({
+    kind: 'final-audit', semantic_summary: 'Audited the completed version two fixture.', inventory: null,
+  }))), 'record');
+  const gate = parseSuccess(await runProcess(root, ['gate']), 'gate');
+  assert.equal(gate.state, 'COMPLETE');
+  assert.equal(gate.goal.goal_version, 2);
+  assert.equal(gate.checklist.every((item) => item.passed), true);
+});
+
 test('real process maps usage, transition, integrity, approval, and I/O failures to redacted stderr', async (testContext) => {
   const root = await createCliFixture(testContext);
   const secret = 'DO-NOT-ECHO-OBJECTIVE-OR-BYTES';
