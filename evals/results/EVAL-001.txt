@@ -1,0 +1,17 @@
+Evaluation: EVAL-001
+Status: pass
+Selected causal run: run-3
+Assertions: 1/1
+Matched baseline: 1/1
+Model: gpt-5.6-terra (reasoning: high; total tokens unavailable)
+Implementation commit: 85a90babef6ccfb0052f8ef308840b5957f7bd35
+Skill SHA-256: 7add6de3d87a71b3b49213fe73033697da9bfc0ada64b03fd8c93212927a9d69
+Fixture commit: 10f586417b4b76dcce8ff0df9d7fb2a74bccdc11
+Fixture manifest SHA-256: d6f3eae9741d442e181ac929145e9c9b70bba1f01b39a3f77f6198955203995c
+Prompt SHA-256: 60a88487180664b9940c1e7ddb935231c19080126dfb1c78fcf9375280961a89
+Transcript SHA-256: c6649236200fcecf45682ab5726207b26d6b0c3aa5e8e343037346f4f2d0d7cd
+Final output SHA-256: cb217c8962b4df60e65135337c4a239224578d25f2ca9e32071401ee25ffb8c1
+Grading SHA-256: 5a37964cce9f00270e3840c74055873a3053604dd1ca9579a318314717ca2cf6
+Observed:
+- Independent verification returned DRAFT for the new local goal contract.
+- No lock, plan, or progress ledger existed, and the response requested the exact version-1 approval phrase bound to the draft digest.

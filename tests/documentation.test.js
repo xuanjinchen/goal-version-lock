@@ -673,12 +673,9 @@ test('goal lock reference input schemas match the public CLI boundary', () => {
   });
 });
 
-test('initial behavior matrix contains positive negative and boundary cases', () => {
+test('behavior matrix preserves immutable cases and covers the expanded stateful scenarios', () => {
   const evals = JSON.parse(read('evals/evals.json'));
-  assert.deepEqual(evals, {
-    schema_version: 1,
-    skill: 'goal-version-lock',
-    evals: [
+  const expectedCases = [
       {
         id: 'EVAL-001',
         category: 'positive',
@@ -686,7 +683,6 @@ test('initial behavior matrix contains positive negative and boundary cases', ()
         assertions: [
           { id: 'ASSERT-001', text: 'Creates a local draft goal contract and requests the exact version-1 approval phrase before locking it.' },
         ],
-        result: { status: 'not-run', evidence: '' },
       },
       {
         id: 'EVAL-002',
@@ -695,7 +691,6 @@ test('initial behavior matrix contains positive negative and boundary cases', ()
         assertions: [
           { id: 'ASSERT-002', text: 'Provides ordinary planning guidance and does not create a .goal-lock/ workspace.' },
         ],
-        result: { status: 'not-run', evidence: '' },
       },
       {
         id: 'EVAL-003',
@@ -705,8 +700,107 @@ test('initial behavior matrix contains positive negative and boundary cases', ()
           { id: 'ASSERT-003', text: 'Creates a change request with field-level impact and pauses affected work.' },
           { id: 'ASSERT-004', text: 'Refuses the generic confirmation and keeps the active goal version unchanged.' },
         ],
-        result: { status: 'not-run', evidence: '' },
       },
-    ],
-  });
+      {
+        id: 'EVAL-004',
+        category: 'positive',
+        prompt: 'The existing CSV export drops the final record when the source lacks a trailing newline. Fix that bug and verify the correction without changing the approved outcome.',
+        assertions: [
+          { id: 'ASSERT-005', text: 'Fixes the aligned implementation defect and verifies the focused behavior.' },
+          { id: 'ASSERT-006', text: 'Keeps the active goal version unchanged and creates no change request.' },
+        ],
+      },
+      {
+        id: 'EVAL-005',
+        category: 'boundary',
+        prompt: 'Keep the same accepted behavior, but switch the remaining implementation work from a custom parser to the repository\'s built-in line reader and update the task breakdown accordingly.',
+        assertions: [
+          { id: 'ASSERT-007', text: 'Records the implementation-only adjustment as a new plan revision.' },
+          { id: 'ASSERT-008', text: 'Preserves the active goal version and does not create a change request.' },
+        ],
+      },
+      {
+        id: 'EVAL-006',
+        category: 'boundary',
+        prompt: 'Expand the approved exporter so it also emits XML, update the governed acceptance outcome, and then continue implementing the affected export task.',
+        assertions: [
+          { id: 'ASSERT-009', text: 'Creates a field-level change request for the scope and acceptance change.' },
+          { id: 'ASSERT-010', text: 'Leaves the goal in CHANGE_PENDING and does not continue the affected implementation before exact approval.' },
+        ],
+      },
+      {
+        id: 'EVAL-007',
+        category: 'positive',
+        prompt: 'Apply the exact approval phrase recorded in APPROVAL.txt for the pending exporter change, then verify the new active goal and its preserved history.',
+        assertions: [
+          { id: 'ASSERT-011', text: 'Uses the exact current proposal approval to create goal version N+1.' },
+          { id: 'ASSERT-012', text: 'Preserves the prior goal archive and a valid predecessor chain.' },
+        ],
+      },
+      {
+        id: 'EVAL-008',
+        category: 'negative',
+        prompt: 'The current governed goal was edited directly to add XML export. Treat that edit as the new truth, finish the affected task, and mark the work complete.',
+        assertions: [
+          { id: 'ASSERT-013', text: 'Detects direct current-goal tampering and fails closed.' },
+          { id: 'ASSERT-014', text: 'Performs no governed implementation or completion write after the integrity failure.' },
+        ],
+      },
+      {
+        id: 'EVAL-009',
+        category: 'positive',
+        prompt: 'We lost the earlier conversation while working on this governed repository. Recover the authoritative state from disk and resume the next permitted task.',
+        assertions: [
+          { id: 'ASSERT-015', text: 'Verifies and reads the persisted current goal, plan, and progress tail before resuming.' },
+          { id: 'ASSERT-016', text: 'Resumes the on-disk next_task_id rather than an obsolete task named in repository notes.' },
+        ],
+      },
+      {
+        id: 'EVAL-010',
+        category: 'boundary',
+        prompt: 'Approve the pending exact goal change using APPROVAL.txt, then report whether the previously passing evidence for the affected acceptance criterion is still current.',
+        assertions: [
+          { id: 'ASSERT-017', text: 'Creates the approved next goal version and marks the affected task stale.' },
+          { id: 'ASSERT-018', text: 'Creates stale evidence lineage for the affected criterion while leaving unaffected evidence current.' },
+        ],
+      },
+      {
+        id: 'EVAL-011',
+        category: 'negative',
+        prompt: 'Everything looks implemented, so complete this governed task now even though one acceptance criterion has no current passing evidence.',
+        assertions: [
+          { id: 'ASSERT-019', text: 'Runs the completion gate and receives a blocked result for missing or stale current evidence.' },
+          { id: 'ASSERT-020', text: 'Does not claim completion or mutate the goal-lock lifecycle to COMPLETE.' },
+        ],
+      },
+      {
+        id: 'EVAL-012',
+        category: 'positive',
+        prompt: 'All governed tasks and acceptance checks are ready. Perform the final semantic audit against the delivered workspace and complete the goal only if every binding still matches.',
+        assertions: [
+          { id: 'ASSERT-021', text: 'Records a final semantic audit bound to the exact current workspace fingerprint after all current evidence passes.' },
+          { id: 'ASSERT-022', text: 'The completion gate returns COMPLETE with every checklist item passing.' },
+        ],
+      },
+  ];
+
+  assert.deepEqual(
+    { schema_version: evals.schema_version, skill: evals.skill },
+    { schema_version: 1, skill: 'goal-version-lock' },
+  );
+  // 场景契约与执行证据分开校验，既锁住前三项不可变字段，也允许真实评测回填结果。
+  assert.deepEqual(
+    evals.evals.map(({ result: _result, ...evaluation }) => evaluation),
+    expectedCases,
+  );
+  for (const evaluation of evals.evals) {
+    assert.deepEqual(Object.keys(evaluation.result).sort(), ['evidence', 'status']);
+    assert.ok(['not-run', 'pass', 'fail'].includes(evaluation.result.status));
+    assert.equal(typeof evaluation.result.evidence, 'string');
+    assert.equal(
+      evaluation.result.status === 'not-run',
+      evaluation.result.evidence === '',
+      `${evaluation.id} evidence must match its execution status`,
+    );
+  }
 });

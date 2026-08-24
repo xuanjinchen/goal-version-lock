@@ -1,0 +1,17 @@
+Evaluation: EVAL-005
+Status: pass
+Selected causal run: run-3
+Assertions: 2/2
+Matched baseline: 2/2
+Model: gpt-5.6-terra (reasoning: high; total tokens unavailable)
+Implementation commit: 85a90babef6ccfb0052f8ef308840b5957f7bd35
+Skill SHA-256: 7add6de3d87a71b3b49213fe73033697da9bfc0ada64b03fd8c93212927a9d69
+Fixture commit: 06ecb3389099e691c99c5dc92b78dc88dfeb3a04
+Fixture manifest SHA-256: 6e64adf82983dc74629620c43a8a53116eb1c0462046e13192894abd6e24df38
+Prompt SHA-256: 5f445c11f6f092ac7aa5180601dc9ae36f35a6c0d9b193c7957e66d709692f89
+Transcript SHA-256: cbae58e0bf3fe6928d70519c78b4bfdd99626561e09f54106332d3b8139150fa
+Final output SHA-256: de33f7a6a53effdb6abb168c3641e573b6f7f7651eddf20373bce1d115687ef7
+Grading SHA-256: 24d1d95895e545f755443527e4c9d573f473e004696a6acbbb964147354cf2c8
+Observed:
+- Independent plan state recorded revision 2 with the built-in line-reader implementation choice.
+- The active goal remained version 1, the task stayed pending, and no change request was created.

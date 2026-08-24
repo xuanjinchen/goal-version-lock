@@ -1,0 +1,17 @@
+Evaluation: EVAL-010
+Status: pass
+Selected causal run: run-3
+Assertions: 2/2
+Matched baseline: 2/2
+Model: gpt-5.6-terra (reasoning: high; total tokens unavailable)
+Implementation commit: 85a90babef6ccfb0052f8ef308840b5957f7bd35
+Skill SHA-256: 7add6de3d87a71b3b49213fe73033697da9bfc0ada64b03fd8c93212927a9d69
+Fixture commit: 77af0a970eb2e43936f3ca9d7d60122efe6e1dd5
+Fixture manifest SHA-256: a86e830d0c3eb7c8157a96bbe5a1e9903a3ccb6b6d9b338ee490926850f956c5
+Prompt SHA-256: 00f1da2ef2881cf4c6676781175eecd9963583ba008446356cddf9a71b9ef436
+Transcript SHA-256: a1bf06ede282edf69395545b9b15bc9e2a29c9d564a5b700159b81c30a70d1e2
+Final output SHA-256: 3702e7fd5d7249e8270ea37748c8782d548cd4c7edb2355e093fa08bf8f3027a
+Grading SHA-256: 7d9600642b34a2ad81f9fe8f296549d45f8345db069a55405e82612c5e8e3aef
+Observed:
+- Exact approval created goal version 2 and marked affected TASK-0001 stale while leaving TASK-0002 pending.
+- AC-001/EVID-0002 is stale and supersedes its prior pass; unaffected AC-002 evidence remains pass.

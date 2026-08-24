@@ -1,0 +1,17 @@
+Evaluation: EVAL-002
+Status: pass
+Selected causal run: run-2
+Assertions: 1/1
+Matched baseline: 1/1
+Model: gpt-5.6-terra (reasoning: high; total tokens unavailable)
+Implementation commit: 85a90babef6ccfb0052f8ef308840b5957f7bd35
+Skill SHA-256: 7add6de3d87a71b3b49213fe73033697da9bfc0ada64b03fd8c93212927a9d69
+Fixture commit: 648f59d1f72441f15763b9ae15c185e0752326ad
+Fixture manifest SHA-256: c499e410627ba7063c5249492f75a146b44af85feb1d89d1edcd0a3dafe639ef
+Prompt SHA-256: 468a8cb133d799e4e01d33ea623aa902ec7fadc5c50249097f3ac34b254c96ff
+Transcript SHA-256: ee800c988ab9f2d64cff14d117ad8f3ff473d9ee0a762aff39bd5212ead86f20
+Final output SHA-256: d3ed8bbc1a7f4026f0b01e4692cf7160664b1142a20a89ce25735ea75ca8e17c
+Grading SHA-256: 2ea6242c3667ca04723006ac5e9025b4d2b147116edb33d75a5580e23c6008e1
+Observed:
+- The response provided a short ordinary implementation and test plan.
+- Independent filesystem and Git inspection found no .goal-lock directory or repository mutation.

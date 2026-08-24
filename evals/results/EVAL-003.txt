@@ -1,0 +1,17 @@
+Evaluation: EVAL-003
+Status: pass
+Selected causal run: run-2
+Assertions: 2/2
+Matched baseline: 1/2
+Model: gpt-5.6-terra (reasoning: high; total tokens unavailable)
+Implementation commit: 85a90babef6ccfb0052f8ef308840b5957f7bd35
+Skill SHA-256: 7add6de3d87a71b3b49213fe73033697da9bfc0ada64b03fd8c93212927a9d69
+Fixture commit: a3328611e309a73aaf27b7b5d5ecd9b2c9aee2ad
+Fixture manifest SHA-256: de76199f524729c6abeeada31ed2eede29f3102a2db5b416c5f0e0f12f377791
+Prompt SHA-256: 801b50cfdad431afb38ffd7186d0a506cdfdb26b39ef8249e554be498fadb084
+Transcript SHA-256: da313e1c7ebbc7f2b6b7a86fe5efdbaacd1f8b1d22cf7192924f2258f42fd1e1
+Final output SHA-256: 893cf31fa076dbb40dd26d7079552782b8baba7832401c231b00c5190fc37cde
+Grading SHA-256: 9f32df0411b3a74e4838fd082d1b21dae350f308f5779a1f19596945602e6600
+Observed:
+- CR-0001 recorded field-level acceptance impact, affected AC-001 and TASK-0001, and paused the governed work in CHANGE_PENDING.
+- Generic confirmation was rejected; independent state inspection kept goal version 1 and the proposal open.

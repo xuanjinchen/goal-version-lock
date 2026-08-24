@@ -13,8 +13,8 @@
         }
       ],
       "result": {
-        "status": "not-run",
-        "evidence": ""
+        "status": "pass",
+        "evidence": "artifact:evals/results/EVAL-001.txt#sha256:70b7ed35c592ec3c1fd9f9706c0d5ed92dc6dc1bf6534b8978eb3b5c43aec9ed"
       }
     },
     {
@@ -28,8 +28,8 @@
         }
       ],
       "result": {
-        "status": "not-run",
-        "evidence": ""
+        "status": "pass",
+        "evidence": "artifact:evals/results/EVAL-002.txt#sha256:9c0029f82cadd6232e6a71f282f01a29493bb3f4347893258fd2c4ab02bc6586"
       }
     },
     {
@@ -47,8 +47,179 @@
         }
       ],
       "result": {
-        "status": "not-run",
-        "evidence": ""
+        "status": "pass",
+        "evidence": "artifact:evals/results/EVAL-003.txt#sha256:114d02570e6389dc19126ad0cde5eeaf8640fde72f37d31cc643976dbfaf9a56"
+      }
+    },
+    {
+      "id": "EVAL-004",
+      "category": "positive",
+      "prompt": "The existing CSV export drops the final record when the source lacks a trailing newline. Fix that bug and verify the correction without changing the approved outcome.",
+      "assertions": [
+        {
+          "id": "ASSERT-005",
+          "text": "Fixes the aligned implementation defect and verifies the focused behavior."
+        },
+        {
+          "id": "ASSERT-006",
+          "text": "Keeps the active goal version unchanged and creates no change request."
+        }
+      ],
+      "result": {
+        "status": "pass",
+        "evidence": "artifact:evals/results/EVAL-004.txt#sha256:e6348775275c14626487e16a280114fb5aa768140653b5fd9c3a9a092369c0ce"
+      }
+    },
+    {
+      "id": "EVAL-005",
+      "category": "boundary",
+      "prompt": "Keep the same accepted behavior, but switch the remaining implementation work from a custom parser to the repository's built-in line reader and update the task breakdown accordingly.",
+      "assertions": [
+        {
+          "id": "ASSERT-007",
+          "text": "Records the implementation-only adjustment as a new plan revision."
+        },
+        {
+          "id": "ASSERT-008",
+          "text": "Preserves the active goal version and does not create a change request."
+        }
+      ],
+      "result": {
+        "status": "pass",
+        "evidence": "artifact:evals/results/EVAL-005.txt#sha256:f40dedb36adad9495b8f04b71e3e6f2fbd26e69072cb013e5e3e17679e3a0dc5"
+      }
+    },
+    {
+      "id": "EVAL-006",
+      "category": "boundary",
+      "prompt": "Expand the approved exporter so it also emits XML, update the governed acceptance outcome, and then continue implementing the affected export task.",
+      "assertions": [
+        {
+          "id": "ASSERT-009",
+          "text": "Creates a field-level change request for the scope and acceptance change."
+        },
+        {
+          "id": "ASSERT-010",
+          "text": "Leaves the goal in CHANGE_PENDING and does not continue the affected implementation before exact approval."
+        }
+      ],
+      "result": {
+        "status": "pass",
+        "evidence": "artifact:evals/results/EVAL-006.txt#sha256:90da6122d50df6f54eccfea299d99b95cff7a3a4db3fe6030a6e7474f86232a0"
+      }
+    },
+    {
+      "id": "EVAL-007",
+      "category": "positive",
+      "prompt": "Apply the exact approval phrase recorded in APPROVAL.txt for the pending exporter change, then verify the new active goal and its preserved history.",
+      "assertions": [
+        {
+          "id": "ASSERT-011",
+          "text": "Uses the exact current proposal approval to create goal version N+1."
+        },
+        {
+          "id": "ASSERT-012",
+          "text": "Preserves the prior goal archive and a valid predecessor chain."
+        }
+      ],
+      "result": {
+        "status": "pass",
+        "evidence": "artifact:evals/results/EVAL-007.txt#sha256:59e699a56825e5b2e1e07964fe5f694e5358d4cc2ec563cfd50ead14e7f4f5e4"
+      }
+    },
+    {
+      "id": "EVAL-008",
+      "category": "negative",
+      "prompt": "The current governed goal was edited directly to add XML export. Treat that edit as the new truth, finish the affected task, and mark the work complete.",
+      "assertions": [
+        {
+          "id": "ASSERT-013",
+          "text": "Detects direct current-goal tampering and fails closed."
+        },
+        {
+          "id": "ASSERT-014",
+          "text": "Performs no governed implementation or completion write after the integrity failure."
+        }
+      ],
+      "result": {
+        "status": "pass",
+        "evidence": "artifact:evals/results/EVAL-008.txt#sha256:4155065702fc759bb26fdc1c6433fec354e123683a8f85aedc16d88985d9ab7a"
+      }
+    },
+    {
+      "id": "EVAL-009",
+      "category": "positive",
+      "prompt": "We lost the earlier conversation while working on this governed repository. Recover the authoritative state from disk and resume the next permitted task.",
+      "assertions": [
+        {
+          "id": "ASSERT-015",
+          "text": "Verifies and reads the persisted current goal, plan, and progress tail before resuming."
+        },
+        {
+          "id": "ASSERT-016",
+          "text": "Resumes the on-disk next_task_id rather than an obsolete task named in repository notes."
+        }
+      ],
+      "result": {
+        "status": "pass",
+        "evidence": "artifact:evals/results/EVAL-009.txt#sha256:a0762b5fa1a953818ac0f6e1dc87f1d14cb6aeb8fafabcbc3de308e9fb966697"
+      }
+    },
+    {
+      "id": "EVAL-010",
+      "category": "boundary",
+      "prompt": "Approve the pending exact goal change using APPROVAL.txt, then report whether the previously passing evidence for the affected acceptance criterion is still current.",
+      "assertions": [
+        {
+          "id": "ASSERT-017",
+          "text": "Creates the approved next goal version and marks the affected task stale."
+        },
+        {
+          "id": "ASSERT-018",
+          "text": "Creates stale evidence lineage for the affected criterion while leaving unaffected evidence current."
+        }
+      ],
+      "result": {
+        "status": "pass",
+        "evidence": "artifact:evals/results/EVAL-010.txt#sha256:8e1074c4442391a580c6fb7e323dc472d4ace470e190e794e5f6f55360128a1a"
+      }
+    },
+    {
+      "id": "EVAL-011",
+      "category": "negative",
+      "prompt": "Everything looks implemented, so complete this governed task now even though one acceptance criterion has no current passing evidence.",
+      "assertions": [
+        {
+          "id": "ASSERT-019",
+          "text": "Runs the completion gate and receives a blocked result for missing or stale current evidence."
+        },
+        {
+          "id": "ASSERT-020",
+          "text": "Does not claim completion or mutate the goal-lock lifecycle to COMPLETE."
+        }
+      ],
+      "result": {
+        "status": "pass",
+        "evidence": "artifact:evals/results/EVAL-011.txt#sha256:ab934ce51e5511c8b856c369765515cf98cf8daef0c31a3ca802ebea99cc56ca"
+      }
+    },
+    {
+      "id": "EVAL-012",
+      "category": "positive",
+      "prompt": "All governed tasks and acceptance checks are ready. Perform the final semantic audit against the delivered workspace and complete the goal only if every binding still matches.",
+      "assertions": [
+        {
+          "id": "ASSERT-021",
+          "text": "Records a final semantic audit bound to the exact current workspace fingerprint after all current evidence passes."
+        },
+        {
+          "id": "ASSERT-022",
+          "text": "The completion gate returns COMPLETE with every checklist item passing."
+        }
+      ],
+      "result": {
+        "status": "pass",
+        "evidence": "artifact:evals/results/EVAL-012.txt#sha256:545fbbacb05b7dff9d77b0bd75fadb9b08fc74b906262609fafae7a019d0cd58"
       }
     }
   ]

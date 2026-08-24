@@ -1,0 +1,17 @@
+Evaluation: EVAL-009
+Status: pass
+Selected causal run: run-3
+Assertions: 2/2
+Matched baseline: 2/2
+Model: gpt-5.6-terra (reasoning: high; total tokens unavailable)
+Implementation commit: 85a90babef6ccfb0052f8ef308840b5957f7bd35
+Skill SHA-256: 7add6de3d87a71b3b49213fe73033697da9bfc0ada64b03fd8c93212927a9d69
+Fixture commit: 71e73f0aab0a37011bc5f57372862edfc959fa94
+Fixture manifest SHA-256: 851c48ab805846d24fbe974b9080dd8c3f9e818a26fc524ddcc5dbd9992ff9ce
+Prompt SHA-256: 8fa841563123305c072efe422ad50ae933d983cdcc83dcdbd2e59d0eda03500d
+Transcript SHA-256: 0a271885e266c7daf79aba2c6b73a939779657bed11a357d980cd93e5854c5fc
+Final output SHA-256: 33afac69a94d5f264853c0644f22f99382c477df9de49026852c80e8f61eb932
+Grading SHA-256: 0becf319cdd9d07d7ff53bca38e53389461b4790da4643d14cec935031aa9ca7
+Observed:
+- The evaluator verified and read persisted current goal, plan, and progress tail before resuming.
+- Independent plan/progress state records TASK-0002 start and completion, next_task_id null, and no resumption of obsolete TASK-0001.

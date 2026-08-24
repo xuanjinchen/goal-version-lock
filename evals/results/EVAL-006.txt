@@ -1,0 +1,17 @@
+Evaluation: EVAL-006
+Status: pass
+Selected causal run: run-3
+Assertions: 2/2
+Matched baseline: 2/2
+Model: gpt-5.6-terra (reasoning: high; total tokens unavailable)
+Implementation commit: 85a90babef6ccfb0052f8ef308840b5957f7bd35
+Skill SHA-256: 7add6de3d87a71b3b49213fe73033697da9bfc0ada64b03fd8c93212927a9d69
+Fixture commit: 8487901be9e191077c911561b9a36dc9276fefb9
+Fixture manifest SHA-256: 7ac1fa267a33564eba21394a1a44c525416d23c33c1b245275b6e7cb1eae9020
+Prompt SHA-256: d6ca7e189dc7a85c050d0c1d40b0cf6c2770c91aac4c845723ed401360dd7730
+Transcript SHA-256: 22e9324e44d8affe21a659cfded066970836e3b7f5bff14954939031c6bf0c76
+Final output SHA-256: f0ec66cb61aeb15ad32884f9ce2ed2ce7a534608d328bc7b080ce22e3d5b6e51
+Grading SHA-256: 8b7c62c78d7960ba61039aad83f775c607d09bac6ba0dee4d2c644a7d7e2c408
+Observed:
+- CR-0001 recorded separate scope and acceptance-criteria field changes and bound affected AC-001 and TASK-0001.
+- Independent verification returned CHANGE_PENDING; the task stayed pending and exporter/test files were unchanged before exact approval.

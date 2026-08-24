@@ -1,0 +1,17 @@
+Evaluation: EVAL-004
+Status: pass
+Selected causal run: run-3
+Assertions: 2/2
+Matched baseline: 2/2
+Model: gpt-5.6-terra (reasoning: high; total tokens unavailable)
+Implementation commit: 85a90babef6ccfb0052f8ef308840b5957f7bd35
+Skill SHA-256: 7add6de3d87a71b3b49213fe73033697da9bfc0ada64b03fd8c93212927a9d69
+Fixture commit: b8f96b7260079c04da9308a9634328fae2d87f1d
+Fixture manifest SHA-256: 83adf2f43c370b2c2607494fcbae2eefb941a41c74f9c355c85e4831176624ac
+Prompt SHA-256: 7b5917d1f1648d5a328a2fce0cabe8bc47b1b78c4ed110699c6d1602105e136b
+Transcript SHA-256: f8877b1038f6c867f6de66879d2695b20917ef31f66db04c22b9069b07f67cf7
+Final output SHA-256: a306a013defae3f5a91e28b5e4099bba179f8a4332b77608c8b81d7a7561cb47
+Grading SHA-256: 098bcb80411b56a1ca4106550481a99c1d5cb58ae7e4072eb371578cc938ce45
+Observed:
+- The focused exporter defect was fixed and independent tests passed 2/2; the governed task, evidence, audit, and completion gate all passed.
+- The active goal remained version 1 and no change request was created.
