@@ -87,12 +87,12 @@ Requirements version: 2
   "tracks": {
     "references": {
       "status": "enabled",
-      "evidence": "artifact:references/contract.md#sha256:a3426837cdb0e175ad18ebad83fa70349bd96e45e2ef5aee10174543fb8863fa",
+      "evidence": "Enabled because the runtime schemas and conditional recovery rules are substantial and should be loaded only when creating, validating, or repairing goal-lock state.",
       "unblock_condition": ""
     },
     "scripts": {
       "status": "enabled",
-      "evidence": "artifact:scripts/goal-lock.js#sha256:c9846dcf7681d92b870c1e1c038eaf2b4f6b379358b09c20250dd87cf94ce64d",
+      "evidence": "Enabled because canonical hashing, version transitions, append-only validation, atomic writes, and completion gates require deterministic behavior across repeated cases.",
       "unblock_condition": ""
     },
     "assets": {

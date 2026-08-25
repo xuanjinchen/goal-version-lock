@@ -208,7 +208,7 @@ function evidenceInput() {
     task_id: 'TASK-0001',
     observed_result: 'The real process behaved as required',
     artifact_refs: ['delivery.txt'],
-    inventory: null,
+    workspace_fingerprint: 'a'.repeat(64),
     state: 'pass',
     failure_paths: [],
     supersedes: null,
@@ -446,7 +446,7 @@ test('real processes catch a v2-approval mutation that loses disk-resumed histor
       plan_revision: 2, validation_id: 'VAL-0001',
     },
     observed_result: 'Version one changed work passed.', artifact_refs: ['delivery.txt'],
-    inventory: null, state: 'pass', failure_paths: [], supersedes: null,
+    workspace_fingerprint: 'a'.repeat(64), state: 'pass', failure_paths: [], supersedes: null,
   }))), 'record');
   assert.equal(firstEvidence.evidence_id, 'EVID-0001');
   parseSuccess(await runProcess(root, ['record', '--input', '-'], Buffer.from(JSON.stringify({
@@ -504,7 +504,7 @@ test('real processes catch a v2-approval mutation that loses disk-resumed histor
         validation_id: taskId === 'TASK-0002' ? 'VAL-0003' : 'VAL-0004',
       },
       observed_result: `Fresh ${criterionId} evidence passed.`, artifact_refs: ['delivery.txt'],
-      inventory: null, state: 'pass', failure_paths: [], supersedes,
+      workspace_fingerprint: 'b'.repeat(64), state: 'pass', failure_paths: [], supersedes,
     }))), 'record');
     parseSuccess(await runProcess(root, ['record', '--input', '-'], Buffer.from(JSON.stringify({
       kind: 'progress', event_type: 'task-complete', task_id: taskId, summary: `Completed ${taskId}`, evidence_refs: [evidence.evidence_id],

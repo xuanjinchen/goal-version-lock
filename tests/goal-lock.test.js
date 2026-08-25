@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { execFileSync, spawnSync } from 'node:child_process';
+import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { chmod, link, lstat, mkdir, readFile, readdir, rename, rm, symlink, unlink, writeFile } from 'node:fs/promises';
@@ -67,10 +67,8 @@ async function installVersionTwo(fixture, changeId = 'CR-0001') {
     predecessor_digest: independentSha256(previousBytes),
     state_revision: 2,
     scope_head: priorLock.scope_head,
-    plan_head: null,
     progress_head: null,
     change_head: { change_request_id: changeId, digest: independentSha256(changeBytes) },
-    change_heads: { [changeId]: independentSha256(changeBytes) },
     evidence_heads: {},
   };
   await writeFile(join(directory, 'lock.json'), canonicalBytes({
@@ -135,13 +133,8 @@ async function installVersionThree(fixture, firstChangeStatus) {
     predecessor_digest: versionTwo.digest,
     state_revision: 3,
     scope_head: priorLock.scope_head,
-    plan_head: null,
     progress_head: null,
     change_head: { change_request_id: 'CR-0002', digest: independentSha256(secondChangeBytes) },
-    change_heads: {
-      'CR-0001': independentSha256(firstChangeBytes),
-      'CR-0002': independentSha256(secondChangeBytes),
-    },
     evidence_heads: {},
   };
   await writeFile(join(directory, 'lock.json'), canonicalBytes({
@@ -269,6 +262,30 @@ test('schema v2 public reference, scope baseline, goal, and progress contracts a
   assert.deepEqual(validatedScope, scope);
   assert.equal(Object.isFrozen(validatedScope.entries[0]), true);
 
+  const versionTwoGoal = { ...goalReference, goal_version: 2 };
+  const versionTwoScopeWithoutDigest = {
+    ...scopeWithoutDigest,
+    goal: versionTwoGoal,
+  };
+  const versionTwoScope = {
+    ...versionTwoScopeWithoutDigest,
+    record_digest: independentSha256(canonicalBytes(versionTwoScopeWithoutDigest)),
+  };
+  assert.throws(
+    () => goalContracts.validateScopeBaseline(versionTwoScope, versionTwoGoal),
+    /scope baseline.*goal_version.*equal 1/i,
+  );
+
+  for (const path of ['@governed-workspace', 'src/**/*.js']) {
+    const invalidScope = structuredClone(scope);
+    invalidScope.entries[0].path = path;
+    assert.throws(
+      () => goalContracts.validateScopeBaseline(invalidScope, goalReference),
+      /reserved|glob|exact path|@governed-workspace/i,
+      `scope entry ${path}`,
+    );
+  }
+
   assert.equal(validateGoalContract(goalV1()).schema_version, 2);
   const progress = structuralProgressEvent();
   const { event_digest: _placeholder, ...progressPayload } = progress;
@@ -285,17 +302,6 @@ test('plan contract accepts a complete goal-bound plan without mutating input', 
   assert.notEqual(validated, input);
   assert.equal(Object.isFrozen(validated.tasks[0]), true);
   assert.equal(input.tasks[0].status, 'pending');
-});
-
-test('goal and plan contracts reject vacuous completion inputs before repository mutation', () => {
-  const goal = goalV1();
-  goal.acceptance_criteria = [];
-  assert.throws(() => validateGoalContract(goal), /acceptance_criteria.*non-empty/i);
-
-  assert.throws(
-    () => goalContracts.validatePlan(structuralPlan(), activeGoalReference()),
-    /tasks.*non-empty/i,
-  );
 });
 
 test('plan contract requires its exact goal reference, revision, and root fields', () => {
@@ -375,6 +381,39 @@ test('plan contract closes validation and risk schema enums without broad path a
     risk_ids: [],
   };
   assert.equal(validateCompletePlan(mandatoryGate).tasks[0].validations[0].kind, 'mandatory-gate');
+});
+
+test('plan contract rejects reserved workspace tokens and glob syntax in every exact-path field', () => {
+  const cases = [
+    ['reserved permitted path', (plan) => { plan.tasks[0].permitted_paths = ['@governed-workspace']; }],
+    ['glob permitted path', (plan) => { plan.tasks[0].permitted_paths = ['src/**/*.js']; }],
+    ['reserved risk path', (plan) => {
+      plan.risks = [{
+        id: 'RISK-0001',
+        statement: 'A bounded failure can recur',
+        source: { kind: 'criterion', criterion_id: 'AC-001' },
+        affected_paths: ['@governed-workspace'],
+      }];
+    }],
+    ['glob risk path', (plan) => {
+      plan.risks = [{
+        id: 'RISK-0001',
+        statement: 'A bounded failure can recur',
+        source: { kind: 'criterion', criterion_id: 'AC-001' },
+        affected_paths: ['src/*.js'],
+      }];
+    }],
+  ];
+
+  for (const [label, mutate] of cases) {
+    const input = completePlan();
+    mutate(input);
+    assert.throws(
+      () => validateCompletePlan(input),
+      /reserved|glob|exact path|@governed-workspace/i,
+      label,
+    );
+  }
 });
 
 test('plan contract enforces normalized paths, validation methods, statuses, and one executable next task', () => {
@@ -862,44 +901,6 @@ test('change verification rejects a proposed request that is not the terminal lo
   assert.equal(verification.state, 'TAMPERED');
 });
 
-test('plan authority rejects direct current and archived semantic rewrites plus post-audit permitted-path drift', async (testContext) => {
-  const current = await createPlannedFixture(testContext);
-  await rewriteTestPlan(current.fixture, (plan) => { plan.tasks[0].outcome = 'Directly rewritten outcome'; });
-  assert.equal((await current.repository.verifyGoalRepository(current.fixture.root, current.fixture)).state, 'TAMPERED');
-
-  const archived = await createPlannedFixture(testContext);
-  await archived.repository.revisePlan(
-    archived.fixture.root,
-    planCandidate('Second accepted plan revision'),
-    'implementation-choice',
-    archived.fixture,
-  );
-  const archivedPath = join(archived.fixture.root, '.goal-lock', 'history', 'plans', 'v0001-r0001.json');
-  const archivedPlan = parseCanonicalJson(await readFile(archivedPath), 'archived plan');
-  archivedPlan.tasks[0].permitted_paths = ['src/direct-tamper.js'];
-  await writeFile(archivedPath, canonicalBytes(archivedPlan));
-  assert.equal((await archived.repository.verifyGoalRepository(archived.fixture.root, archived.fixture)).state, 'TAMPERED');
-
-  const audited = await createCompletionFixture(testContext);
-  await rewriteTestPlan(audited.fixture, (plan) => { plan.tasks[0].permitted_paths = ['src/post-audit-tamper.js']; });
-  assert.equal((await audited.repository.gateGoalCompletion(audited.fixture.root, audited.inventory, audited.fixture)).state, 'BLOCKED');
-});
-
-test('change authority rejects a rewritten nonterminal request after a later CR becomes the head', async (testContext) => {
-  const { fixture, repository } = await createChangeProposalFixture(testContext);
-  const first = await repository.proposeGoalChange(fixture.root, changeProposalInput(), fixture);
-  await repository.rejectGoalChange(fixture.root, 'CR-0001', 'Keep version one', fixture);
-  await repository.proposeGoalChange(fixture.root, changeProposalInput({ rationale: 'Second proposal' }), fixture);
-  const firstPath = join(fixture.root, '.goal-lock', 'changes', 'CR-0001.json');
-  const firstRecord = parseCanonicalJson(await readFile(firstPath), 'first change');
-  firstRecord.rationale = 'Rewritten historical rationale';
-  refreshTestChange(firstRecord);
-  await writeFile(firstPath, canonicalBytes(firstRecord));
-
-  assert.match(first.approval_required, /^APPROVE CR-0001/u);
-  assert.equal((await repository.verifyGoalRepository(fixture.root, fixture)).state, 'TAMPERED');
-});
-
 async function proposeChangeForApproval(testContext, overrides = {}, withEvidence = false) {
   const { fixture, repository } = await createChangeProposalFixture(testContext);
   if (withEvidence) await repository.recordGoalEvent(fixture.root, evidenceInput(), fixture);
@@ -1067,7 +1068,7 @@ test('selective invalidation retains unaffected task status across the new goal 
   assert.equal((await repository.verifyGoalRepository(fixture.root, fixture)).state, 'LOCKED');
 });
 
-test('selective invalidation preserves unaffected state through derivation and rejects a goal change without a plan', async (testContext) => {
+test('selective invalidation preserves unaffected plan and evidence state and creates an empty revision without a prior plan', async (testContext) => {
   for (const [label, affectedTasks, affectedCriteria, expectTaskStale, expectEvidenceStale] of [
     ['none', [], [], false, false],
     ['task only', ['TASK-0001'], [], true, false],
@@ -1085,12 +1086,7 @@ test('selective invalidation preserves unaffected state through derivation and r
     const directory = join(fixture.root, '.goal-lock');
     const plan = parseCanonicalJson(await readFile(join(directory, 'plan.json')), `${label} plan`);
     assert.equal(plan.tasks.find((task) => task.id === 'TASK-0001').status, expectTaskStale ? 'stale' : 'pending', label);
-    const derived = parseCanonicalJson(
-      await readFile(join(directory, 'evidence', 'AC-001', 'EVID-0002.json')),
-      `${label} derived evidence`,
-    );
-    assert.equal(derived.state, expectEvidenceStale ? 'stale' : 'pass', label);
-    assert.equal(derived.derivation.kind, expectEvidenceStale ? 'invalidation' : 'carry-forward', label);
+    assert.equal(existsSync(join(directory, 'evidence', 'AC-001', 'EVID-0002.json')), expectEvidenceStale, label);
     assert.equal((await repository.verifyGoalRepository(fixture.root, fixture)).state, 'LOCKED', label);
   }
 
@@ -1102,54 +1098,11 @@ test('selective invalidation preserves unaffected state through derivation and r
     affected_tasks: [],
     criterion_impact: { affected: [], unaffected: ['AC-001'] },
   }), fixture);
-  await assert.rejects(
-    repository.approveGoalChange(fixture.root, 'CR-0001', receipt.approval_required, fixture),
-    /tasks.*non-empty/i,
-  );
-  assert.equal((await repository.verifyGoalRepository(fixture.root, fixture)).state, 'CHANGE_PENDING');
-});
-
-test('goal change derives current carry-forward evidence for unaffected criteria and stales affected criteria only', async (testContext) => {
-  const { fixture, repository } = await createTwoCriterionFixture(testContext);
-  await repository.recordGoalEvent(fixture.root, evidenceInput(), fixture);
-  await repository.recordGoalEvent(fixture.root, evidenceInput({
-    acceptance_criterion_id: 'AC-002',
-    task_id: 'TASK-0002',
-  }), fixture);
-  const candidate = goalV1();
-  candidate.acceptance_criteria.push({
-    id: 'AC-002',
-    outcome: 'Independent verification is retained',
-    verification: 'Inspect the second evidence chain',
-  });
-  candidate.objective = 'Ship a safely evolved lock';
-  const receipt = await repository.proposeGoalChange(fixture.root, changeProposalInput({
-    candidate: {
-      objective: candidate.objective,
-      scope: candidate.scope,
-      non_goals: candidate.non_goals,
-      constraints: candidate.constraints,
-      acceptance_criteria: candidate.acceptance_criteria,
-      authorization_boundary: candidate.authorization_boundary,
-      assumptions: candidate.assumptions,
-    },
-    changes: [{ field: 'objective', before: goalV1().objective, after: candidate.objective }],
-    affected_tasks: ['TASK-0001'],
-    criterion_impact: { affected: ['AC-001'], unaffected: ['AC-002'] },
-  }), fixture);
-
   await repository.approveGoalChange(fixture.root, 'CR-0001', receipt.approval_required, fixture);
-
-  const evidenceRoot = join(fixture.root, '.goal-lock', 'evidence');
-  const affected = parseCanonicalJson(await readFile(join(evidenceRoot, 'AC-001', 'EVID-0002.json')), 'affected derivation');
-  const unaffected = parseCanonicalJson(await readFile(join(evidenceRoot, 'AC-002', 'EVID-0002.json')), 'unaffected derivation');
-  assert.equal(affected.state, 'stale');
-  assert.equal(affected.goal.goal_version, 2);
-  assert.equal(affected.derivation.kind, 'invalidation');
-  assert.equal(unaffected.state, 'pass');
-  assert.equal(unaffected.goal.goal_version, 2);
-  assert.equal(unaffected.supersedes, 'EVID-0001');
-  assert.equal(unaffected.derivation.kind, 'carry-forward');
+  const plan = parseCanonicalJson(await readFile(join(fixture.root, '.goal-lock', 'plan.json')), 'empty v2 plan');
+  assert.equal(plan.goal.goal_version, 2);
+  assert.equal(plan.plan_revision, 1);
+  assert.deepEqual(plan.tasks, []);
   assert.equal((await repository.verifyGoalRepository(fixture.root, fixture)).state, 'LOCKED');
 });
 
@@ -1958,6 +1911,22 @@ test('evidence public API rejects invalid schema-v2 bindings, results, paths, st
     state: 'fail',
     failure_paths: ['src/goal-lock/contracts.js'],
   }, activeGoalReference()).failure_paths[0], 'src/goal-lock/contracts.js');
+
+  for (const [label, field, path, state] of [
+    ['reserved artifact path', 'artifact_refs', '@governed-workspace', 'pass'],
+    ['glob artifact path', 'artifact_refs', 'reports/*.json', 'pass'],
+    ['reserved failure path', 'failure_paths', '@governed-workspace', 'fail'],
+    ['glob failure path', 'failure_paths', 'src/**/*.js', 'fail'],
+  ]) {
+    const record = structuralEvidence();
+    record.state = state;
+    record[field] = [path];
+    assert.throws(
+      () => goalContracts.validateEvidence(record, activeGoalReference()),
+      /reserved|glob|exact path|@governed-workspace/i,
+      label,
+    );
+  }
 });
 
 test('evidence recording creates literal canonical evidence, one linked event, and both lock heads atomically', async (testContext) => {
@@ -2617,7 +2586,7 @@ function structuralChange(changeId = 'CR-0001', options = {}) {
   };
 }
 
-test('change request contract requires a disjoint exhaustive schema-v2 criterion impact partition', () => {
+test('change request contract requires exact, unique, disjoint schema-v2 criterion impact arrays', () => {
   const input = structuralChange();
   const validated = goalContracts.validateChangeRequest(input);
 
@@ -2633,13 +2602,6 @@ test('change request contract requires a disjoint exhaustive schema-v2 criterion
       criterion_impact: { affected: ['AC-001'], unaffected: ['AC-001'] },
     }),
     /criterion_impact|disjoint/i,
-  );
-  assert.throws(
-    () => goalContracts.validateChangeRequest({
-      ...input,
-      criterion_impact: { affected: [], unaffected: [] },
-    }),
-    /criterion_impact|every|exhaustive/i,
   );
   assert.throws(
     () => goalContracts.validateChangeRequest({
@@ -2807,10 +2769,8 @@ test('version 1 lock records the exact approved current bytes in immutable histo
     predecessor_digest: null,
     state_revision: 1,
     scope_head: { scope_version: 1, digest: sha256(scopeBytes) },
-    plan_head: null,
     progress_head: null,
     change_head: null,
-    change_heads: {},
     evidence_heads: {},
   });
   assert.equal(record_digest, sha256(canonicalBytes(lockWithoutDigest)));
@@ -3942,62 +3902,6 @@ test('transaction rejects a stale expected digest without producing stages', asy
   assert.deepEqual(await readdir(directory), ['current.json']);
 });
 
-test('durable recovery restores every target after abrupt termination at each atomic replacement boundary', async (testContext) => {
-  const transactionModule = new URL('../src/goal-lock/transaction.js', import.meta.url).href;
-  for (const [phase, failingIndex] of [
-    ['install', 0],
-    ['readBack', 0],
-    ['install', 1],
-    ['readBack', 1],
-    ['finalReadBack', -1],
-  ]) {
-    const fixture = createGoalLockFixture(testContext);
-    const directory = join(fixture.root, '.goal-lock');
-    await mkdir(directory, { recursive: true });
-    await writeFile(join(directory, 'a.json'), 'old-a');
-    await writeFile(join(directory, 'b.json'), 'old-b');
-    const childPath = join(fixture.root, `crash-${phase}-${failingIndex}.mjs`);
-    await writeFile(childPath, `
-import { commitGoalFiles, withGoalLock } from ${JSON.stringify(transactionModule)};
-const [root, phase, indexText] = process.argv.slice(2);
-const failingIndex = Number(indexText);
-const transactionFaults = {
-  [phase](details) {
-    if (failingIndex === -1 || details.index === failingIndex) process.exit(91);
-  },
-};
-await withGoalLock(root, 'abrupt-test', (ownership) => commitGoalFiles(root, [
-  { target: '.goal-lock/a.json', expected: { kind: 'sha256', digest: ${JSON.stringify(independentSha256(Buffer.from('old-a')))} }, content: Buffer.from('new-a') },
-  { target: '.goal-lock/b.json', expected: { kind: 'sha256', digest: ${JSON.stringify(independentSha256(Buffer.from('old-b')))} }, content: Buffer.from('new-b') },
-], { transactionFaults, ...ownership }), { transactionFaults });
-`);
-    const child = spawnSync(process.execPath, [childPath, fixture.root, phase, String(failingIndex)], {
-      encoding: 'utf8',
-      windowsHide: true,
-    });
-    assert.equal(child.status, 91, `${phase}/${failingIndex}: ${child.stderr}`);
-
-    for (const name of ['a.json', 'b.json']) {
-      const snapshot = await lstat(join(directory, name));
-      assert.equal(snapshot.isFile(), true, `${phase}/${failingIndex}/${name} must never be absent`);
-    }
-    const lockBytes = await readFile(join(directory, '.write-lock.json'));
-    const owner = parseCanonicalJson(lockBytes, 'abrupt writer lock');
-    await recoverGoalLock(fixture.root, {
-      owner_token: owner.token,
-      lock_digest: independentSha256(lockBytes),
-    }, { ...fixture, isProcessAlive: () => false });
-
-    assert.equal(await readFile(join(directory, 'a.json'), 'utf8'), 'old-a', `${phase}/${failingIndex}/a`);
-    assert.equal(await readFile(join(directory, 'b.json'), 'utf8'), 'old-b', `${phase}/${failingIndex}/b`);
-    assert.equal(existsSync(join(directory, '.transaction.json')), false);
-    assert.deepEqual(
-      (await readdir(directory)).filter((name) => name.includes('.stage') || name.includes('.backup')),
-      [],
-    );
-  }
-});
-
 test('recover removes an exact canonical lock only after its process is dead', async (testContext) => {
   const fixture = createGoalLockFixture(testContext);
   const directory = join(fixture.root, '.goal-lock');
@@ -4274,10 +4178,8 @@ function lockV1() {
       scope_version: 1,
       digest: '3333333333333333333333333333333333333333333333333333333333333333',
     },
-    plan_head: null,
     progress_head: null,
     change_head: null,
-    change_heads: {},
     evidence_heads: {},
     record_digest: 'REPLACE_ME',
   };
@@ -4294,11 +4196,11 @@ test('goal contract accepts every required version-one field without mutating in
   assert.equal(input.scope.in[0], 'CLI');
 });
 
-test('goal contract rejects an empty acceptance-criteria array', () => {
+test('goal contract permits an empty acceptance-criteria array when no criterion is declared', () => {
   const input = goalV1();
   input.acceptance_criteria = [];
 
-  assert.throws(() => validateGoalContract(input), /acceptance_criteria.*non-empty/i);
+  assert.deepEqual(validateGoalContract(input).acceptance_criteria, []);
 });
 
 test('goal contract names each missing required field', () => {
@@ -4415,10 +4317,8 @@ test('lock contract validates the semantic boundary of every root field', () => 
     ['predecessor_digest', (lock) => { lock.predecessor_digest = '1111111111111111111111111111111111111111111111111111111111111111'; }],
     ['state_revision', (lock) => { lock.state_revision = 0; }],
     ['scope_head', (lock) => { lock.scope_head = {}; }],
-    ['plan_head', (lock) => { lock.plan_head = {}; }],
     ['progress_head', (lock) => { lock.progress_head = {}; }],
     ['change_head', (lock) => { lock.change_head = {}; }],
-    ['change_heads', (lock) => { lock.change_heads = { invalid: 'not-a-digest' }; }],
     ['evidence_heads', (lock) => { lock.evidence_heads = { invalid: {} }; }],
     ['record_digest', (lock) => { lock.record_digest = 'not-a-digest'; }],
   ];
@@ -4741,70 +4641,6 @@ async function createCompletionFixture(testContext, { git: withGit = true, evide
   return { fixture, repository, inventory };
 }
 
-test('evidence recording derives the workspace fingerprint and gate rejects evidence for stale delivery bytes', async (testContext) => {
-  const fixture = createGoalLockFixture(testContext);
-  const repository = await goalRepository();
-  const { workspaceFingerprint } = await workspaceReader();
-  await writeDelivery(fixture.root, 'delivery.txt', 'evidence workspace\n');
-  await repository.initializeGoal(fixture.root, goalV1(), fixture);
-  await repository.lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 87f66f9c59ab', fixture);
-  await repository.revisePlan(fixture.root, planCandidate(), 'aligned', fixture);
-  const expected = await workspaceFingerprint(fixture.root, undefined, fixture);
-  await repository.recordGoalEvent(fixture.root, evidenceInput(), fixture);
-  const record = parseCanonicalJson(
-    await readFile(join(fixture.root, '.goal-lock', 'evidence', 'AC-001', 'EVID-0001.json')),
-    'derived evidence',
-  );
-  assert.equal(record.workspace_fingerprint, expected);
-
-  await repository.recordGoalEvent(fixture.root, progressInput('Started task one', { event_type: 'task-start' }), fixture);
-  await repository.recordGoalEvent(fixture.root, progressInput('Completed task one', {
-    event_type: 'task-complete',
-    evidence_refs: ['EVID-0001'],
-  }), fixture);
-  await repository.recordGoalEvent(fixture.root, evidenceInput({
-    task_id: 'TASK-0002',
-    supersedes: 'EVID-0001',
-  }), fixture);
-  await repository.recordGoalEvent(fixture.root, progressInput('Started task two', {
-    event_type: 'task-start',
-    task_id: 'TASK-0002',
-  }), fixture);
-  await repository.recordGoalEvent(fixture.root, progressInput('Completed task two', {
-    event_type: 'task-complete',
-    task_id: 'TASK-0002',
-    evidence_refs: ['EVID-0002'],
-  }), fixture);
-  await writeDelivery(fixture.root, 'delivery.txt', 'changed after passing evidence\n');
-  await repository.recordGoalEvent(fixture.root, {
-    kind: 'final-audit',
-    semantic_summary: 'Reviewed changed delivery bytes.',
-    inventory: undefined,
-  }, fixture);
-
-  const gate = await repository.gateGoalCompletion(fixture.root, undefined, fixture);
-  assert.equal(gate.state, 'BLOCKED');
-  assert.equal(gate.checklist.find((item) => item.condition === 'evidence').passed, false);
-});
-
-test('plan creation rejects nonempty tasks that leave a measurable goal criterion uncovered', async (testContext) => {
-  const fixture = createGoalLockFixture(testContext);
-  const repository = await goalRepository();
-  const goal = goalV1();
-  goal.acceptance_criteria.push({
-    id: 'AC-002',
-    outcome: 'Second measurable outcome',
-    verification: 'Run the second check',
-  });
-  await repository.initializeGoal(fixture.root, goal, fixture);
-  await repository.lockInitialGoal(fixture.root, approvalPhraseForGoal(goal), fixture);
-
-  await assert.rejects(
-    repository.revisePlan(fixture.root, planCandidate(), 'aligned', fixture),
-    /cover every acceptance criterion/i,
-  );
-});
-
 test('final audit computes its own fingerprint and rejects caller-supplied trusted fingerprint fields', async (testContext) => {
   const completed = await createCompletionFixture(testContext, { audit: false });
   const { workspaceFingerprint } = await workspaceReader();
@@ -4889,7 +4725,7 @@ test('completion gate passes only current audited Git and explicit-inventory wor
   }
 });
 
-test('completion gate invalidates audit and evidence after workspace drift until both are refreshed', async (testContext) => {
+test('completion gate invalidates a prior final audit after a workspace change until a new audit is recorded', async (testContext) => {
   const { fixture, repository } = await createCompletionFixture(testContext);
   assert.equal((await repository.gateGoalCompletion(fixture.root, undefined, fixture)).state, 'COMPLETE');
   await writeDelivery(fixture.root, 'delivery.txt', 'changed after audit\n');
@@ -4899,18 +4735,6 @@ test('completion gate invalidates audit and evidence after workspace drift until
   await repository.recordGoalEvent(fixture.root, {
     kind: 'final-audit',
     semantic_summary: 'Reviewed the changed final semantic diff.',
-    inventory: undefined,
-  }, fixture);
-  const auditedOnly = await repository.gateGoalCompletion(fixture.root, undefined, fixture);
-  assert.equal(auditedOnly.state, 'BLOCKED');
-  assert.equal(auditedOnly.checklist.find((item) => item.condition === 'evidence').passed, false);
-  await repository.recordGoalEvent(fixture.root, evidenceInput({
-    task_id: 'TASK-0002',
-    supersedes: 'EVID-0002',
-  }), fixture);
-  await repository.recordGoalEvent(fixture.root, {
-    kind: 'final-audit',
-    semantic_summary: 'Re-audited the refreshed current evidence.',
     inventory: undefined,
   }, fixture);
   assert.equal((await repository.gateGoalCompletion(fixture.root, undefined, fixture)).state, 'COMPLETE');

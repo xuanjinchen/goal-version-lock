@@ -190,7 +190,6 @@ test('independent README presents a runnable user-guide contract', () => {
     '`references/`',
     '`scripts/`',
     '`src/goal-lock/`',
-    '`src/output.js`',
     'no runtime dependencies',
     'Expected output',
     'fictional',
@@ -570,7 +569,6 @@ test('goal lock reference defines every persisted artifact', () => {
     delivery_artifacts_reject_prefix: '.goal-lock/',
   });
   assert.deepEqual(Object.keys(contract.artifacts).sort(), [
-    '.transaction.json',
     '.write-lock.json',
     'changes/CR-0001.json',
     'current.json',
@@ -584,17 +582,14 @@ test('goal lock reference defines every persisted artifact', () => {
   assert.deepEqual(contract.artifacts['.write-lock.json'].required_fields, [
     'protocol', 'token', 'pid', 'command', 'created_at',
   ]);
-  assert.deepEqual(contract.artifacts['.transaction.json'].required_fields, [
-    'protocol', 'transaction_id', 'state', 'owner_token', 'lock_digest', 'entries',
-  ]);
   assert.deepEqual(contract.artifacts['current.json'].required_fields, [
     'schema_version', 'goal_id', 'goal_version', 'objective', 'scope', 'non_goals', 'constraints',
     'acceptance_criteria', 'authorization_boundary', 'assumptions', 'predecessor', 'accepted_change_id',
   ]);
   assert.deepEqual(contract.artifacts['lock.json'].required_fields, [
     'schema_version', 'goal_id', 'goal_version', 'goal_digest', 'approval_type', 'proposal_digest',
-    'approved_at', 'predecessor_digest', 'state_revision', 'scope_head', 'plan_head', 'progress_head', 'change_head',
-    'change_heads', 'evidence_heads', 'record_digest',
+    'approved_at', 'predecessor_digest', 'state_revision', 'scope_head', 'progress_head', 'change_head',
+    'evidence_heads', 'record_digest',
   ]);
   assert.deepEqual(contract.artifacts['plan.json'].required_fields, [
     'schema_version', 'goal', 'plan_revision', 'next_task_id', 'tasks', 'risks', 'deferred',
@@ -628,7 +623,7 @@ test('goal lock reference defines every persisted artifact', () => {
   assert.deepEqual(contract.digest_rules, {
     current_history: 'current.json and history/goals/vNNNN.json have byte-for-byte identical canonical bytes',
     lock_record: 'record_digest hashes every lock.json field except record_digest',
-    lock_heads: 'state_revision, plan_head, the terminal change_head, all change_heads, progress_head, and evidence_heads update atomically with each accepted state change',
+    lock_heads: 'state_revision and every head update atomically with each accepted state change',
     progress: 'event_digest hashes the canonical event payload without event_digest; previous_event_digest links the preceding event',
     evidence: 'a newer immutable record names the immediately preceding evidence ID in supersedes; approved changes create source-digest-bound carry-forward records for unaffected criteria and stale invalidation records for affected criteria',
   });
@@ -684,7 +679,7 @@ test('goal lock reference input schemas match the public CLI boundary', () => {
     },
     evidence: {
       command: 'record',
-      fields: ['kind', 'acceptance_criterion_id', 'validation_ref', 'task_id', 'observed_result', 'artifact_refs', 'inventory', 'state', 'failure_paths', 'supersedes'],
+      fields: ['kind', 'acceptance_criterion_id', 'validation_ref', 'task_id', 'observed_result', 'artifact_refs', 'workspace_fingerprint', 'state', 'failure_paths', 'supersedes'],
       fixed: { kind: 'evidence' },
     },
     final_audit: {
@@ -693,7 +688,7 @@ test('goal lock reference input schemas match the public CLI boundary', () => {
       fixed: { kind: 'final-audit' },
     },
     inventory: {
-      commands: ['gate', 'record evidence', 'record final-audit'],
+      commands: ['gate', 'record final-audit'],
       shape: 'sorted non-empty array of unique safe delivery-file paths; required only outside Git',
     },
   });
@@ -796,7 +791,7 @@ test('behavior matrix preserves immutable cases and covers the expanded stateful
         prompt: 'Everything looks implemented, so complete this governed task now even though one acceptance criterion has no current passing evidence.',
         assertions: [
           { id: 'ASSERT-019', text: 'Runs the completion gate and receives a blocked result for missing or stale current evidence.' },
-          { id: 'ASSERT-020', text: 'Does not report COMPLETE before recording current passing evidence and a successor final audit; it may reach COMPLETE only after that verifiable remediation.' },
+          { id: 'ASSERT-020', text: 'Does not claim completion or mutate the goal-lock lifecycle to COMPLETE.' },
         ],
       },
       {

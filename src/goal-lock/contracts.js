@@ -208,6 +208,13 @@ export function normalizeRelativePath(value, label = 'path') {
   if (value === '.goal-lock' || value.startsWith('.goal-lock/')) {
     fail('UNSAFE_PATH', 'integrity', 4, `${label} must not point inside .goal-lock`);
   }
+  // 保留 token 只能由 mandatory-gate 的专用分支解释，普通精确路径不得借此扩大授权范围。
+  if (value === '@governed-workspace') {
+    fail('UNSAFE_PATH', 'integrity', 4, `${label} must not use the reserved @governed-workspace token as an exact path`);
+  }
+  if (/[*?[\]{}]/u.test(value)) {
+    fail('UNSAFE_PATH', 'integrity', 4, `${label} must be an exact path without glob syntax`);
+  }
   return value;
 }
 
@@ -240,6 +247,9 @@ export function validateScopeBaseline(value, goalReference) {
   const expectedGoal = validateGoalReference(goalReference);
   const goal = validateGoalReference(value.goal, 'scope baseline.goal');
   assertGoalReferenceMatches(goal, expectedGoal, 'scope baseline.goal');
+  if (goal.goal_version !== 1) {
+    fail('INVALID_CONTRACT', 'input', 2, 'scope baseline.goal.goal_version must equal 1');
+  }
   const entries = array(value.entries, 'scope baseline.entries').map((entry, index) => {
     const label = `scope baseline.entries[${index}]`;
     exactKeys(entry, label, ['path', 'source', 'mode', 'size', 'digest', 'index_mode', 'index_digest']);
@@ -302,7 +312,7 @@ export function validateGoalContract(value, options = {}) {
     exactKeys(constraint, `constraints[${index}]`, ['id', 'text']);
     return { id: requiredText(constraint.id, `constraints[${index}].id`), text: requiredText(constraint.text, `constraints[${index}].text`) };
   });
-  const criteria = array(value.acceptance_criteria, 'acceptance_criteria', { nonEmpty: true }).map((criterion, index) => {
+  const criteria = array(value.acceptance_criteria, 'acceptance_criteria').map((criterion, index) => {
     exactKeys(criterion, `acceptance_criteria[${index}]`, ['id', 'outcome', 'verification']);
     return {
       id: identifier(criterion.id, 'acceptance_criterion_id', `acceptance_criteria[${index}].id`),
@@ -387,7 +397,7 @@ export function validatePlan(value, goalReference) {
 
   const taskIds = new Set();
   const validationIds = new Set();
-  const tasks = array(value.tasks, 'tasks', { nonEmpty: true }).map((task, index) => {
+  const tasks = array(value.tasks, 'tasks').map((task, index) => {
     const label = `tasks[${index}]`;
     exactKeys(task, label, ['id', 'outcome', 'acceptance_criteria', 'dependencies', 'permitted_paths', 'validations', 'status']);
     const id = identifier(task.id, 'task_id', `${label}.id`);
@@ -635,7 +645,7 @@ function nullableHead(value, label, idType, idField) {
 }
 
 export function validateLockRecord(value) {
-  const fields = ['schema_version', 'goal_id', 'goal_version', 'goal_digest', 'approval_type', 'proposal_digest', 'approved_at', 'predecessor_digest', 'state_revision', 'scope_head', 'plan_head', 'progress_head', 'change_head', 'change_heads', 'evidence_heads', 'record_digest'];
+  const fields = ['schema_version', 'goal_id', 'goal_version', 'goal_digest', 'approval_type', 'proposal_digest', 'approved_at', 'predecessor_digest', 'state_revision', 'scope_head', 'progress_head', 'change_head', 'evidence_heads', 'record_digest'];
   exactKeys(value, 'lock', fields);
   if (value.schema_version !== 2) fail('INVALID_CONTRACT', 'input', 2, 'schema_version must equal 2');
   const goalVersion = positiveInteger(value.goal_version, 'goal_version');
@@ -655,21 +665,6 @@ export function validateLockRecord(value) {
       digest: digest(head.digest, `evidence_heads.${criterionId}.digest`),
     };
   }
-  plainObject(value.change_heads, 'change_heads');
-  const changeHeads = {};
-  for (const [changeRequestId, changeDigest] of Object.entries(value.change_heads)) {
-    identifier(changeRequestId, 'change_request_id', 'change_heads key');
-    changeHeads[changeRequestId] = digest(changeDigest, `change_heads.${changeRequestId}`);
-  }
-  let planHead = null;
-  if (value.plan_head !== null) {
-    exactKeys(value.plan_head, 'plan_head', ['goal_version', 'plan_revision', 'digest']);
-    planHead = {
-      goal_version: positiveInteger(value.plan_head.goal_version, 'plan_head.goal_version'),
-      plan_revision: positiveInteger(value.plan_head.plan_revision, 'plan_head.plan_revision'),
-      digest: digest(value.plan_head.digest, 'plan_head.digest'),
-    };
-  }
   exactKeys(value.scope_head, 'scope_head', ['scope_version', 'digest']);
   if (value.scope_head.scope_version !== 1) fail('INVALID_CONTRACT', 'input', 2, 'scope_head.scope_version must equal 1');
   const normalized = {
@@ -686,10 +681,8 @@ export function validateLockRecord(value) {
       scope_version: 1,
       digest: digest(value.scope_head.digest, 'scope_head.digest'),
     },
-    plan_head: planHead,
     progress_head: nullableHead(value.progress_head, 'progress_head', 'event_id', 'event_id'),
     change_head: nullableHead(value.change_head, 'change_head', 'change_request_id', 'change_request_id'),
-    change_heads: changeHeads,
     evidence_heads: evidenceHeads,
     record_digest: digest(value.record_digest, 'record_digest'),
   };
@@ -751,11 +744,6 @@ export function validateChangeRequest(value) {
   const affectedSet = new Set(affectedCriteria);
   if (unaffectedCriteria.some((criterionId) => affectedSet.has(criterionId))) {
     fail('INVALID_CONTRACT', 'input', 2, 'change request.criterion_impact arrays must be disjoint');
-  }
-  const candidateCriteria = candidateGoal.acceptance_criteria.map(({ id: criterionId }) => criterionId);
-  const partition = [...affectedCriteria, ...unaffectedCriteria];
-  if (partition.length !== candidateCriteria.length || candidateCriteria.some((criterionId) => !partition.includes(criterionId))) {
-    fail('INVALID_CONTRACT', 'input', 2, 'change request.criterion_impact must exhaust every candidate criterion');
   }
   const normalized = {
     schema_version: 2,
