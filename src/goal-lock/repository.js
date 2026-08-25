@@ -1074,7 +1074,7 @@ export async function initializeGoal(root, draft, context = {}) {
         target: '.goal-lock/current.json',
         expected: { kind: 'absent' },
         content: currentBytes,
-      }], context);
+      }], { ...context, ...ownership });
       return {
         state: 'DRAFT',
         goal_id: goal.goal_id,
@@ -1492,7 +1492,7 @@ export async function revisePlan(root, candidate, classification, context = {}) 
   }
   validatePlanCandidate(candidate);
 
-  return withGoalLock(root, 'plan', async () => {
+  return withGoalLock(root, 'plan', async (ownership) => {
     const snapshot = await verifyGoalRepository(root, {
       ...context,
       mutating: true,
@@ -1555,7 +1555,7 @@ export async function revisePlan(root, candidate, classification, context = {}) 
       content: canonicalBytes(nextLock),
     });
     await reader.verifyInputs();
-    await commitGoalFiles(root, entries, context);
+    await commitGoalFiles(root, entries, { ...context, ...ownership });
     return {
       state: 'LOCKED',
       goal_id: current.goal.goal_id,
@@ -1570,7 +1570,7 @@ export async function revisePlan(root, candidate, classification, context = {}) 
 /** 记录一个派生封装的进度事件，并原子更新任务状态、账本和锁索引。 */
 export async function recordGoalEvent(root, input, context = {}) {
   validateGoalEventInput(input);
-  return withGoalLock(root, 'record', async () => {
+  return withGoalLock(root, 'record', async (ownership) => {
     const snapshot = await verifyGoalRepository(root, {
       ...context,
       mutating: true,
@@ -1623,7 +1623,7 @@ export async function recordGoalEvent(root, input, context = {}) {
         content: canonicalBytes(nextLockForEvent(lockInput, event)),
       });
       // 已夹持复验的指纹与 progress head 同事务安装，调用方无法注入可信摘要。
-      await commitGoalFiles(root, entries, context);
+      await commitGoalFiles(root, entries, { ...context, ...ownership });
       return {
         state: 'LOCKED',
         event_id: event.event_id,
@@ -1713,7 +1713,7 @@ export async function recordGoalEvent(root, input, context = {}) {
       });
       // 新证据、关联事件和两个 head 在一次最终复验后共同提交，失败时整体回滚。
       await reader.verifyInputs();
-      await commitGoalFiles(root, entries, context);
+      await commitGoalFiles(root, entries, { ...context, ...ownership });
       return {
         state: 'LOCKED',
         evidence_id: evidenceId,
@@ -1755,7 +1755,7 @@ export async function recordGoalEvent(root, input, context = {}) {
       content: canonicalBytes(nextLock),
     });
     await reader.verifyInputs();
-    await commitGoalFiles(root, entries, context);
+    await commitGoalFiles(root, entries, { ...context, ...ownership });
     return {
       state: 'LOCKED',
       event_id: event.event_id,
@@ -1873,7 +1873,7 @@ export async function gateGoalCompletion(root, inventory, context = {}) {
 
 export async function proposeGoalChange(root, input, context = {}) {
   validateChangeProposalInput(input);
-  return withGoalLock(root, 'change-propose', async () => {
+  return withGoalLock(root, 'change-propose', async (ownership) => {
     const snapshot = await verifyGoalRepository(root, {
       ...context,
       mutating: true,
@@ -1986,7 +1986,7 @@ export async function proposeGoalChange(root, input, context = {}) {
     });
     // 新 CR 与 change_head 共享一次 revision；完整快照作为只读所有权输入，失败时两项一起回滚。
     await reader.verifyInputs();
-    await commitGoalFiles(root, entries, context);
+    await commitGoalFiles(root, entries, { ...context, ...ownership });
     return {
       state: 'CHANGE_PENDING',
       change_request_id: changeRequestId,
@@ -2000,7 +2000,7 @@ export async function proposeGoalChange(root, input, context = {}) {
 
 export async function rejectGoalChange(root, changeRequestId, reason, context = {}) {
   validateChangeRejectionInput(changeRequestId, reason);
-  return withGoalLock(root, 'change-reject', async () => {
+  return withGoalLock(root, 'change-reject', async (ownership) => {
     const snapshot = await verifyGoalRepository(root, {
       ...context,
       mutating: true,
@@ -2037,7 +2037,7 @@ export async function rejectGoalChange(root, changeRequestId, reason, context = 
     });
     // CR 状态与 change_head 同属一次原子替换，任一所有权或安装失败都恢复原提案与原锁。
     await snapshot.reader.verifyInputs();
-    await commitGoalFiles(root, entries, context);
+    await commitGoalFiles(root, entries, { ...context, ...ownership });
     return {
       state: 'LOCKED',
       change_request_id: changeRequestId,
@@ -2048,7 +2048,7 @@ export async function rejectGoalChange(root, changeRequestId, reason, context = 
 }
 
 export async function approveGoalChange(root, changeRequestId, approval, context = {}) {
-  return withGoalLock(root, 'change-approve', async () => {
+  return withGoalLock(root, 'change-approve', async (ownership) => {
     let snapshot;
     try {
       snapshot = await verifyGoalRepository(root, {
@@ -2107,6 +2107,7 @@ export async function approveGoalChange(root, changeRequestId, approval, context
       deferred: priorPlan?.deferred ?? [],
     }, goalReference), candidate);
     const planBytes = canonicalBytes(plan);
+    const planDigest = sha256(planBytes);
 
     const events = [];
     let pendingProgress = { count: progressState.count, terminal: progressState.terminal };
@@ -2119,7 +2120,7 @@ export async function approveGoalChange(root, changeRequestId, approval, context
     appendEvent({
       event_type: 'plan-revision',
       task_id: null,
-      summary: 'Recorded plan revision 1',
+      summary: planRevisionSummary(candidate.goal_version, 1, planDigest, planState.current?.digest ?? null),
       evidence_refs: [],
     });
     appendEvent({
@@ -2299,7 +2300,7 @@ export async function approveGoalChange(root, changeRequestId, approval, context
 
     // 目标、历史、计划、证据、账本、CR 与索引必须共用一次安装；任一文件失败时事务恢复整个已验证快照。
     await snapshot.reader.verifyInputs();
-    await commitGoalFiles(root, entries, context);
+    await commitGoalFiles(root, entries, { ...context, ...ownership });
     const verification = await verifyGoalRepository(root, { ...context, [ACTIVE_WRITE]: true });
     if (verification.state !== 'LOCKED') {
       throw integrityError('APPROVED_CHANGE_VERIFICATION_FAILED', 'Approved goal change did not verify as locked.');
