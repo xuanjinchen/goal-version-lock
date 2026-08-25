@@ -25,7 +25,6 @@ import {
   createScopeBaseline,
   createWorkspaceReader,
   verifyScopeBaseline,
-  workspaceFingerprint,
   workspaceFingerprintFromManifest,
 } from './workspace.js';
 
@@ -1349,15 +1348,37 @@ function appendProgressEvents(progressState, events) {
   };
 }
 
-async function fingerprintAcrossRepositoryRevalidation(root, inventory, reader, context) {
-  const before = await workspaceFingerprint(root, inventory, context);
+async function verifiedScopeFacts(root, inventory, reader, snapshot, context) {
+  const before = await captureWorkspaceManifest(root, inventory ?? null, context);
   await reader.verifyInputs();
-  const after = await workspaceFingerprint(root, inventory, context);
-  // 仓库复验位于两次完整指纹之间，任一侧的 delivery 或 goal 输入变化都不能被签发为同一审计快照。
-  if (before !== after) {
+  const authorizationGraph = repositoryAuthorizationGraph(
+    snapshot.history,
+    snapshot.planState,
+    snapshot.evidenceState,
+    snapshot.changeState,
+  );
+  const currentManifest = await captureWorkspaceManifest(root, inventory ?? null, context);
+  await reader.verifyInputs();
+  // 审计绑定只来自同一稳定窗口内重建的权威图、清单和差异，不能混用两个时刻的事实。
+  if (before.manifest_digest !== currentManifest.manifest_digest) {
     throw integrityError('WORKSPACE_INPUT_CHANGED', 'Workspace inputs changed across repository revalidation.');
   }
-  return after;
+  const delta = computeWorkspaceDelta(snapshot.scope.scope.entries, currentManifest.entries);
+  const scopeBlockers = authorizationGraph
+    ? deriveScopeBlockers(authorizationGraph, delta.paths)
+    : [];
+  return {
+    authorizationGraph,
+    currentManifest,
+    delta,
+    scopeBlockers,
+    auditBinding: {
+      scope_digest: snapshot.lockInput.lock.scope_head.digest,
+      authorization_graph_digest: authorizationGraph?.digest ?? null,
+      delta_digest: delta.delta_digest,
+      workspace_fingerprint: workspaceFingerprintFromManifest(currentManifest),
+    },
+  };
 }
 
 async function authorizedWorkspaceFingerprint(root, inventory, reader, scope, graph, context) {
@@ -1598,16 +1619,23 @@ export async function recordGoalEvent(root, input, context = {}) {
       goal_digest: current.digest,
     };
     if (input.kind === 'final-audit') {
-      const fingerprint = await fingerprintAcrossRepositoryRevalidation(
+      const facts = await verifiedScopeFacts(
         root,
         input.inventory,
         reader,
+        snapshot,
         context,
       );
+      if (facts.scopeBlockers.length > 0) {
+        throw stateError(
+          'WORKSPACE_SCOPE_UNAUTHORIZED',
+          `Workspace delta includes unauthorized path ${facts.scopeBlockers[0].path}.`,
+        );
+      }
       const event = buildProgressEvent(progressState, goalReference, plan.plan_revision, {
         event_type: 'final-audit',
         task_id: null,
-        summary: `Final audit sha256:${fingerprint}: ${input.semantic_summary}`,
+        summary: `Final audit ${JSON.stringify(facts.auditBinding)}: ${input.semantic_summary}`,
         evidence_refs: [],
       }, context);
       const entries = verifiedHistoryEntries(current, history, planState);
@@ -1629,7 +1657,7 @@ export async function recordGoalEvent(root, input, context = {}) {
         event_id: event.event_id,
         event_digest: event.event_digest,
         event_type: event.event_type,
-        workspace_fingerprint: fingerprint,
+        ...facts.auditBinding,
         goal_id: current.goal.goal_id,
         goal_version: current.goal.goal_version,
         goal_digest: current.digest,
@@ -1770,15 +1798,16 @@ export async function recordGoalEvent(root, input, context = {}) {
 }
 
 const COMPLETION_CONDITIONS = Object.freeze([
-  'active_goal',
-  'change_requests',
-  'evidence',
-  'final_audit',
-  'plan',
-  'progress_ledger',
+  'integrity',
+  'change_control',
   'tasks',
-  'workspace_fingerprint',
-].sort());
+  'criteria_evidence',
+  'validation_trace',
+  'mandatory_gates',
+  'delivery_scope',
+  'final_audit',
+  'scope_blockers',
+]);
 
 function completionChecklist(results) {
   return COMPLETION_CONDITIONS.map((condition) => ({
@@ -1787,21 +1816,76 @@ function completionChecklist(results) {
   }));
 }
 
-function failedRepositoryCondition(code) {
-  if (code.startsWith('PLAN_')) return 'plan';
-  if (code.startsWith('PROGRESS_')) return 'progress_ledger';
-  if (code.startsWith('EVIDENCE_')) return 'evidence';
-  if (code.startsWith('CHANGE_')) return 'change_requests';
-  return 'active_goal';
+function failedRepositoryCondition(code, message) {
+  if (code.startsWith('CHANGE_')) return 'change_control';
+  if (code === 'AUTHORIZATION_DENIED' && /^Mandatory validation .+ accepted result$/u.test(message)) {
+    return 'mandatory_gates';
+  }
+  if (code.startsWith('AUTHORIZATION_')
+    || code.startsWith('EVIDENCE_')
+    || code.startsWith('PROGRESS_EVIDENCE_')) return 'validation_trace';
+  return 'integrity';
 }
 
-function auditedFingerprint(event) {
+function auditedBinding(event) {
   if (event?.event_type !== 'final-audit') return null;
-  const match = /^Final audit sha256:([a-f0-9]{64}): .+$/s.exec(event.summary);
-  return match?.[1] ?? null;
+  const match = /^Final audit (\{[^\r\n]+\}): .+$/s.exec(event.summary);
+  if (!match) return null;
+  try {
+    const binding = JSON.parse(match[1]);
+    const fields = ['scope_digest', 'authorization_graph_digest', 'delta_digest', 'workspace_fingerprint'];
+    if (Object.keys(binding).length !== fields.length
+      || fields.some((field) => !Object.hasOwn(binding, field))
+      || fields.some((field) => !/^[a-f0-9]{64}$/.test(binding[field]))) {
+      return null;
+    }
+    return binding;
+  } catch {
+    return null;
+  }
 }
 
-/** 仅证明当前 goal 状态、证据和语义审计满足门禁，不扩张为代码正确性或不可逆完成声明。 */
+function sameValidationReference(left, right) {
+  return left.goal_id === right.goal_id
+    && left.goal_version === right.goal_version
+    && left.goal_digest === right.goal_digest
+    && left.plan_revision === right.plan_revision
+    && left.validation_id === right.validation_id;
+}
+
+function mandatoryGatesPass(authorizationGraph, evidenceState, plan) {
+  if (!authorizationGraph || !plan) return false;
+  const mandatory = authorizationGraph.validations.filter((validation) => (
+    validation.kind === 'mandatory-gate'
+    && validation.validation_ref.goal_id === plan.goal.goal_id
+    && validation.validation_ref.goal_version === plan.goal.goal_version
+    && validation.validation_ref.goal_digest === plan.goal.goal_digest
+    && validation.validation_ref.plan_revision === plan.plan_revision
+  ));
+  if (mandatory.length !== 1) return false;
+  return mandatory.every((validation) => {
+    const accepted = evidenceState.records.filter((record) => (
+      sameValidationReference(record.value.validation_ref, validation.validation_ref)
+      && record.value.state !== 'stale'
+    ));
+    return accepted.length === 1
+      && accepted[0].value.state === 'pass'
+      && validation.evidence_bindings.length === 1
+      && validation.evidence_bindings[0].evidence_id === accepted[0].value.evidence_id
+      && validation.evidence_bindings[0].evidence_digest === accepted[0].digest;
+  });
+}
+
+function bindingsEqual(left, right) {
+  return left !== null
+    && right !== null
+    && left.scope_digest === right.scope_digest
+    && left.authorization_graph_digest === right.authorization_graph_digest
+    && left.delta_digest === right.delta_digest
+    && left.workspace_fingerprint === right.workspace_fingerprint;
+}
+
+/** 九项条件分别从当前权威事实求值，因此完成可在证据、工作区或授权变化后重新变为阻塞。 */
 export async function gateGoalCompletion(root, inventory, context = {}) {
   const results = Object.fromEntries(COMPLETION_CONDITIONS.map((condition) => [condition, false]));
   const snapshot = await verifyGoalRepository(root, {
@@ -1810,7 +1894,9 @@ export async function gateGoalCompletion(root, inventory, context = {}) {
   });
   if (!snapshot.result) {
     const issueCode = snapshot.evidence?.issues?.[0]?.code ?? 'GOAL_REPOSITORY_TAMPERED';
-    results[failedRepositoryCondition(issueCode)] = false;
+    const issueMessage = snapshot.evidence?.issues?.[0]?.message ?? '';
+    for (const condition of COMPLETION_CONDITIONS) results[condition] = true;
+    results[failedRepositoryCondition(issueCode, issueMessage)] = false;
     return {
       state: 'BLOCKED',
       goal: snapshot.evidence?.goal ?? null,
@@ -1827,37 +1913,41 @@ export async function gateGoalCompletion(root, inventory, context = {}) {
     evidenceState,
     changeState,
     reader,
+    authorizationGraph,
   } = snapshot;
-  results.active_goal = result.state !== 'DRAFT';
-  results.change_requests = changeState !== undefined && !changeState.pending;
-  results.plan = planState?.current !== null && planState?.current !== undefined;
-  results.progress_ledger = progressState !== undefined;
+  results.integrity = true;
+  results.change_control = changeState !== undefined && !changeState.pending;
   const plan = planState?.current?.value;
   results.tasks = Boolean(plan) && plan.tasks.every((task) => task.status === 'complete');
-  results.evidence = Boolean(plan) && current.goal.acceptance_criteria.every((criterion) => {
+  results.criteria_evidence = Boolean(plan) && current.goal.acceptance_criteria.every((criterion) => {
     const latest = evidenceState.latestByCriterion.get(criterion.id)?.value;
     return latest?.state === 'pass'
-      && latest.goal.goal_id === current.goal.goal_id
-      && latest.goal.goal_version === current.goal.goal_version
-      && latest.goal.goal_digest === current.digest
-      && latest.plan_revision === plan.plan_revision;
+      && latest.validation_ref.goal_id === current.goal.goal_id
+      && latest.validation_ref.goal_version === current.goal.goal_version
+      && latest.validation_ref.goal_digest === current.digest
+      && latest.validation_ref.plan_revision === plan.plan_revision;
   });
-  const auditFingerprint = auditedFingerprint(progressState?.terminal);
-  results.final_audit = auditFingerprint !== null
+  results.validation_trace = Boolean(plan && authorizationGraph && progressState);
+  results.mandatory_gates = mandatoryGatesPass(authorizationGraph, evidenceState, plan);
+  const audit = auditedBinding(progressState?.terminal);
+  const auditTargetsCurrentState = audit !== null
     && progressState.terminal.goal.goal_id === current.goal.goal_id
     && progressState.terminal.goal.goal_version === current.goal.goal_version
     && progressState.terminal.goal.goal_digest === current.digest
     && progressState.terminal.plan_revision === plan?.plan_revision;
 
-  let fingerprint = null;
-  if (results.active_goal && results.plan && results.progress_ledger) {
+  let facts = null;
+  if (plan && authorizationGraph && progressState) {
     try {
-      fingerprint = await fingerprintAcrossRepositoryRevalidation(root, inventory, reader, context);
-      results.workspace_fingerprint = results.final_audit && fingerprint === auditFingerprint;
+      facts = await verifiedScopeFacts(root, inventory, reader, snapshot, context);
+      results.delivery_scope = facts.scopeBlockers.length === 0;
+      results.scope_blockers = result.scope_blockers.length === 0 && facts.scopeBlockers.length === 0;
     } catch {
-      results.workspace_fingerprint = false;
+      results.delivery_scope = false;
+      results.scope_blockers = false;
     }
   }
+  results.final_audit = auditTargetsCurrentState && bindingsEqual(audit, facts?.auditBinding ?? null);
   const checklist = completionChecklist(results);
   return {
     state: checklist.every((item) => item.passed) ? 'COMPLETE' : 'BLOCKED',
@@ -1866,7 +1956,7 @@ export async function gateGoalCompletion(root, inventory, context = {}) {
       goal_version: current.goal.goal_version,
       goal_digest: current.digest,
     },
-    workspace_fingerprint: fingerprint,
+    workspace_fingerprint: facts?.auditBinding.workspace_fingerprint ?? null,
     checklist,
   };
 }

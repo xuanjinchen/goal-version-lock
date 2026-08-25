@@ -5209,35 +5209,104 @@ test('explicit-inventory fingerprint fails closed when an entry changes during c
   );
 });
 
-async function createCompletionFixture(testContext, { git: withGit = true, evidenceState = 'pass', audit = true } = {}) {
+const COMPLETION_CONDITION_NAMES = [
+  'integrity',
+  'change_control',
+  'tasks',
+  'criteria_evidence',
+  'validation_trace',
+  'mandatory_gates',
+  'delivery_scope',
+  'final_audit',
+  'scope_blockers',
+];
+
+async function createCompletionFixture(testContext, {
+  git: withGit = true,
+  focusedState = 'pass',
+  mandatoryResult = true,
+  audit = true,
+  completeTasks = true,
+} = {}) {
   const fixture = createGoalLockFixture(testContext, { git: withGit });
   const repository = await goalRepository();
+  const goal = goalV1();
+  goal.acceptance_criteria.push({
+    id: 'AC-002',
+    outcome: 'The final mandatory validation is accepted once',
+    verification: 'Run the declared delivery gate',
+  });
+  const goalReference = {
+    goal_id: goal.goal_id,
+    goal_version: goal.goal_version,
+    goal_digest: independentSha256(canonicalBytes(goal)),
+  };
   await writeDelivery(fixture.root, 'delivery.txt', 'accepted delivery\n');
-  await repository.initializeGoal(fixture.root, goalV1(), fixture);
-  await repository.lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 87f66f9c59ab', fixture);
-  await repository.revisePlan(fixture.root, planCandidate(), 'aligned', fixture);
+  if (!withGit) fixture.inventory = ['delivery.txt'];
+  await repository.initializeGoal(fixture.root, goal, fixture);
+  await repository.lockInitialGoal(fixture.root, approvalPhraseForGoal(goal), fixture);
+  const candidate = planCandidate();
+  candidate.tasks[1].acceptance_criteria = ['AC-002'];
+  candidate.tasks[1].validations = [{
+    id: 'VAL-0002',
+    kind: 'focused',
+    method: { type: 'deterministic-test', target: 'goal-lock-final-focused' },
+    affected_paths: ['tests/goal-lock.test.js'],
+    criterion_ids: ['AC-002'],
+    risk_ids: [],
+  }, {
+    id: 'VAL-0003',
+    kind: 'mandatory-gate',
+    method: { type: 'delivery-gate', target: 'goal-lock-delivery-gate' },
+    affected_paths: ['@governed-workspace'],
+    criterion_ids: ['AC-002'],
+    risk_ids: [],
+  }];
+  await repository.revisePlan(fixture.root, candidate, 'aligned', fixture);
   const inventory = withGit ? undefined : ['delivery.txt'];
-  await repository.recordGoalEvent(fixture.root, evidenceInput({ state: evidenceState, inventory }), fixture);
-  await repository.recordGoalEvent(fixture.root, progressInput('Started task one', { event_type: 'task-start' }), fixture);
-  await repository.recordGoalEvent(fixture.root, progressInput('Completed task one', {
-    event_type: 'task-complete',
-    evidence_refs: ['EVID-0001'],
-  }), fixture);
   await repository.recordGoalEvent(fixture.root, evidenceInput({
-    task_id: 'TASK-0002',
-    state: evidenceState,
-    supersedes: 'EVID-0001',
+    validation_ref: { ...goalReference, plan_revision: 1, validation_id: 'VAL-0001' },
+    state: focusedState,
     inventory,
   }), fixture);
-  await repository.recordGoalEvent(fixture.root, progressInput('Started task two', {
-    event_type: 'task-start',
+  if (completeTasks) {
+    await repository.recordGoalEvent(fixture.root, progressInput('Started task one', { event_type: 'task-start' }), fixture);
+    await repository.recordGoalEvent(fixture.root, progressInput('Completed task one', {
+      event_type: 'task-complete',
+      evidence_refs: ['EVID-0001'],
+    }), fixture);
+  }
+  await repository.recordGoalEvent(fixture.root, evidenceInput({
+    acceptance_criterion_id: 'AC-002',
     task_id: 'TASK-0002',
+    validation_ref: { ...goalReference, plan_revision: 1, validation_id: 'VAL-0002' },
+    observed_result: 'The final focused validation passed',
+    artifact_refs: ['tests/goal-lock.test.js'],
+    supersedes: null,
+    inventory,
   }), fixture);
-  await repository.recordGoalEvent(fixture.root, progressInput('Completed task two', {
-    event_type: 'task-complete',
-    task_id: 'TASK-0002',
-    evidence_refs: ['EVID-0002'],
-  }), fixture);
+  if (mandatoryResult) {
+    await repository.recordGoalEvent(fixture.root, evidenceInput({
+      acceptance_criterion_id: 'AC-002',
+      task_id: 'TASK-0002',
+      validation_ref: { ...goalReference, plan_revision: 1, validation_id: 'VAL-0003' },
+      observed_result: 'The mandatory delivery gate passed once',
+      artifact_refs: ['tests/goal-lock.test.js'],
+      supersedes: 'EVID-0001',
+      inventory,
+    }), fixture);
+  }
+  if (completeTasks) {
+    await repository.recordGoalEvent(fixture.root, progressInput('Started task two', {
+      event_type: 'task-start',
+      task_id: 'TASK-0002',
+    }), fixture);
+    await repository.recordGoalEvent(fixture.root, progressInput('Completed task two', {
+      event_type: 'task-complete',
+      task_id: 'TASK-0002',
+      evidence_refs: [mandatoryResult ? 'EVID-0002' : 'EVID-0001'],
+    }), fixture);
+  }
   if (audit) {
     await repository.recordGoalEvent(fixture.root, {
       kind: 'final-audit',
@@ -5245,19 +5314,122 @@ async function createCompletionFixture(testContext, { git: withGit = true, evide
       inventory,
     }, fixture);
   }
-  return { fixture, repository, inventory };
+  return { fixture, repository, inventory, goal, goalReference };
 }
 
-test('final audit computes its own fingerprint and rejects caller-supplied trusted fingerprint fields', async (testContext) => {
+function parseLedgerEvents(bytes) {
+  return bytes.toString('utf8').trimEnd().split('\n').map((line) => JSON.parse(line));
+}
+
+async function rewriteCompletionLedger(fixture, mutate) {
+  const progressPath = join(fixture.root, '.goal-lock', 'progress.jsonl');
+  const events = parseLedgerEvents(await readFile(progressPath));
+  mutate(events);
+  let previous = null;
+  for (let index = 0; index < events.length; index += 1) {
+    events[index].event_id = `EVT-${String(index + 1).padStart(6, '0')}`;
+    events[index] = withEventDigest(events[index], previous);
+    previous = events[index].event_digest;
+  }
+  await writeFile(progressPath, Buffer.concat(events.map((event) => canonicalBytes(event))));
+  await rewriteTestLock(fixture, (lock) => {
+    lock.progress_head = { event_id: events.at(-1).event_id, digest: events.at(-1).event_digest };
+  });
+}
+
+async function duplicateCompletionMandatoryResult(value) {
+  const evidenceDirectory = join(value.fixture.root, '.goal-lock', 'evidence', 'AC-002');
+  const source = parseCanonicalJson(
+    await readFile(join(evidenceDirectory, 'EVID-0002.json')),
+    'mandatory evidence',
+  );
+  const duplicate = {
+    ...source,
+    evidence_id: 'EVID-0003',
+    observed_result: 'A duplicate mandatory result was injected',
+    supersedes: 'EVID-0002',
+  };
+  const duplicateBytes = canonicalBytes(duplicate);
+  const duplicateDigest = independentSha256(duplicateBytes);
+  await writeFile(join(evidenceDirectory, 'EVID-0003.json'), duplicateBytes);
+  await rewriteCompletionLedger(value.fixture, (events) => {
+    const audit = events.pop();
+    const sourceEvent = events.find((event) => event.summary.startsWith('Recorded evidence AC-002/EVID-0002 '));
+    events.push({
+      ...sourceEvent,
+      summary: `Recorded evidence AC-002/EVID-0003 sha256:${duplicateDigest} as pass`,
+      evidence_refs: ['EVID-0003'],
+    }, audit);
+  });
+  await rewriteTestLock(value.fixture, (lock) => {
+    lock.evidence_heads['AC-002'] = { evidence_id: 'EVID-0003', digest: duplicateDigest };
+  });
+}
+
+async function invalidateCompletionValidationTrace(value) {
+  const evidencePath = join(value.fixture.root, '.goal-lock', 'evidence', 'AC-001', 'EVID-0001.json');
+  const evidence = parseCanonicalJson(await readFile(evidencePath), 'completion evidence');
+  evidence.validation_ref.validation_id = 'VAL-9999';
+  const evidenceBytes = canonicalBytes(evidence);
+  const evidenceDigest = independentSha256(evidenceBytes);
+  await writeFile(evidencePath, evidenceBytes);
+  await rewriteCompletionLedger(value.fixture, (events) => {
+    const event = events.find((candidate) => candidate.summary.startsWith('Recorded evidence AC-001/EVID-0001 '));
+    event.summary = `Recorded evidence AC-001/EVID-0001 sha256:${evidenceDigest} as ${evidence.state}`;
+  });
+  await rewriteTestLock(value.fixture, (lock) => {
+    lock.evidence_heads['AC-001'].digest = evidenceDigest;
+  });
+}
+
+function completionChangeInput(goal) {
+  return {
+    candidate: {
+      objective: 'Ship a safer completed lock',
+      scope: goal.scope,
+      non_goals: goal.non_goals,
+      constraints: goal.constraints,
+      acceptance_criteria: goal.acceptance_criteria,
+      authorization_boundary: goal.authorization_boundary,
+      assumptions: goal.assumptions,
+    },
+    changes: [{ field: 'objective', before: goal.objective, after: 'Ship a safer completed lock' }],
+    rationale: 'Strengthen the completed safety outcome',
+    affected_tasks: ['TASK-0001'],
+    criterion_impact: { affected: [], unaffected: ['AC-001', 'AC-002'] },
+    risks: ['The implementation may require focused remediation'],
+    validation: ['Run only the affected authorized validation'],
+    rollback: ['Reject the proposal and retain the active goal'],
+  };
+}
+
+function failedCompletionConditions(result) {
+  return result.checklist.filter((item) => !item.passed).map((item) => item.condition);
+}
+
+test('final audit stores only its derived scope, graph, delta, and workspace binding', async (testContext) => {
   const completed = await createCompletionFixture(testContext, { audit: false });
-  const { workspaceFingerprint } = await workspaceReader();
-  const expected = await workspaceFingerprint(completed.fixture.root, undefined, completed.fixture);
+  const lock = parseCanonicalJson(
+    await readFile(join(completed.fixture.root, '.goal-lock', 'lock.json')),
+    'completion lock',
+  );
+  const scope = parseCanonicalJson(
+    await readFile(join(completed.fixture.root, '.goal-lock', 'scope.json')),
+    'completion scope',
+  );
+  const verified = await completed.repository.verifyGoalRepository(completed.fixture.root, completed.fixture);
+  const expected = {
+    scope_digest: lock.scope_head.digest,
+    authorization_graph_digest: verified.authorization_graph_digest,
+    delta_digest: independentSha256(canonicalBytes({ entries: [], paths: [] })),
+    workspace_fingerprint: independentSha256(canonicalBytes({ mode: scope.mode, entries: scope.entries })),
+  };
   await assert.rejects(
     completed.repository.recordGoalEvent(completed.fixture.root, {
       kind: 'final-audit',
       semantic_summary: 'Reviewed final semantics.',
       inventory: undefined,
-      workspace_fingerprint: '0'.repeat(64),
+      scope_digest: '0'.repeat(64),
     }, completed.fixture),
     (error) => error instanceof GoalLockError && error.kind === 'input',
   );
@@ -5266,28 +5438,29 @@ test('final audit computes its own fingerprint and rejects caller-supplied trust
     semantic_summary: 'Reviewed final semantics.',
     inventory: undefined,
   }, completed.fixture);
-  assert.equal(receipt.workspace_fingerprint, expected);
-  const ledger = await readFile(join(completed.fixture.root, '.goal-lock', 'progress.jsonl'), 'utf8');
-  assert.match(ledger, new RegExp(expected));
+  assert.deepEqual({
+    scope_digest: receipt.scope_digest,
+    authorization_graph_digest: receipt.authorization_graph_digest,
+    delta_digest: receipt.delta_digest,
+    workspace_fingerprint: receipt.workspace_fingerprint,
+  }, expected);
+  const terminal = parseLedgerEvents(
+    await readFile(join(completed.fixture.root, '.goal-lock', 'progress.jsonl')),
+  ).at(-1);
+  assert.equal(terminal.summary, `Final audit ${JSON.stringify(expected)}: Reviewed final semantics.`);
 
-  const lateRace = await createCompletionFixture(testContext, { audit: false });
-  let verifications = 0;
-  lateRace.fixture.workspaceFaults = {
-    beforeVerifyInputs: async () => {
-      verifications += 1;
-      if (verifications === 3) {
-        await writeDelivery(lateRace.fixture.root, 'delivery.txt', 'changed after fingerprint capture\n');
-      }
-    },
-  };
+  const unauthorized = await createCompletionFixture(testContext, { audit: false });
+  await writeDelivery(unauthorized.fixture.root, 'unapproved.js', 'export const unapproved = true;\n');
+  const before = await readFile(join(unauthorized.fixture.root, '.goal-lock', 'progress.jsonl'));
   await assert.rejects(
-    lateRace.repository.recordGoalEvent(lateRace.fixture.root, {
+    unauthorized.repository.recordGoalEvent(unauthorized.fixture.root, {
       kind: 'final-audit',
-      semantic_summary: 'This audit must not accept a late workspace change.',
+      semantic_summary: 'Unauthorized delivery must not be audited.',
       inventory: undefined,
-    }, lateRace.fixture),
-    (error) => error instanceof GoalLockError && error.kind === 'integrity',
+    }, unauthorized.fixture),
+    (error) => error instanceof GoalLockError && error.code === 'WORKSPACE_SCOPE_UNAUTHORIZED',
   );
+  assert.deepEqual(await readFile(join(unauthorized.fixture.root, '.goal-lock', 'progress.jsonl')), before);
 });
 
 test('final audit cannot be forged through the ordinary progress input path', async (testContext) => {
@@ -5314,164 +5487,139 @@ test('final audit cannot be forged through the ordinary progress input path', as
   assert.equal(gate.checklist.find((item) => item.condition === 'final_audit').passed, false);
 });
 
-test('completion gate passes only current audited Git and explicit-inventory workspaces', async (testContext) => {
+test('completion gate returns the exact nine independent scope conditions', async (testContext) => {
   for (const withGit of [true, false]) {
-    const { fixture, repository, inventory } = await createCompletionFixture(testContext, { git: withGit });
+    const { fixture, repository, inventory, goalReference } = await createCompletionFixture(testContext, { git: withGit });
     const result = await repository.gateGoalCompletion(fixture.root, inventory, fixture);
     assert.equal(result.state, 'COMPLETE');
     assert.match(result.workspace_fingerprint, /^[a-f0-9]{64}$/);
-    assert.equal(result.goal.goal_digest, activeGoalReference().goal_digest);
+    assert.equal(result.goal.goal_digest, goalReference.goal_digest);
     assert.equal(result.checklist.every((item) => item.passed === true), true);
     assert.deepEqual(
       result.checklist.map((item) => item.condition),
-      [...result.checklist.map((item) => item.condition)].sort(),
+      COMPLETION_CONDITION_NAMES,
     );
-    assert.equal(Object.hasOwn(result, 'code_correct'), false);
-    assert.equal(Object.hasOwn(result, 'authenticated_identity'), false);
-    assert.equal(Object.hasOwn(result, 'irreversible'), false);
   }
 });
 
-test('completion gate invalidates a prior final audit after a workspace change until a new audit is recorded', async (testContext) => {
-  const { fixture, repository } = await createCompletionFixture(testContext);
-  assert.equal((await repository.gateGoalCompletion(fixture.root, undefined, fixture)).state, 'COMPLETE');
-  await writeDelivery(fixture.root, 'delivery.txt', 'changed after audit\n');
-  const changed = await repository.gateGoalCompletion(fixture.root, undefined, fixture);
-  assert.equal(changed.state, 'BLOCKED');
-  assert.equal(changed.checklist.find((item) => item.condition === 'workspace_fingerprint').passed, false);
-  await repository.recordGoalEvent(fixture.root, {
-    kind: 'final-audit',
-    semantic_summary: 'Reviewed the changed final semantic diff.',
-    inventory: undefined,
-  }, fixture);
-  assert.equal((await repository.gateGoalCompletion(fixture.root, undefined, fixture)).state, 'COMPLETE');
-});
-
-test('completion gate checklist independently blocks incomplete tasks, evidence states, absent audit, repository damage, and capture races', async (testContext) => {
+test('completion gate mutation table reports every scope blocker without an umbrella result', async (testContext) => {
   const cases = [
-    ['each pending task status', async () => createPlannedFixture(testContext), 'tasks'],
-    ['fail evidence', async () => createCompletionFixture(testContext, { evidenceState: 'fail' }), 'evidence'],
-    ['stale evidence', async () => createCompletionFixture(testContext, { evidenceState: 'stale' }), 'evidence'],
-    ['absent final audit', async () => createCompletionFixture(testContext, { audit: false }), 'final_audit'],
-    ['invalid goal chain', async () => {
+    ['integrity', async () => {
       const value = await createCompletionFixture(testContext);
       await writeDelivery(value.fixture.root, '.goal-lock/history/goals/v0001.json', canonicalBytes({
-        ...goalV1(),
+        ...value.goal,
         objective: 'tampered objective',
       }));
       return value;
-    }, 'active_goal'],
-    ['mismatched plan', async () => {
+    }, ['integrity']],
+    ['change_control', async () => {
       const value = await createCompletionFixture(testContext);
-      await rewriteTestPlan(value.fixture, (plan) => { plan.goal.goal_digest = 'f'.repeat(64); });
+      await value.repository.proposeGoalChange(
+        value.fixture.root,
+        completionChangeInput(value.goal),
+        value.fixture,
+      );
       return value;
-    }, 'plan'],
-    ['broken ledger', async () => {
+    }, ['change_control']],
+    ['tasks', async () => createCompletionFixture(testContext, { completeTasks: false }), ['tasks']],
+    ['criteria_evidence', async () => createCompletionFixture(testContext, { focusedState: 'fail' }), ['criteria_evidence']],
+    ['validation_trace', async () => {
       const value = await createCompletionFixture(testContext);
-      await writeDelivery(value.fixture.root, '.goal-lock/progress.jsonl', 'broken\n');
+      await invalidateCompletionValidationTrace(value);
       return value;
-    }, 'progress_ledger'],
+    }, ['validation_trace']],
+    ['mandatory_gates', async () => createCompletionFixture(testContext, { mandatoryResult: false }), ['mandatory_gates']],
+    ['duplicate mandatory_gates', async () => {
+      const value = await createCompletionFixture(testContext);
+      await duplicateCompletionMandatoryResult(value);
+      return value;
+    }, ['mandatory_gates']],
+    ['delivery_scope and scope_blockers', async () => {
+      const value = await createCompletionFixture(testContext);
+      await writeDelivery(value.fixture.root, 'unapproved.js', 'export const unapproved = true;\n');
+      return value;
+    }, ['delivery_scope', 'final_audit', 'scope_blockers']],
+    ['final_audit', async () => createCompletionFixture(testContext, { audit: false }), ['final_audit']],
   ];
-  for (const [label, build, condition] of cases) {
+  for (const [label, build, expectedFailures] of cases) {
     const value = await build();
     const result = await value.repository.gateGoalCompletion(value.fixture.root, value.inventory, value.fixture);
     assert.equal(result.state, 'BLOCKED', label);
-    assert.equal(result.checklist.find((item) => item.condition === condition).passed, false, label);
+    assert.deepEqual(result.checklist.map((item) => item.condition), COMPLETION_CONDITION_NAMES, label);
+    assert.deepEqual(failedCompletionConditions(result), expectedFailures, label);
   }
-
-  const proposed = await createCompletionFixture(testContext);
-  await proposed.repository.proposeGoalChange(proposed.fixture.root, changeProposalInput(), proposed.fixture);
-  const pending = await proposed.repository.gateGoalCompletion(proposed.fixture.root, undefined, proposed.fixture);
-  assert.equal(pending.state, 'BLOCKED');
-  assert.equal(pending.checklist.find((item) => item.condition === 'change_requests').passed, false);
-
-  const raced = await createCompletionFixture(testContext);
-  let changed = false;
-  raced.fixture.workspaceFaults = {
-    afterFileRead: async ({ relativePath }) => {
-      if (!changed && relativePath === 'delivery.txt') {
-        changed = true;
-        await writeDelivery(raced.fixture.root, 'delivery.txt', 'raced during gate\n');
-      }
-    },
-  };
-  const raceResult = await raced.repository.gateGoalCompletion(raced.fixture.root, undefined, raced.fixture);
-  assert.equal(raceResult.state, 'BLOCKED');
-  assert.equal(raceResult.checklist.find((item) => item.condition === 'workspace_fingerprint').passed, false);
-
-  const lateRace = await createCompletionFixture(testContext);
-  let verifications = 0;
-  lateRace.fixture.workspaceFaults = {
-    beforeVerifyInputs: async () => {
-      verifications += 1;
-      if (verifications === 3) {
-        await writeDelivery(lateRace.fixture.root, 'delivery.txt', 'changed during final repository revalidation\n');
-      }
-    },
-  };
-  const lateRaceResult = await lateRace.repository.gateGoalCompletion(
-    lateRace.fixture.root,
-    undefined,
-    lateRace.fixture,
-  );
-  assert.equal(lateRaceResult.state, 'BLOCKED');
-  assert.equal(lateRaceResult.checklist.find((item) => item.condition === 'workspace_fingerprint').passed, false);
 });
 
-test('completion gate blocks every non-complete task status plus missing and old-goal evidence', async (testContext) => {
-  const taskStatuses = [
-    ['pending', async () => createPlannedFixture(testContext)],
-    ['in_progress', async () => {
-      const value = await createPlannedFixture(testContext);
-      await value.repository.recordGoalEvent(value.fixture.root, progressInput('Started', { event_type: 'task-start' }), value.fixture);
-      return value;
-    }],
-    ['blocked', async () => {
-      const value = await createPlannedFixture(testContext);
-      await value.repository.recordGoalEvent(value.fixture.root, progressInput('Started', { event_type: 'task-start' }), value.fixture);
-      await value.repository.recordGoalEvent(value.fixture.root, progressInput('Blocked', { event_type: 'blocker' }), value.fixture);
-      return value;
-    }],
-    ['stale', async () => {
-      const value = await createPlannedFixture(testContext);
-      await rewriteTestPlan(value.fixture, (plan) => { plan.tasks[0].status = 'stale'; });
-      return value;
-    }],
-  ];
-  for (const [status, build] of taskStatuses) {
-    const value = await build();
-    const result = await value.repository.gateGoalCompletion(value.fixture.root, undefined, value.fixture);
-    assert.equal(result.state, 'BLOCKED', status);
-    assert.equal(result.checklist.find((item) => item.condition === 'tasks').passed, false, status);
-  }
+test('completion gate is reversible across evidence remediation, successor audit, and later fact changes', async (testContext) => {
+  const value = await createCompletionFixture(testContext, {
+    focusedState: 'fail',
+    mandatoryResult: false,
+    audit: false,
+  });
+  const initial = await value.repository.gateGoalCompletion(value.fixture.root, value.inventory, value.fixture);
+  assert.equal(initial.state, 'BLOCKED');
+  assert.deepEqual(failedCompletionConditions(initial), ['criteria_evidence', 'mandatory_gates', 'final_audit']);
 
-  const missingPlan = createGoalLockFixture(testContext);
-  const repository = await goalRepository();
-  await repository.initializeGoal(missingPlan.root, goalV1(), missingPlan);
-  await repository.lockInitialGoal(missingPlan.root, 'APPROVE GOAL GL-ALPHA VERSION 1 87f66f9c59ab', missingPlan);
-  const noPlan = await repository.gateGoalCompletion(missingPlan.root, undefined, missingPlan);
-  assert.equal(noPlan.checklist.find((item) => item.condition === 'plan').passed, false);
+  await value.repository.recordGoalEvent(value.fixture.root, evidenceInput({
+    validation_ref: { ...value.goalReference, plan_revision: 1, validation_id: 'VAL-0001' },
+    observed_result: 'The successor focused result passed',
+    supersedes: 'EVID-0001',
+    inventory: value.inventory,
+  }), value.fixture);
+  await value.repository.recordGoalEvent(value.fixture.root, evidenceInput({
+    acceptance_criterion_id: 'AC-002',
+    task_id: 'TASK-0002',
+    validation_ref: { ...value.goalReference, plan_revision: 1, validation_id: 'VAL-0003' },
+    observed_result: 'The successor mandatory result passed once',
+    artifact_refs: ['tests/goal-lock.test.js'],
+    supersedes: 'EVID-0001',
+    inventory: value.inventory,
+  }), value.fixture);
+  await value.repository.recordGoalEvent(value.fixture.root, {
+    kind: 'final-audit',
+    semantic_summary: 'Reviewed the remediated delivery.',
+    inventory: value.inventory,
+  }, value.fixture);
+  assert.equal((await value.repository.gateGoalCompletion(
+    value.fixture.root,
+    value.inventory,
+    value.fixture,
+  )).state, 'COMPLETE');
 
-  const missingEvidence = await createCompletionFixture(testContext);
-  await rm(join(missingEvidence.fixture.root, '.goal-lock', 'evidence'), { recursive: true });
-  const withoutEvidence = await missingEvidence.repository.gateGoalCompletion(
-    missingEvidence.fixture.root,
-    undefined,
-    missingEvidence.fixture,
+  await writeDelivery(value.fixture.root, 'src/goal-lock/repository.js', 'authorized remediation\n');
+  assert.equal((await value.repository.gateGoalCompletion(
+    value.fixture.root,
+    value.inventory,
+    value.fixture,
+  )).state, 'BLOCKED');
+  await value.repository.recordGoalEvent(value.fixture.root, {
+    kind: 'final-audit',
+    semantic_summary: 'Reviewed the authorized workspace change.',
+    inventory: value.inventory,
+  }, value.fixture);
+  assert.equal((await value.repository.gateGoalCompletion(
+    value.fixture.root,
+    value.inventory,
+    value.fixture,
+  )).state, 'COMPLETE');
+
+  const plan = parseCanonicalJson(
+    await readFile(join(value.fixture.root, '.goal-lock', 'plan.json')),
+    'completion plan',
   );
-  assert.equal(withoutEvidence.checklist.find((item) => item.condition === 'evidence').passed, false);
-
-  const oldGoalEvidence = await createCompletionFixture(testContext);
-  const evidencePath = join(oldGoalEvidence.fixture.root, '.goal-lock', 'evidence', 'AC-001', 'EVID-0002.json');
-  const evidence = parseCanonicalJson(await readFile(evidencePath), 'test old-goal evidence');
-  evidence.goal.goal_digest = 'f'.repeat(64);
-  await writeFile(evidencePath, canonicalBytes(evidence));
-  const oldGoal = await oldGoalEvidence.repository.gateGoalCompletion(
-    oldGoalEvidence.fixture.root,
-    undefined,
-    oldGoalEvidence.fixture,
-  );
-  assert.equal(oldGoal.checklist.find((item) => item.condition === 'evidence').passed, false);
+  plan.tasks[0].permitted_paths.push('src/goal-lock/contracts.js');
+  plan.tasks[0].permitted_paths.sort();
+  await value.repository.revisePlan(value.fixture.root, {
+    next_task_id: plan.next_task_id,
+    tasks: plan.tasks,
+    risks: plan.risks,
+    deferred: plan.deferred,
+  }, 'implementation-only', value.fixture);
+  assert.equal((await value.repository.gateGoalCompletion(
+    value.fixture.root,
+    value.inventory,
+    value.fixture,
+  )).state, 'BLOCKED');
 });
 
 test('goal lock errors expose immutable classification metadata', () => {
