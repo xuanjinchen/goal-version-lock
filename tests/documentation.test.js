@@ -23,6 +23,25 @@ function parseMarkedJsonExample(source, marker) {
   return JSON.parse(source.slice(jsonStart, jsonEnd));
 }
 
+function parseMarkdownLinks(source) {
+  const links = [];
+  let cursor = 0;
+  while (cursor < source.length) {
+    const labelStart = source.indexOf('[', cursor);
+    if (labelStart === -1) break;
+    const labelEnd = source.indexOf('](', labelStart + 1);
+    const targetEnd = labelEnd === -1 ? -1 : source.indexOf(')', labelEnd + 2);
+    if (targetEnd === -1) break;
+    links.push(source.slice(labelEnd + 2, targetEnd).split('#', 1)[0]);
+    cursor = targetEnd + 1;
+  }
+  return links;
+}
+
+function assertExactFields(value, fields, label) {
+  assert.deepEqual(Object.keys(value).sort(), [...fields].sort(), label);
+}
+
 test('public schema-v2 examples parse as the runtime contracts they describe', () => {
   const readme = read('README.md');
   const contract = read('references/contract.md');
@@ -57,20 +76,51 @@ test('documented validation methods remain inert data and help remains a read-on
   assert.equal(plan.method.target, 'node --test tests/exporter-focused.test.js');
   assert.equal(result.ok, true);
   assert.equal(result.command, 'help');
-  assert.match(result.result, /Validation targets are inert data/u);
+  assert.ok(result.result.split('\n').some((line) => line.startsWith('  goal-lock lock ')));
 });
 
-test('published workflow links the detailed contract without copying the wire schema', () => {
+test('workflow routes to a complete, parseable v2 contract', () => {
   const skill = read('SKILL.md');
   const readme = read('README.md');
   const contract = read('references/contract.md');
+  const contractPath = 'references/contract.md';
 
-  assert.match(skill, /\[runtime contract\]\(references\/contract\.md\)/u);
-  assert.match(readme, /\[runtime contract\]\(references\/contract\.md\)/u);
-  assert.equal((skill.match(/\`\`\`json/g) ?? []).length, 0);
-  assert.equal((readme.match(/record_digest/g) ?? []).length, 0);
-  assert.match(contract, /never-listed files outside an inventory are not discoverable/u);
-  assert.match(contract, /cannot police host activity/u);
+  assert.ok(parseMarkdownLinks(skill).includes(contractPath));
+  assert.ok(parseMarkdownLinks(readme).includes(contractPath));
+
+  const examples = {
+    current: parseMarkedJsonExample(contract, 'goal-lock-current-record:v2'),
+    scope: parseMarkedJsonExample(contract, 'goal-lock-scope-record:v2'),
+    lock: parseMarkedJsonExample(contract, 'goal-lock-lock-record:v2'),
+    plan: parseMarkedJsonExample(contract, 'goal-lock-plan-record:v2'),
+    progressInput: parseMarkedJsonExample(contract, 'goal-lock-progress-input:v2'),
+    progress: parseMarkedJsonExample(contract, 'goal-lock-progress-record:v2'),
+    finalAudit: parseMarkedJsonExample(contract, 'goal-lock-final-audit-input:v2'),
+    evidence: parseMarkedJsonExample(contract, 'goal-lock-stored-evidence:v2'),
+    changeInput: parseMarkedJsonExample(contract, 'goal-lock-change-input:v2'),
+    change: parseMarkedJsonExample(contract, 'goal-lock-change-record:v2'),
+    mandatoryFailure: parseMarkedJsonExample(contract, 'goal-lock-mandatory-gate-failure:v2'),
+  };
+
+  assertExactFields(examples.current, [
+    'accepted_change_id', 'acceptance_criteria', 'assumptions', 'authorization_boundary', 'constraints',
+    'goal_id', 'goal_version', 'non_goals', 'objective', 'predecessor', 'schema_version', 'scope',
+  ], 'current state fields');
+  assertExactFields(examples.scope, ['entries', 'goal', 'mode', 'record_digest', 'recorded_at', 'schema_version', 'scope_version'], 'scope fields');
+  assertExactFields(examples.lock, [
+    'approval_type', 'approved_at', 'change_head', 'evidence_heads', 'goal_digest', 'goal_id',
+    'goal_version', 'predecessor_digest', 'progress_head', 'proposal_digest', 'record_digest', 'scope_head',
+    'schema_version', 'state_revision',
+  ], 'lock fields');
+  assertExactFields(examples.plan, ['deferred', 'goal', 'next_task_id', 'plan_revision', 'risks', 'schema_version', 'tasks'], 'plan fields');
+  assertExactFields(examples.progressInput, ['event_type', 'evidence_refs', 'kind', 'summary', 'task_id'], 'progress input fields');
+  assertExactFields(examples.progress, ['event_digest', 'event_id', 'event_type', 'evidence_refs', 'goal', 'plan_revision', 'previous_event_digest', 'recorded_at', 'schema_version', 'summary', 'task_id'], 'progress record fields');
+  assertExactFields(examples.finalAudit, ['inventory', 'kind', 'semantic_summary'], 'final audit input fields');
+  assertExactFields(examples.evidence, ['acceptance_criterion_id', 'artifact_refs', 'derivation', 'evidence_id', 'failure_paths', 'recorded_at', 'schema_version', 'state', 'supersedes', 'task_id', 'validation_ref', 'workspace_fingerprint', 'observed_result'], 'stored evidence fields');
+  assertExactFields(examples.changeInput, ['affected_tasks', 'candidate', 'changes', 'criterion_impact', 'rationale', 'risks', 'rollback', 'validation'], 'change input fields');
+  assertExactFields(examples.change, ['affected_tasks', 'approval_phrase', 'base_goal', 'candidate_digest', 'candidate_goal', 'changes', 'criterion_impact', 'id', 'proposal_digest', 'rationale', 'recorded_at', 'risks', 'rollback', 'schema_version', 'status', 'validation'], 'change record fields');
+  assert.deepEqual(examples.mandatoryFailure.required_sequence, ['focused-remediation', 'new-plan-revision', 'one-successor-mandatory-gate']);
+  assert.notDeepEqual(examples.mandatoryFailure.failed_validation_ref, examples.mandatoryFailure.successor_validation_ref);
 });
 
 test('evaluation matrix is draft evidence through EVAL-013', () => {

@@ -54,7 +54,10 @@ current CR approval phrase. Generic confirmation is not approval. Use
 Use the one authorized `mandatory-gate` validation only in the final
 sequence: current evidence first, final semantic audit next, then `gate`.
 Do not substitute a general regression sweep for that gate or repeat an
-accepted mandatory gate.
+accepted mandatory gate. If that gate fails, perform only focused remediation,
+create a new plan revision, then declare exactly one successor mandatory-gate
+ValidationRef. Never rerun or reuse the failed reference in its prior
+revision.
 
 On integrity failure, stop governed writes and preserve the bytes. For a stale
 cooperative writer only, use `recover-lock` with its exact owner token and
