@@ -777,6 +777,47 @@ test('carry-forward and invalidation bind exact source evidence without rewritin
   assert.equal((await repository.verifyGoalRepository(fixture.root, fixture)).state, 'LOCKED');
 });
 
+test('invalidation resolves a repurposed validation ID through the authorization graph', async (testContext) => {
+  const { fixture, repository, goalReference } = await createTwoCriterionChangeFixture(testContext);
+  await repository.recordGoalEvent(fixture.root, twoCriterionEvidenceInput(goalReference, 'AC-001'), fixture);
+  const directory = join(fixture.root, '.goal-lock');
+  const sourcePath = join(directory, 'evidence', 'AC-001', 'EVID-0001.json');
+  const sourceBytes = await readFile(sourcePath);
+  const sourceEvidence = parseCanonicalJson(sourceBytes, 'source evidence');
+  const successorPlan = twoCriterionPlanCandidate();
+  successorPlan.tasks[0].acceptance_criteria = ['AC-001', 'AC-002'];
+  successorPlan.tasks[0].validations = [{
+    ...successorPlan.tasks[0].validations[0],
+    criterion_ids: ['AC-002'],
+  }, {
+    id: 'VAL-0003',
+    kind: 'focused',
+    method: { type: 'deterministic-test', target: 'goal-lock-affected-invalidation' },
+    affected_paths: ['src/goal-lock/repository.js'],
+    criterion_ids: ['AC-001'],
+    risk_ids: [],
+  }];
+  await repository.revisePlan(fixture.root, successorPlan, 'aligned', fixture);
+  const proposal = await repository.proposeGoalChange(fixture.root, twoCriterionChangeInput(), fixture);
+
+  await repository.approveGoalChange(fixture.root, proposal.change_request_id, proposal.approval_required, fixture);
+
+  const invalidation = parseCanonicalJson(
+    await readFile(join(directory, 'evidence', 'AC-001', 'EVID-0002.json')),
+    'graph-resolved invalidation',
+  );
+  assert.equal(invalidation.state, 'stale');
+  assert.equal(invalidation.validation_ref.validation_id, 'VAL-0003');
+  assert.deepEqual(invalidation.derivation, {
+    kind: 'invalidation',
+    source_validation_ref: sourceEvidence.validation_ref,
+    source_evidence_id: 'EVID-0001',
+    source_evidence_digest: independentSha256(sourceBytes),
+  });
+  assert.deepEqual(await readFile(sourcePath), sourceBytes);
+  assert.equal((await repository.verifyGoalRepository(fixture.root, fixture)).state, 'LOCKED');
+});
+
 test('carry-forward requires byte-identical adjacent task and validation definitions', async (testContext) => {
   for (const [label, mutate] of [
     ['task', (task) => { task.outcome = 'Verify lineage with a changed task definition'; }],

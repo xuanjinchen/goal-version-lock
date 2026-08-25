@@ -2152,8 +2152,9 @@ export async function approveGoalChange(root, changeRequestId, approval, context
         const sourcePlan = sourcePlans.get(`${sourceReference.goal_version}/${sourceReference.plan_revision}`);
         const sourceTask = sourcePlan?.tasks.find((candidateTask) => candidateTask.id === latest.value.task_id);
         const sourceValidation = sourceTask?.validations.find((validation) => validation.id === sourceReference.validation_id);
-        let targetValidation = task.validations.find((validation) => validation.id === sourceReference.validation_id);
-        if (affectedCriteria.has(criterionId) && !targetValidation) {
+        let targetValidation;
+        if (affectedCriteria.has(criterionId)) {
+          // 受影响失效必须按授权图的准则可达性选靶；复用同一 ID 不代表仍获该准则授权。
           const authorizedTarget = authorizationGraph.validations.find((validation) => (
             validation.validation_ref.goal_version === current.goal.goal_version
             && validation.validation_ref.goal_digest === current.digest
@@ -2162,6 +2163,8 @@ export async function approveGoalChange(root, changeRequestId, approval, context
             && validation.reachable_criterion_ids.includes(criterionId)
           ));
           targetValidation = task.validations.find((validation) => validation.id === authorizedTarget?.validation_ref.validation_id);
+        } else {
+          targetValidation = task.validations.find((validation) => validation.id === sourceReference.validation_id);
         }
         const canCarry = unaffectedCriteria.has(criterionId)
           && sourceTask
