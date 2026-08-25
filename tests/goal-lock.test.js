@@ -2753,10 +2753,12 @@ test('version 1 lock records the exact approved current bytes in immutable histo
   const currentPath = join(fixture.root, '.goal-lock', 'current.json');
   const current = await readFile(currentPath);
 
-  await lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 87f66f9c59ab', fixture);
+  const receipt = await lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 87f66f9c59ab', fixture);
 
   const lock = parseCanonicalJson(await readFile(join(fixture.root, '.goal-lock', 'lock.json')), 'lock');
   const scopeBytes = await readFile(join(fixture.root, '.goal-lock', 'scope.json'));
+  assert.deepEqual(lock.scope_head, { scope_version: 1, digest: independentSha256(scopeBytes) });
+  assert.equal(receipt.scope_digest, lock.scope_head.digest);
   const { record_digest, ...lockWithoutDigest } = lock;
   assert.deepEqual(lockWithoutDigest, {
     schema_version: 2,
@@ -2783,10 +2785,10 @@ test('version 1 lock records the exact approved current bytes in immutable histo
   assert.deepEqual(await readFile(join(fixture.root, '.goal-lock', 'lock.json')), lockBytes);
 });
 
-test('version 1 lock rolls back lock and history when either installation fails', async (testContext) => {
+test('version 1 lock rolls back history, scope, and lock at every installation boundary', async (testContext) => {
   const { initializeGoal, lockInitialGoal } = await goalRepository();
 
-  for (const failedInstallation of [0, 1]) {
+  for (const failedInstallation of [0, 1, 2]) {
     const fixture = createGoalLockFixture(testContext);
     await initializeGoal(fixture.root, goalV1(), fixture);
     const currentPath = join(fixture.root, '.goal-lock', 'current.json');
@@ -2801,6 +2803,7 @@ test('version 1 lock rolls back lock and history when either installation fails'
     assert.deepEqual(await readFile(currentPath), current);
     assert.equal(await optionalBytes(join(fixture.root, '.goal-lock', 'lock.json')), null);
     assert.equal(await optionalBytes(join(fixture.root, '.goal-lock', 'history', 'goals', 'v0001.json')), null);
+    assert.equal(await optionalBytes(join(fixture.root, '.goal-lock', 'scope.json')), null);
   }
 });
 
@@ -2819,6 +2822,56 @@ test('version 1 lock rolls back when current draft ownership changes during fina
   assert.deepEqual(await readFile(currentPath), editedBytes);
   assert.equal(await optionalBytes(join(fixture.root, '.goal-lock', 'lock.json')), null);
   assert.equal(await optionalBytes(join(fixture.root, '.goal-lock', 'history', 'goals', 'v0001.json')), null);
+  assert.equal(await optionalBytes(join(fixture.root, '.goal-lock', 'scope.json')), null);
+});
+
+test('scope head rejects missing, changed, noncanonical, and mismatched immutable scope bytes', async (testContext) => {
+  const { initializeGoal, lockInitialGoal, verifyGoalRepository } = await goalRepository();
+  const cases = [
+    ['missing', async (fixture) => unlink(join(fixture.root, '.goal-lock', 'scope.json'))],
+    ['changed', async (fixture) => {
+      const target = join(fixture.root, '.goal-lock', 'scope.json');
+      const scope = parseCanonicalJson(await readFile(target), 'test scope');
+      scope.recorded_at = '2026-08-23T00:00:01.000Z';
+      await writeFile(target, canonicalBytes(scope));
+    }],
+    ['noncanonical', async (fixture) => {
+      const target = join(fixture.root, '.goal-lock', 'scope.json');
+      const scopeBytes = await readFile(target);
+      await writeFile(target, Buffer.concat([scopeBytes.subarray(0, -1), Buffer.from('\r\n')]));
+    }],
+    ['mismatched', async (fixture) => rewriteTestLock(fixture, (lock) => {
+      lock.scope_head.digest = 'f'.repeat(64);
+    })],
+  ];
+
+  for (const [label, tamper] of cases) {
+    const fixture = createGoalLockFixture(testContext);
+    await initializeGoal(fixture.root, goalV1(), fixture);
+    await lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 87f66f9c59ab', fixture);
+    await tamper(fixture);
+
+    assert.equal((await verifyGoalRepository(fixture.root, fixture)).state, 'TAMPERED', label);
+  }
+});
+
+test('scope head stays byte-identical in a later goal-version lock', async (testContext) => {
+  const fixture = createGoalLockFixture(testContext);
+  const {
+    initializeGoal,
+    lockInitialGoal,
+  } = await goalRepository();
+  await initializeGoal(fixture.root, goalV1(), fixture);
+  await lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 87f66f9c59ab', fixture);
+  const directory = join(fixture.root, '.goal-lock');
+  const scopeBytes = await readFile(join(directory, 'scope.json'));
+  const initialLock = parseCanonicalJson(await readFile(join(directory, 'lock.json')), 'initial lock');
+
+  await installVersionTwo(fixture);
+
+  const approvedLock = parseCanonicalJson(await readFile(join(directory, 'lock.json')), 'approved lock');
+  assert.deepEqual(approvedLock.scope_head, initialLock.scope_head);
+  assert.deepEqual(await readFile(join(directory, 'scope.json')), scopeBytes);
 });
 
 test('safe workspace reads only stable regular files and real directories', async (testContext) => {

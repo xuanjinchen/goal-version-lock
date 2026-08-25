@@ -13,7 +13,13 @@ import {
   validateProgressEvent,
 } from './contracts.js';
 import { commitGoalFiles, withGoalLock } from './transaction.js';
-import { createWorkspaceReader, workspaceFingerprint } from './workspace.js';
+import {
+  captureWorkspaceManifest,
+  createScopeBaseline,
+  createWorkspaceReader,
+  verifyScopeBaseline,
+  workspaceFingerprint,
+} from './workspace.js';
 
 const ACTIVE_WRITE = Symbol('active goal writer');
 const RETURN_VERIFIED_SNAPSHOT = Symbol('return verified repository snapshot');
@@ -725,6 +731,27 @@ async function readLock(reader) {
   }
 }
 
+async function readScopeBaseline(reader, initialGoal, lock) {
+  const input = await reader.readFile('.goal-lock/scope.json');
+  try {
+    const scope = verifyScopeBaseline(
+      parseCanonicalJson(input.bytes, 'goal scope baseline'),
+      {
+        goal_id: initialGoal.goal.goal_id,
+        goal_version: 1,
+        goal_digest: initialGoal.digest,
+      },
+    );
+    // scope.json 的首版字节只由 lock.scope_head 绑定，后续版本不得重新捕获或改写它。
+    if (input.digest !== lock.scope_head.digest) {
+      throw integrityError('SCOPE_HEAD_MISMATCH', 'Goal lock scope head does not match the immutable scope baseline.');
+    }
+    return { ...input, scope };
+  } catch (error) {
+    throw repositoryIntegrity('SCOPE_BASELINE_INVALID', 'Goal scope baseline is malformed, noncanonical, or does not match the lock head.', error);
+  }
+}
+
 async function verifyGoalHistory(reader, current, lock) {
   const historyDirectory = await reader.readDirectory('.goal-lock/history');
   if (!historyDirectory.names.includes('goals')
@@ -810,7 +837,7 @@ function verificationEvidence(reader, current, optional, issues = [], latest = {
   };
 }
 
-/** 验证完整目标仓库；只读调用返回篡改证据，写调用则在同一完整性失败上立即关闭。 */
+/** 验证完整目标仓库及其不可变范围基线；只读调用返回篡改证据，写调用则在同一完整性失败上立即关闭。 */
 export async function verifyGoalRepository(root, context = {}) {
   let reader;
   let current = null;
@@ -822,7 +849,7 @@ export async function verifyGoalRepository(root, context = {}) {
       throw integrityError('GOAL_REPOSITORY_INVALID', 'Goal repository contains an unexpected cooperative writer.');
     }
     const rootNames = goalLockDirectory.names.filter((name) => name !== '.write-lock.json');
-    const allowedNames = new Set(['current.json', 'lock.json', 'plan.json', 'progress.jsonl', 'changes', 'history', 'evidence']);
+    const allowedNames = new Set(['current.json', 'lock.json', 'scope.json', 'plan.json', 'progress.jsonl', 'changes', 'history', 'evidence']);
     if (rootNames.some((name) => !allowedNames.has(name)) || !rootNames.includes('current.json')) {
       throw integrityError('GOAL_REPOSITORY_INVALID', 'Goal repository contains missing or unexpected root state.');
     }
@@ -833,14 +860,15 @@ export async function verifyGoalRepository(root, context = {}) {
         throw integrityError('GOAL_LOCK_MISSING', 'Only a pristine version-one draft may omit the goal lock.');
       }
       await reader.verifyInputs();
-      const result = { state: 'DRAFT', evidence: verificationEvidence(reader, current, { plan: false, changes: 0, progress_events: 0, evidence_records: 0 }) };
+      const result = { state: 'DRAFT', scope: null, evidence: verificationEvidence(reader, current, { plan: false, changes: 0, progress_events: 0, evidence_records: 0 }) };
       return context[RETURN_VERIFIED_SNAPSHOT] === true
-        ? { result, reader, current, rootNames, lockInput: null, planState: null, history: null }
+        ? { result, reader, current, rootNames, lockInput: null, planState: null, history: null, scope: null }
         : result;
     }
 
     const lockInput = await readLock(reader);
     const history = await verifyGoalHistory(reader, current, lockInput.lock);
+    const scope = await readScopeBaseline(reader, history.goals.get(1), lockInput.lock);
     const changeState = await verifyChangeState(reader, rootNames, lockInput.lock, current, history.goals);
     verifyHistoricalChangeBindings(history.goals, changeState);
     const planState = await verifyPlanState(reader, rootNames, current, history.goals);
@@ -871,10 +899,11 @@ export async function verifyGoalRepository(root, context = {}) {
     };
     const result = {
       state: changeState.pending ? 'CHANGE_PENDING' : 'LOCKED',
+      scope: scope.scope,
       evidence: verificationEvidence(reader, current, optional, [], evidenceState.publicLatest),
     };
     return context[RETURN_VERIFIED_SNAPSHOT] === true
-      ? { result, reader, current, rootNames, lockInput, planState, progressState, evidenceState, changeState, history }
+      ? { result, reader, current, rootNames, lockInput, planState, progressState, evidenceState, changeState, history, scope }
       : result;
   } catch (error) {
     const failure = repositoryIntegrity('GOAL_REPOSITORY_TAMPERED', 'Goal repository integrity verification failed.', error);
@@ -932,8 +961,9 @@ export async function initializeGoal(root, draft, context = {}) {
   }
 }
 
+/** 仅在精确批准后，将版本一范围基线、历史与锁作为同一原子提交安装。 */
 export async function lockInitialGoal(root, approval, context = {}) {
-  return withGoalLock(root, 'lock', async () => {
+  return withGoalLock(root, 'lock', async (ownership) => {
     const directory = path.join(path.resolve(root), '.goal-lock');
     const names = await readdir(directory);
     if (names.some((name) => name !== '.write-lock.json' && name !== 'current.json')) {
@@ -945,16 +975,26 @@ export async function lockInitialGoal(root, approval, context = {}) {
       throw stateError('APPROVAL_REJECTED', 'Initial goal approval must exactly match the current draft confirmation phrase.');
     }
 
+    const approvedAt = (context.now ?? (() => new Date().toISOString()))();
+    const goalReference = {
+      goal_id: current.goal.goal_id,
+      goal_version: 1,
+      goal_digest: current.digest,
+    };
+    const manifest = await captureWorkspaceManifest(root, context.inventory ?? null, context);
+    const scopeBytes = canonicalBytes(createScopeBaseline(goalReference, manifest, approvedAt));
+    const scopeHead = { scope_version: 1, digest: sha256(scopeBytes) };
     const record = {
-      schema_version: 1,
+      schema_version: 2,
       goal_id: current.goal.goal_id,
       goal_version: 1,
       goal_digest: current.digest,
       approval_type: 'explicit-version-1',
       proposal_digest: current.digest,
-      approved_at: (context.now ?? (() => new Date().toISOString()))(),
+      approved_at: approvedAt,
       predecessor_digest: null,
       state_revision: 1,
+      scope_head: scopeHead,
       progress_head: null,
       change_head: null,
       evidence_heads: {},
@@ -963,10 +1003,17 @@ export async function lockInitialGoal(root, approval, context = {}) {
     validateLockRecord(lock);
     await commitGoalFiles(root, [
       { target: '.goal-lock/current.json', expected: { kind: 'sha256', digest: current.digest }, content: current.bytes },
-      { target: '.goal-lock/lock.json', expected: { kind: 'absent' }, content: canonicalBytes(lock) },
       { target: '.goal-lock/history/goals/v0001.json', expected: { kind: 'absent' }, content: current.bytes },
-    ], context);
-    return { state: 'LOCKED', goal_id: current.goal.goal_id, goal_version: 1, goal_digest: current.digest };
+      { target: '.goal-lock/scope.json', expected: { kind: 'absent' }, content: scopeBytes },
+      { target: '.goal-lock/lock.json', expected: { kind: 'absent' }, content: canonicalBytes(lock) },
+    ], { ...context, ...ownership });
+    return {
+      state: 'LOCKED',
+      goal_id: current.goal.goal_id,
+      goal_version: 1,
+      goal_digest: current.digest,
+      scope_digest: scopeHead.digest,
+    };
   }, context);
 }
 
@@ -1965,7 +2012,7 @@ export async function approveGoalChange(root, changeRequestId, approval, context
       };
     }
     const nextWithoutDigest = {
-      schema_version: 1,
+      schema_version: 2,
       goal_id: candidate.goal_id,
       goal_version: candidate.goal_version,
       goal_digest: candidateDigest,
@@ -1974,6 +2021,7 @@ export async function approveGoalChange(root, changeRequestId, approval, context
       approved_at: (context.now ?? (() => new Date().toISOString()))(),
       predecessor_digest: current.digest,
       state_revision: lockInput.lock.state_revision + 1,
+      scope_head: lockInput.lock.scope_head,
       progress_head: { event_id: pendingProgress.terminal.event_id, digest: pendingProgress.terminal.event_digest },
       change_head: { change_request_id: approved.id, digest: approvedDigest },
       evidence_heads: nextEvidenceHeads,
