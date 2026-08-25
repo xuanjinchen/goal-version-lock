@@ -4,9 +4,8 @@ import path from 'node:path';
 import { TextDecoder } from 'node:util';
 
 import { canonicalBytes, sha256 } from './canonical.js';
-import { GoalLockError } from './contracts.js';
+import { GoalLockError, validateScopeBaseline } from './contracts.js';
 
-const EMPTY_TREE_SENTINEL = '4b825dc642cb6eb9a060e54bf8d69288fbee4904';
 const GIT_OUTPUT_LIMIT = 64 * 1024 * 1024;
 const UTF8_DECODER = new TextDecoder('utf-8', { fatal: true });
 
@@ -267,17 +266,6 @@ function compareNames(left, right) {
   return left < right ? -1 : left > right ? 1 : 0;
 }
 
-function framedManifest(metadata, rawParts) {
-  const parts = [canonicalBytes(metadata)];
-  for (const rawPart of rawParts) {
-    const bytes = Buffer.from(rawPart);
-    const length = Buffer.alloc(8);
-    length.writeBigUInt64BE(BigInt(bytes.length));
-    parts.push(length, bytes);
-  }
-  return Buffer.concat(parts);
-}
-
 function defaultGitRunner(root) {
   return (args) => new Promise((resolve, reject) => {
     execFile('git', args, {
@@ -363,15 +351,6 @@ function normalizeInventory(inventory) {
   return normalized;
 }
 
-async function fingerprintFiles(reader, names) {
-  const entries = [];
-  for (const name of names) {
-    const input = await reader.readFile(name);
-    entries.push({ name, mode: input.mode, size: input.size, bytes: input.bytes });
-  }
-  return entries;
-}
-
 async function resolveGitHead(runGit) {
   const observed = await observeGit(runGit, ['rev-parse', '--verify', 'HEAD']);
   if (observed.bytes !== null) return observed.bytes;
@@ -385,13 +364,28 @@ async function resolveGitHead(runGit) {
   return null;
 }
 
-async function captureGitState(runGit) {
-  const headOutput = await resolveGitHead(runGit);
-  const head = headOutput === null ? EMPTY_TREE_SENTINEL : headOutput.toString('ascii').trim();
-  if (!/^[a-f0-9]{40,64}$/.test(head)) throw gitError();
-  const diff = await invokeGit(runGit, [
-    'diff', '--binary', headOutput === null ? EMPTY_TREE_SENTINEL : 'HEAD', '--', '.',
-    ':(exclude).goal-lock', ':(exclude).goal-lock/**',
+function parseIndexEntries(bytes) {
+  if (bytes.length === 0) return [];
+  if (bytes.at(-1) !== 0) throw gitError();
+  let records;
+  try {
+    records = UTF8_DECODER.decode(bytes.subarray(0, -1)).split('\0');
+  } catch {
+    throw gitError();
+  }
+  return records.map((record) => {
+    const match = /^(100(?:644|755)|120000|160000) ([0-9a-f]{40,64}) ([0-3])\t(.+)$/u.exec(record);
+    if (!match) throw gitError();
+    return { mode: match[1], object: match[2], stage: match[3], path: safeRelativePath(match[4]).join('/') };
+  });
+}
+
+async function captureGitView(runGit) {
+  // 先验证 HEAD，损坏引用不能被误判为 unborn；摘要本身不绑定提交身份。
+  await resolveGitHead(runGit);
+  const worktree = await invokeGit(runGit, [
+    'diff', '--binary', '--no-ext-diff', '--', '.',
+    ':(exclude).git', ':(exclude).git/**', ':(exclude).goal-lock', ':(exclude).goal-lock/**',
   ]);
   const untrackedOutput = await invokeGit(runGit, ['ls-files', '--others', '--exclude-standard', '-z', '--']);
   const trackedOutput = await invokeGit(runGit, ['ls-files', '--stage', '-z', '--']);
@@ -399,77 +393,176 @@ async function captureGitState(runGit) {
     .filter((name) => !isBookkeepingPath(name))
     .map((name) => safeRelativePath(name).join('/'))
     .sort(compareNames);
-  const tracked = decodeGitPaths(trackedOutput).filter((entry) => {
-    const separator = entry.indexOf('\t');
-    return separator === -1 || !isBookkeepingPath(entry.slice(separator + 1));
-  });
-  if (tracked.some((entry) => entry.startsWith('120000 '))) {
-    throw integrityError('WORKSPACE_FILE_UNSAFE', 'Git workspace inputs must not contain symbolic links.');
+  const tracked = parseIndexEntries(trackedOutput).filter((entry) => !isBookkeepingPath(entry.path));
+  if (tracked.some((entry) => entry.stage !== '0')) {
+    throw integrityError('WORKSPACE_FILE_UNSAFE', 'Git workspace inputs must have one resolved index entry per path.');
   }
-  return { head, diff, untracked, tracked };
+  if (tracked.some((entry) => !['100644', '100755'].includes(entry.mode))) {
+    throw integrityError('WORKSPACE_FILE_UNSAFE', 'Git workspace inputs must be regular files.');
+  }
+  return { worktree, untracked, tracked };
 }
 
-function sameGitState(left, right) {
-  return left.head === right.head
-    && left.diff.equals(right.diff)
+function sameGitView(left, right) {
+  return left.worktree.equals(right.worktree)
     && left.untracked.length === right.untracked.length
     && left.untracked.every((name, index) => name === right.untracked[index])
     && left.tracked.length === right.tracked.length
-    && left.tracked.every((entry, index) => entry === right.tracked[index]);
+    && left.tracked.every((entry, index) => (
+      entry.mode === right.tracked[index].mode
+      && entry.object === right.tracked[index].object
+      && entry.stage === right.tracked[index].stage
+      && entry.path === right.tracked[index].path
+    ));
 }
 
-async function gitFingerprint(reader, runGit) {
+function createManifest(mode, entries) {
+  const manifestValue = {
+    mode,
+    entries: entries.toSorted((left, right) => left.path.localeCompare(right.path)),
+  };
+  return Object.freeze({
+    ...manifestValue,
+    manifest_digest: sha256(canonicalBytes(manifestValue)),
+  });
+}
+
+async function gitManifest(reader, runGit) {
   const topLevel = await invokeGit(runGit, ['rev-parse', '--show-toplevel']);
   if (!samePath(topLevel.toString('utf8').trim(), reader.root)) {
     throw integrityError('WORKSPACE_GIT_ROOT_INVALID', 'Workspace root must equal the Git repository top level.');
   }
-  const before = await captureGitState(runGit);
-  const files = await fingerprintFiles(reader, before.untracked);
-  await reader.verifyInputs();
-  const after = await captureGitState(runGit);
-  // Git 负责 tracked/index 快照，安全 reader 负责未跟踪文件；两侧都必须在最终复验后仍等于首次捕获。
-  if (!sameGitState(before, after)) {
-    throw integrityError('WORKSPACE_INPUT_CHANGED', 'Git workspace inputs changed during fingerprint capture.');
+  const before = await captureGitView(runGit);
+  const entries = [];
+  for (const indexed of before.tracked) {
+    const input = await reader.readFile(indexed.path, { optional: true });
+    if (input) {
+      const indexBytes = await invokeGit(runGit, ['cat-file', 'blob', indexed.object]);
+      entries.push({
+        path: indexed.path,
+        source: 'tracked',
+        mode: input.mode,
+        size: input.size,
+        digest: input.digest,
+        index_mode: indexed.mode,
+        index_digest: sha256(indexBytes),
+      });
+    }
   }
-  return sha256(framedManifest({
-    mode: 'git',
-    head: before.head,
-    diff_size: before.diff.length,
-    files: files.map(({ name, mode, size }) => ({ name, mode, size })),
-  }, [before.diff, ...files.map((file) => file.bytes)]));
-}
-
-async function inventoryFingerprint(reader, inventory) {
-  const names = normalizeInventory(inventory);
-  const files = await fingerprintFiles(reader, names);
+  for (const relativePath of before.untracked) {
+    const input = await reader.readFile(relativePath);
+    entries.push({
+      path: relativePath,
+      source: 'untracked',
+      mode: input.mode,
+      size: input.size,
+      digest: input.digest,
+      index_mode: null,
+      index_digest: null,
+    });
+  }
   await reader.verifyInputs();
-  return sha256(framedManifest({
-    mode: 'inventory',
-    files: files.map(({ name, mode, size }) => ({ name, mode, size })),
-  }, files.map((file) => file.bytes)));
+  const after = await captureGitView(runGit);
+  // Git/index 视图与安全读取的文件快照必须同时稳定，避免混合两个时刻的字节。
+  if (!sameGitView(before, after)) {
+    throw integrityError('WORKSPACE_INPUT_CHANGED', 'Git workspace inputs changed during manifest capture.');
+  }
+  return createManifest('git', entries);
 }
 
-/** 生成只接受真实 Git 根的工作区摘要。 */
-export async function gitWorkspaceFingerprint(root) {
-  const reader = await createWorkspaceReader(root);
-  const runGit = defaultGitRunner(reader.root);
-  const probe = await invokeGit(runGit, ['rev-parse', '--is-inside-work-tree'], { unavailableRoot: reader.root });
-  if (probe?.toString('ascii').trim() !== 'true') throw gitError();
-  return gitFingerprint(reader, runGit);
+async function inventoryManifest(reader, inventory) {
+  const names = normalizeInventory(inventory);
+  const entries = [];
+  for (const relativePath of names) {
+    const input = await reader.readFile(relativePath);
+    entries.push({
+      path: relativePath,
+      source: 'inventory',
+      mode: input.mode,
+      size: input.size,
+      digest: input.digest,
+      index_mode: null,
+      index_digest: null,
+    });
+  }
+  await reader.verifyInputs();
+  return createManifest('inventory', entries);
 }
 
-/** 生成只绑定显式交付清单的非 Git 工作区摘要。 */
-export async function inventoryWorkspaceFingerprint(root, inventory) {
-  return inventoryFingerprint(await createWorkspaceReader(root), inventory);
-}
-
-/** 优先选择 Git，并在 Git 不可用或非 Git 根时回退到显式清单。 */
-export async function workspaceFingerprint(root, inventory, context = {}) {
+/** 捕获唯一的 Git 或显式清单工作区视图，不允许两个视图竞争。 */
+export async function captureWorkspaceManifest(root, inventory = null, context = {}) {
   const reader = await createWorkspaceReader(root, context);
   const runGit = context.runGit ?? defaultGitRunner(reader.root);
   const probe = await invokeGit(runGit, ['rev-parse', '--is-inside-work-tree'], { unavailableRoot: reader.root });
   if (probe?.toString('ascii').trim() === 'true') {
-    return gitFingerprint(reader, runGit);
+    if (inventory !== null) {
+      throw integrityError('WORKSPACE_INVENTORY_INVALID', 'A Git workspace cannot select a competing inventory view.');
+    }
+    return gitManifest(reader, runGit);
   }
-  return inventoryFingerprint(reader, inventory);
+  return inventoryManifest(reader, inventory);
+}
+
+/** 将已捕获清单固定为版本一目标的可验证范围基线。 */
+export function createScopeBaseline(goalReference, manifest, recordedAt) {
+  const withoutDigest = {
+    schema_version: 2,
+    scope_version: 1,
+    goal: goalReference,
+    mode: manifest.mode,
+    entries: manifest.entries,
+    recorded_at: recordedAt,
+  };
+  return verifyScopeBaseline({
+    ...withoutDigest,
+    record_digest: sha256(canonicalBytes(withoutDigest)),
+  }, goalReference);
+}
+
+/** 验证持久化范围基线的目标绑定、条目格式和记录摘要。 */
+export function verifyScopeBaseline(scope, goalReference) {
+  return validateScopeBaseline(scope, goalReference);
+}
+
+/** 计算两份清单的精确路径差异；清单模式不允许静默丢失已知基线路径。 */
+export function computeWorkspaceDelta(baselineEntries, currentEntries) {
+  const baseline = new Map(baselineEntries.map((entry) => [entry.path, entry]));
+  const current = new Map(currentEntries.map((entry) => [entry.path, entry]));
+  for (const [relativePath, entry] of baseline) {
+    if (entry.source === 'inventory' && !current.has(relativePath)) {
+      throw integrityError('WORKSPACE_INVENTORY_INCOMPLETE', 'An inventory manifest omitted a baseline path.');
+    }
+  }
+  const entries = [...new Set([...baseline.keys(), ...current.keys()])]
+    .toSorted(compareNames)
+    .flatMap((relativePath) => {
+      const before = baseline.get(relativePath) ?? null;
+      const after = current.get(relativePath) ?? null;
+      return canonicalBytes(before).equals(canonicalBytes(after)) ? [] : [{ path: relativePath, baseline: before, current: after }];
+    });
+  const deltaValue = { entries, paths: entries.map((entry) => entry.path) };
+  return Object.freeze({ ...deltaValue, delta_digest: sha256(canonicalBytes(deltaValue)) });
+}
+
+/** 工作区指纹只从已捕获的规范清单推导，绝不重新读取工作区。 */
+export function workspaceFingerprintFromManifest(manifest) {
+  return sha256(canonicalBytes({ mode: manifest.mode, entries: manifest.entries }));
+}
+
+/** 兼容旧调用方：Git 摘要委托给唯一的清单捕获管线。 */
+export async function gitWorkspaceFingerprint(root) {
+  const manifest = await captureWorkspaceManifest(root);
+  if (manifest.mode !== 'git') throw gitError();
+  return workspaceFingerprintFromManifest(manifest);
+}
+
+/** 兼容旧调用方：非 Git 摘要仍由同一份清单派生。 */
+export async function inventoryWorkspaceFingerprint(root, inventory) {
+  const reader = await createWorkspaceReader(root);
+  return workspaceFingerprintFromManifest(await inventoryManifest(reader, inventory));
+}
+
+/** 兼容旧调用方：捕获一次清单后派生单一工作区指纹。 */
+export async function workspaceFingerprint(root, inventory, context = {}) {
+  return workspaceFingerprintFromManifest(await captureWorkspaceManifest(root, inventory ?? null, context));
 }

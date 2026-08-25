@@ -4357,9 +4357,9 @@ async function writeDelivery(root, relativePath, bytes) {
   await writeFile(join(root, ...segments), bytes);
 }
 
-test('Git fingerprint binds HEAD plus staged, unstaged, deleted, renamed, binary, Unicode, and untracked bytes', async (testContext) => {
+test('workspace manifest binds staged, unstaged, deleted, renamed, binary, Unicode, and untracked bytes without binding HEAD', async (testContext) => {
   const fixture = createGoalLockFixture(testContext);
-  const { workspaceFingerprint } = await workspaceReader();
+  const { captureWorkspaceManifest, workspaceFingerprint } = await workspaceReader();
   await writeDelivery(fixture.root, '.gitignore', 'ignored.txt\n');
   await writeDelivery(fixture.root, 'unstaged.txt', 'base\n');
   await writeDelivery(fixture.root, 'staged.txt', 'base\n');
@@ -4368,10 +4368,10 @@ test('Git fingerprint binds HEAD plus staged, unstaged, deleted, renamed, binary
   await writeDelivery(fixture.root, 'binary.bin', Buffer.from([0, 1, 2, 3]));
   git(fixture.root, ['add', '--', '.']);
   git(fixture.root, ['commit', '--quiet', '-m', 'base']);
-  const clean = await workspaceFingerprint(fixture.root, undefined, fixture);
+  const clean = await captureWorkspaceManifest(fixture.root, null, fixture);
   git(fixture.root, ['commit', '--quiet', '--allow-empty', '-m', 'new head']);
-  const newHead = await workspaceFingerprint(fixture.root, undefined, fixture);
-  assert.notEqual(newHead, clean);
+  const newHead = await captureWorkspaceManifest(fixture.root, null, fixture);
+  assert.equal(newHead.manifest_digest, clean.manifest_digest);
 
   const mutations = [
     async () => writeDelivery(fixture.root, 'unstaged.txt', 'changed unstaged\n'),
@@ -4385,7 +4385,7 @@ test('Git fingerprint binds HEAD plus staged, unstaged, deleted, renamed, binary
     async () => writeDelivery(fixture.root, '\u4ea4\u4ed8-\ud83d\ude80.txt', Buffer.from('\u771f\u5b9e UTF-8 \u5b57\u8282\n')),
     async () => writeDelivery(fixture.root, 'untracked.txt', Buffer.from('untracked bytes\n')),
   ];
-  let previous = newHead;
+  let previous = await workspaceFingerprint(fixture.root, undefined, fixture);
   for (const mutate of mutations) {
     await mutate();
     const current = await workspaceFingerprint(fixture.root, undefined, fixture);
