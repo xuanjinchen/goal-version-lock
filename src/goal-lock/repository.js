@@ -12,13 +12,21 @@ import {
   validatePlan,
   validateProgressEvent,
 } from './contracts.js';
+import {
+  assertEvidenceAuthorized,
+  buildAuthorizationGraph,
+  deriveScopeBlockers,
+  resolveValidationRef,
+} from './authorization.js';
 import { commitGoalFiles, withGoalLock } from './transaction.js';
 import {
+  computeWorkspaceDelta,
   captureWorkspaceManifest,
   createScopeBaseline,
   createWorkspaceReader,
   verifyScopeBaseline,
   workspaceFingerprint,
+  workspaceFingerprintFromManifest,
 } from './workspace.js';
 
 const ACTIVE_WRITE = Symbol('active goal writer');
@@ -231,12 +239,49 @@ async function readCanonicalObject(reader, relativePath, label) {
 
 function validatePlanCriteria(plan, goal) {
   const criterionIds = new Set(goal.acceptance_criteria.map((criterion) => criterion.id));
+  const coveredCriteria = new Set();
   for (const task of plan.tasks) {
     if (task.acceptance_criteria.some((criterionId) => !criterionIds.has(criterionId))) {
       throw inputError('INVALID_PLAN_REFERENCE', 'Plan acceptance criteria must belong to the bound goal.');
     }
+    for (const criterionId of task.acceptance_criteria) coveredCriteria.add(criterionId);
+  }
+  if ([...criterionIds].some((criterionId) => !coveredCriteria.has(criterionId))) {
+    throw inputError('INVALID_PLAN_REFERENCE', 'Plan tasks must cover every acceptance criterion in the bound goal.');
   }
   return plan;
+}
+
+/** 从已核验归档构建唯一授权图；仓库不维护第二份计划、证据或路径权限账本。 */
+function repositoryAuthorizationGraph(history, planState, evidenceState, changeState, candidatePlan = null) {
+  const planRecords = [
+    ...planState.archives.map((record) => record.value),
+    ...(planState.current ? [planState.current.value] : []),
+    ...(candidatePlan ? [candidatePlan] : []),
+  ];
+  if (planRecords.length === 0) return null;
+  return buildAuthorizationGraph({
+    goalHistory: [...history.goals.values()].map((record) => record.goal),
+    planRecords,
+    evidenceRecords: evidenceState.records.map((record) => record.value),
+    changeRecords: [...changeState.records.values()].map((record) => record.value),
+  });
+}
+
+function assertEvidenceReplayAuthorized(graph, evidenceState, progressState) {
+  for (const record of evidenceState.records) {
+    const evidence = record.value;
+    const supersedingPlan = progressState.events.find((event) => (
+      event.event_type === 'plan-revision'
+      && (event.goal.goal_version > evidence.validation_ref.goal_version
+        || (event.goal.goal_version === evidence.validation_ref.goal_version
+          && event.plan_revision > evidence.validation_ref.plan_revision))
+    ));
+    assertEvidenceAuthorized(graph, evidence, {
+      mode: 'replay',
+      superseded_at: supersedingPlan?.recorded_at,
+    });
+  }
 }
 
 function validateRepositoryPlan(value, goalRecord, label) {
@@ -495,7 +540,7 @@ async function verifyProgressLedger(reader, rootNames, lock, goalHistory, planSt
     || terminal.event_digest !== lock.progress_head.digest) {
     throw integrityError('PROGRESS_HEAD_MISMATCH', 'Lock progress head does not match the terminal progress event.');
   }
-  verifyProgressPlanState(plans, eventsByPlan, changeState);
+  verifyProgressPlanState(plans, eventsByPlan, changeState, planState);
   for (const record of evidenceState.records) {
     const matches = events.filter((event) => evidenceCreationEventMatchesRecord(event, record));
     if (matches.length !== 1) {
@@ -508,13 +553,14 @@ async function verifyProgressLedger(reader, rootNames, lock, goalHistory, planSt
   return { count, events, input, terminal };
 }
 
-function verifyProgressPlanState(plans, eventsByPlan, changeState) {
-  const orderedPlans = [...plans.values()].sort((left, right) => (
-    left.goal.goal_version - right.goal.goal_version
-    || left.plan_revision - right.plan_revision
+function verifyProgressPlanState(plans, eventsByPlan, changeState, planState) {
+  const orderedRecords = [...planState.archives, planState.current].filter(Boolean).sort((left, right) => (
+    left.value.goal.goal_version - right.value.goal.goal_version
+    || left.value.plan_revision - right.value.plan_revision
   ));
+  const orderedPlans = orderedRecords.map((record) => record.value);
   let previousStatuses = new Map();
-  for (const plan of orderedPlans) {
+  for (const [planIndex, plan] of orderedPlans.entries()) {
     const planKey = `${plan.goal.goal_version}/${plan.plan_revision}`;
     const planEvents = eventsByPlan.get(planKey);
     const lifecycleCount = planEvents.filter((event) => event.event_type === 'plan-revision').length;
@@ -523,6 +569,14 @@ function verifyProgressPlanState(plans, eventsByPlan, changeState) {
         'PROGRESS_PLAN_LIFECYCLE_INVALID',
         'Every plan revision requires exactly one plan-revision event as its first bound event.',
       );
+    }
+    const previousDigest = planIndex === 0 ? null : orderedRecords[planIndex - 1].digest;
+    const summaryPattern = new RegExp(
+      `^Recorded plan v${String(plan.goal.goal_version).padStart(4, '0')}/r${String(plan.plan_revision).padStart(4, '0')} sha256:[a-f0-9]{64} previous:${previousDigest ?? 'none'}$`,
+      'u',
+    );
+    if (!summaryPattern.test(planEvents[0].summary)) {
+      throw integrityError('PROGRESS_PLAN_DIGEST_MISMATCH', 'Plan revision event does not bind its plan and exact predecessor digest.');
     }
 
     // 新目标版本继承未受影响任务的终态；批准 CR 列出的任务例外地从 stale 开始，首次出现的任务仍从 pending 回放。
@@ -574,11 +628,11 @@ function evidenceCreationEventMatchesRecord(event, record) {
     && event.evidence_refs[0] === record.value.evidence_id
     && event.summary === evidenceEventSummary(record.value, record.digest)
     && event.recorded_at === record.value.recorded_at
-    && event.plan_revision === record.value.plan_revision
+    && event.plan_revision === record.value.validation_ref.plan_revision
     && event.task_id === record.value.task_id
-    && event.goal.goal_id === record.value.goal.goal_id
-    && event.goal.goal_version === record.value.goal.goal_version
-    && event.goal.goal_digest === record.value.goal.goal_digest;
+    && event.goal.goal_id === record.value.validation_ref.goal_id
+    && event.goal.goal_version === record.value.validation_ref.goal_version
+    && event.goal.goal_digest === record.value.validation_ref.goal_digest;
 }
 
 function ordinaryEvidenceReferencesResolve(evidenceState, event) {
@@ -587,10 +641,10 @@ function ordinaryEvidenceReferencesResolve(evidenceState, event) {
   // bare ID 只在事件的目标、计划和任务范围内解析；自动证据事件另由 qualified summary 消除歧义。
   return event.evidence_refs.every((evidenceId) => (
     (evidenceState.recordsById.get(evidenceId) ?? []).filter((record) => (
-      record.value.goal.goal_id === event.goal.goal_id
-      && record.value.goal.goal_version === event.goal.goal_version
-      && record.value.goal.goal_digest === event.goal.goal_digest
-      && record.value.plan_revision === event.plan_revision
+      record.value.validation_ref.goal_id === event.goal.goal_id
+      && record.value.validation_ref.goal_version === event.goal.goal_version
+      && record.value.validation_ref.goal_digest === event.goal.goal_digest
+      && record.value.validation_ref.plan_revision === event.plan_revision
       && record.value.task_id === event.task_id
     )).length === 1
   ));
@@ -652,7 +706,7 @@ async function verifyEvidenceState(reader, rootNames, lock, goalHistory, planSta
     for (const [index, name] of criterionDirectory.names.entries()) {
       const record = await readCanonicalObject(reader, `.goal-lock/evidence/${criterion}/${name}`, 'evidence record');
       const evidenceId = name.slice(0, -5);
-      const goalRecord = goalHistory.get(record.value.goal?.goal_version);
+      const goalRecord = goalHistory.get(record.value.validation_ref?.goal_version);
       if (!goalRecord) {
         throw integrityError('EVIDENCE_GOAL_UNKNOWN', 'Evidence references an unknown goal version.');
       }
@@ -672,7 +726,7 @@ async function verifyEvidenceState(reader, rootNames, lock, goalHistory, planSta
       if (!goalRecord.goal.acceptance_criteria.some((candidate) => candidate.id === criterion)) {
         throw integrityError('EVIDENCE_CRITERION_UNKNOWN', 'Evidence references an unknown acceptance criterion.');
       }
-      const plan = plans.get(`${value.goal.goal_version}/${value.plan_revision}`);
+      const plan = plans.get(`${value.validation_ref.goal_version}/${value.validation_ref.plan_revision}`);
       const task = plan?.tasks.find((candidate) => candidate.id === value.task_id);
       if (!task || !task.acceptance_criteria.includes(criterion)) {
         throw integrityError('EVIDENCE_TASK_UNKNOWN', 'Evidence task must exist in its bound plan and own the criterion.');
@@ -880,6 +934,15 @@ export async function verifyGoalRepository(root, context = {}) {
       history.goals,
       planState,
     );
+    const authorizationGraph = repositoryAuthorizationGraph(history, planState, evidenceState, changeState);
+    const workspaceManifest = await captureWorkspaceManifest(
+      root,
+      scope.scope.mode === 'inventory' ? scope.scope.entries.map((entry) => entry.path) : null,
+      context,
+    );
+    const scopeBlockers = authorizationGraph
+      ? deriveScopeBlockers(authorizationGraph, computeWorkspaceDelta(scope.scope.entries, workspaceManifest.entries).paths)
+      : [];
     const progressState = await verifyProgressLedger(
       reader,
       rootNames,
@@ -889,6 +952,7 @@ export async function verifyGoalRepository(root, context = {}) {
       evidenceState,
       changeState,
     );
+    if (authorizationGraph) assertEvidenceReplayAuthorized(authorizationGraph, evidenceState, progressState);
     verifyLockBindings(current, lockInput.lock, history.activeHistory, changeState);
     await reader.verifyInputs();
     const optional = {
@@ -900,10 +964,13 @@ export async function verifyGoalRepository(root, context = {}) {
     const result = {
       state: changeState.pending ? 'CHANGE_PENDING' : 'LOCKED',
       scope: scope.scope,
+      authorization_graph_digest: authorizationGraph?.digest ?? null,
+      cumulative_permitted_paths: authorizationGraph?.cumulative_permitted_paths ?? [],
+      scope_blockers: scopeBlockers,
       evidence: verificationEvidence(reader, current, optional, [], evidenceState.publicLatest),
     };
     return context[RETURN_VERIFIED_SNAPSHOT] === true
-      ? { result, reader, current, rootNames, lockInput, planState, progressState, evidenceState, changeState, history, scope }
+      ? { result, reader, current, rootNames, lockInput, planState, progressState, evidenceState, changeState, history, scope, authorizationGraph }
       : result;
   } catch (error) {
     const failure = repositoryIntegrity('GOAL_REPOSITORY_TAMPERED', 'Goal repository integrity verification failed.', error);
@@ -1024,10 +1091,10 @@ function validatePlanCandidate(candidate) {
     || (Object.getPrototypeOf(candidate) !== Object.prototype && Object.getPrototypeOf(candidate) !== null)) {
     throw inputError('INVALID_PLAN_INPUT', 'Plan candidate must be an object.');
   }
-  const fields = ['next_task_id', 'tasks', 'deferred'];
+  const fields = ['next_task_id', 'tasks', 'risks', 'deferred'];
   const keys = Object.keys(candidate);
   if (keys.length !== fields.length || fields.some((field) => !Object.hasOwn(candidate, field))) {
-    throw inputError('INVALID_PLAN_INPUT', 'Plan candidate must contain exactly next_task_id, tasks, and deferred.');
+    throw inputError('INVALID_PLAN_INPUT', 'Plan candidate must contain exactly next_task_id, tasks, risks, and deferred.');
   }
   return candidate;
 }
@@ -1142,7 +1209,7 @@ function validateGoalEventInput(input) {
     throw inputError('INVALID_EVENT_INPUT', 'Goal event input must be an object.');
   }
   const fields = input.kind === 'evidence'
-    ? ['kind', 'acceptance_criterion_id', 'task_id', 'method', 'observed_result', 'artifact_refs', 'workspace_fingerprint', 'state', 'supersedes']
+    ? ['kind', 'acceptance_criterion_id', 'validation_ref', 'task_id', 'observed_result', 'artifact_refs', 'inventory', 'state', 'failure_paths', 'supersedes']
     : input.kind === 'final-audit'
       ? ['kind', 'semantic_summary', 'inventory']
       : ['kind', 'event_type', 'task_id', 'summary', 'evidence_refs'];
@@ -1169,7 +1236,7 @@ function validateGoalEventInput(input) {
 function buildProgressEvent(progressState, goalReference, planRevision, input, context, recordedAt) {
   const eventId = `EVT-${String(progressState.count + 1).padStart(6, '0')}`;
   const withoutDigest = {
-    schema_version: 1,
+    schema_version: 2,
     event_id: eventId,
     recorded_at: recordedAt ?? (context.now ?? (() => new Date().toISOString()))(),
     goal: goalReference,
@@ -1234,6 +1301,20 @@ async function fingerprintAcrossRepositoryRevalidation(root, inventory, reader, 
   return after;
 }
 
+async function authorizedWorkspaceFingerprint(root, inventory, reader, scope, graph, context) {
+  const before = await captureWorkspaceManifest(root, inventory ?? null, context);
+  await reader.verifyInputs();
+  const after = await captureWorkspaceManifest(root, inventory ?? null, context);
+  if (before.manifest_digest !== after.manifest_digest) {
+    throw integrityError('WORKSPACE_INPUT_CHANGED', 'Workspace inputs changed across authorization revalidation.');
+  }
+  const blockers = deriveScopeBlockers(graph, computeWorkspaceDelta(scope.entries, after.entries).paths);
+  if (blockers.length > 0) {
+    throw stateError('WORKSPACE_SCOPE_UNAUTHORIZED', `Workspace delta includes unauthorized path ${blockers[0].path}.`);
+  }
+  return workspaceFingerprintFromManifest(after);
+}
+
 function nextLockForEvent(lockInput, event) {
   const { record_digest: _recordDigest, ...withoutDigest } = lockInput.lock;
   const nextWithoutDigest = {
@@ -1245,6 +1326,10 @@ function nextLockForEvent(lockInput, event) {
     ...nextWithoutDigest,
     record_digest: sha256(canonicalBytes(nextWithoutDigest)),
   });
+}
+
+function planRevisionSummary(goalVersion, planRevision, planDigest, previousDigest) {
+  return `Recorded plan v${String(goalVersion).padStart(4, '0')}/r${String(planRevision).padStart(4, '0')} sha256:${planDigest} previous:${previousDigest ?? 'none'}`;
 }
 
 function nextLockForEvidence(lockInput, event, evidence, evidenceDigest) {
@@ -1343,8 +1428,8 @@ function validatePlanStatusOwnership(plan, priorPlan) {
 }
 
 export async function revisePlan(root, candidate, classification, context = {}) {
-  if (!['aligned', 'implementation-choice'].includes(classification)) {
-    throw inputError('INVALID_CLASSIFICATION', 'Plan classification must be aligned or implementation-choice.');
+  if (!['aligned', 'implementation-only'].includes(classification)) {
+    throw inputError('INVALID_CLASSIFICATION', 'Plan classification must be aligned or implementation-only.');
   }
   validatePlanCandidate(candidate);
 
@@ -1361,7 +1446,7 @@ export async function revisePlan(root, candidate, classification, context = {}) 
     }
 
     // 事务预条件必须复用同一验证快照，不能用第二次读取覆盖已信任的基线。
-    const { reader, current, lockInput, planState, progressState, history } = snapshot;
+    const { reader, current, lockInput, planState, progressState, evidenceState, changeState, history } = snapshot;
     const priorPlan = planState.current;
     const planRevision = priorPlan ? priorPlan.value.plan_revision + 1 : 1;
     const goalReference = {
@@ -1370,18 +1455,25 @@ export async function revisePlan(root, candidate, classification, context = {}) 
       goal_digest: current.digest,
     };
     const plan = validatePlanStatusOwnership(validatePlanCriteria(validatePlan({
-      schema_version: 1,
+      schema_version: 2,
       goal: goalReference,
       plan_revision: planRevision,
       next_task_id: candidate.next_task_id,
       tasks: candidate.tasks,
+      risks: candidate.risks,
       deferred: candidate.deferred,
     }, goalReference), current.goal), priorPlan?.value ?? null);
+    try {
+      repositoryAuthorizationGraph(history, planState, evidenceState, changeState, plan);
+    } catch (error) {
+      throw inputError('INVALID_PLAN_AUTHORIZATION', `Plan candidate violates the authorization graph: ${error.message}`);
+    }
     const planBytes = canonicalBytes(plan);
+    const planDigest = sha256(planBytes);
     const event = buildProgressEvent(progressState, goalReference, planRevision, {
       event_type: 'plan-revision',
       task_id: null,
-      summary: `Recorded plan revision ${planRevision}`,
+      summary: planRevisionSummary(current.goal.goal_version, planRevision, planDigest, priorPlan?.digest ?? null),
       evidence_refs: [],
     }, context);
 
@@ -1486,20 +1578,21 @@ export async function recordGoalEvent(root, input, context = {}) {
       };
     }
     if (input.kind === 'evidence') {
-      const criterion = current.goal.acceptance_criteria.find(
-        (candidate) => candidate.id === input.acceptance_criterion_id,
+      const fingerprint = await authorizedWorkspaceFingerprint(
+        root,
+        input.inventory,
+        reader,
+        snapshot.scope.scope,
+        snapshot.authorizationGraph,
+        context,
       );
-      if (!criterion) {
-        throw inputError('INVALID_EVIDENCE_REFERENCE', 'Evidence acceptance_criterion_id must reference the current goal.');
+      let validation;
+      try {
+        validation = resolveValidationRef(snapshot.authorizationGraph, input.validation_ref);
+      } catch (error) {
+        throw inputError('INVALID_EVIDENCE_REFERENCE', `Evidence validation reference is not authorized: ${error.message}`);
       }
-      const task = plan.tasks.find((candidate) => candidate.id === input.task_id);
-      if (!task || !task.acceptance_criteria.includes(criterion.id)) {
-        throw inputError(
-          'INVALID_EVIDENCE_REFERENCE',
-          'Evidence task_id must reference a current-plan task that owns the criterion.',
-        );
-      }
-      const priorRecords = evidenceState.recordsByCriterion.get(criterion.id) ?? [];
+      const priorRecords = evidenceState.recordsByCriterion.get(input.acceptance_criterion_id) ?? [];
       const preceding = priorRecords.at(-1)?.value.evidence_id ?? null;
       if (input.supersedes !== preceding) {
         throw inputError(
@@ -1513,25 +1606,30 @@ export async function recordGoalEvent(root, input, context = {}) {
       const evidenceId = `EVID-${String(priorRecords.length + 1).padStart(4, '0')}`;
       const recordedAt = (context.now ?? (() => new Date().toISOString()))();
       const evidence = validateEvidence({
-        schema_version: 1,
+        schema_version: 2,
         evidence_id: evidenceId,
-        acceptance_criterion_id: criterion.id,
-        goal: goalReference,
-        plan_revision: plan.plan_revision,
-        task_id: task.id,
-        method: input.method,
+        acceptance_criterion_id: input.acceptance_criterion_id,
+        validation_ref: validation.validation_ref,
+        task_id: input.task_id,
         observed_result: input.observed_result,
         artifact_refs: input.artifact_refs,
-        workspace_fingerprint: input.workspace_fingerprint,
+        workspace_fingerprint: fingerprint,
         state: input.state,
+        failure_paths: input.failure_paths,
         supersedes: input.supersedes,
+        derivation: null,
         recorded_at: recordedAt,
       }, goalReference);
+      try {
+        assertEvidenceAuthorized(snapshot.authorizationGraph, evidence, { mode: 'write' });
+      } catch (error) {
+        throw inputError('INVALID_EVIDENCE_AUTHORIZATION', `Evidence does not satisfy authorization: ${error.message}`);
+      }
       const evidenceBytes = canonicalBytes(evidence);
       const evidenceDigest = sha256(evidenceBytes);
       const event = buildProgressEvent(progressState, goalReference, plan.plan_revision, {
         event_type: 'verification-result',
-        task_id: task.id,
+        task_id: validation.task_id,
         summary: evidenceEventSummary(evidence, evidenceDigest),
         evidence_refs: [evidenceId],
       }, context, recordedAt);
@@ -1544,7 +1642,7 @@ export async function recordGoalEvent(root, input, context = {}) {
       });
       entries.push(...verifiedEvidenceEntries(evidenceState));
       entries.push({
-        target: `.goal-lock/evidence/${criterion.id}/${evidenceId}.json`,
+        target: `.goal-lock/evidence/${evidence.acceptance_criterion_id}/${evidenceId}.json`,
         expected: { kind: 'absent' },
         content: evidenceBytes,
       });
@@ -1561,13 +1659,13 @@ export async function recordGoalEvent(root, input, context = {}) {
         state: 'LOCKED',
         evidence_id: evidenceId,
         evidence_digest: evidenceDigest,
-        acceptance_criterion_id: criterion.id,
+        acceptance_criterion_id: evidence.acceptance_criterion_id,
         event_id: event.event_id,
         event_digest: event.event_digest,
         goal_id: current.goal.goal_id,
         goal_version: current.goal.goal_version,
-        plan_revision: plan.plan_revision,
-        task_id: task.id,
+        plan_revision: evidence.validation_ref.plan_revision,
+        task_id: validation.task_id,
       };
     }
     const event = buildProgressEvent(progressState, goalReference, plan.plan_revision, input, context);

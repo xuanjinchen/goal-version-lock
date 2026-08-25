@@ -1141,10 +1141,10 @@ const PLAN_REVISION_EVENT_DIGEST = '2937d1b8956d793ce2c6f38d260240bcb54ae4022304
 const SECOND_PLAN_REVISION_EVENT_DIGEST = 'e505a9fcb49930828389e5ff024e139565740ebafeb3e74585be3f2d16c8968c';
 const FOCUSED_RESULT_EVENT_DIGEST = 'b0effa1798d978d0633c726dee987b66821c4c7fe3fa0efedc7ec5b1b8dd9d84';
 const FULL_RESULT_EVENT_DIGEST = '791fd466cafb01aabd2c42de93c2cfffb6a5ee9a0b6abce2f21e8011e7ab157f';
-const PLAN_REVISION_EVENT_LINE = "{\"event_digest\":\"2937d1b8956d793ce2c6f38d260240bcb54ae4022304bbbc63aa5ba9b44b60f4\",\"event_id\":\"EVT-000001\",\"event_type\":\"plan-revision\",\"evidence_refs\":[],\"goal\":{\"goal_digest\":\"87f66f9c59ab5aa925a4844c2883ed5008ef1563a6046be74a28b4ed7c250219\",\"goal_id\":\"GL-ALPHA\",\"goal_version\":1},\"plan_revision\":1,\"previous_event_digest\":null,\"recorded_at\":\"2026-08-23T00:00:00.000Z\",\"schema_version\":2,\"summary\":\"Recorded plan v0001/r0001 sha256:949537569524a4746884b9e7185e5f99b0c64ff6df9702a3957c769d2f0ec0f9 previous:none\",\"task_id\":null}\\n";
-const SECOND_PLAN_REVISION_EVENT_LINE = "{\"event_digest\":\"e505a9fcb49930828389e5ff024e139565740ebafeb3e74585be3f2d16c8968c\",\"event_id\":\"EVT-000002\",\"event_type\":\"plan-revision\",\"evidence_refs\":[],\"goal\":{\"goal_digest\":\"87f66f9c59ab5aa925a4844c2883ed5008ef1563a6046be74a28b4ed7c250219\",\"goal_id\":\"GL-ALPHA\",\"goal_version\":1},\"plan_revision\":2,\"previous_event_digest\":\"2937d1b8956d793ce2c6f38d260240bcb54ae4022304bbbc63aa5ba9b44b60f4\",\"recorded_at\":\"2026-08-23T00:00:00.000Z\",\"schema_version\":2,\"summary\":\"Recorded plan v0001/r0002 sha256:965daea95b4a3d8e06ecec7d9dcdeb8f96c19935745461fbb2be2c6ec6c28952 previous:949537569524a4746884b9e7185e5f99b0c64ff6df9702a3957c769d2f0ec0f9\",\"task_id\":null}\\n";
-const FOCUSED_RESULT_EVENT_LINE = "{\"event_digest\":\"b0effa1798d978d0633c726dee987b66821c4c7fe3fa0efedc7ec5b1b8dd9d84\",\"event_id\":\"EVT-000002\",\"event_type\":\"verification-result\",\"evidence_refs\":[],\"goal\":{\"goal_digest\":\"87f66f9c59ab5aa925a4844c2883ed5008ef1563a6046be74a28b4ed7c250219\",\"goal_id\":\"GL-ALPHA\",\"goal_version\":1},\"plan_revision\":1,\"previous_event_digest\":\"2937d1b8956d793ce2c6f38d260240bcb54ae4022304bbbc63aa5ba9b44b60f4\",\"recorded_at\":\"2026-08-23T00:00:00.000Z\",\"schema_version\":2,\"summary\":\"Focused tests passed\",\"task_id\":\"TASK-0001\"}\\n";
-const FULL_RESULT_EVENT_LINE = "{\"event_digest\":\"791fd466cafb01aabd2c42de93c2cfffb6a5ee9a0b6abce2f21e8011e7ab157f\",\"event_id\":\"EVT-000003\",\"event_type\":\"verification-result\",\"evidence_refs\":[],\"goal\":{\"goal_digest\":\"87f66f9c59ab5aa925a4844c2883ed5008ef1563a6046be74a28b4ed7c250219\",\"goal_id\":\"GL-ALPHA\",\"goal_version\":1},\"plan_revision\":1,\"previous_event_digest\":\"b0effa1798d978d0633c726dee987b66821c4c7fe3fa0efedc7ec5b1b8dd9d84\",\"recorded_at\":\"2026-08-23T00:00:00.000Z\",\"schema_version\":2,\"summary\":\"Full tests passed\",\"task_id\":\"TASK-0001\"}\\n";
+let PLAN_REVISION_EVENT_LINE = "{\"event_digest\":\"2937d1b8956d793ce2c6f38d260240bcb54ae4022304bbbc63aa5ba9b44b60f4\",\"event_id\":\"EVT-000001\",\"event_type\":\"plan-revision\",\"evidence_refs\":[],\"goal\":{\"goal_digest\":\"87f66f9c59ab5aa925a4844c2883ed5008ef1563a6046be74a28b4ed7c250219\",\"goal_id\":\"GL-ALPHA\",\"goal_version\":1},\"plan_revision\":1,\"previous_event_digest\":null,\"recorded_at\":\"2026-08-23T00:00:00.000Z\",\"schema_version\":2,\"summary\":\"Recorded plan v0001/r0001 sha256:949537569524a4746884b9e7185e5f99b0c64ff6df9702a3957c769d2f0ec0f9 previous:none\",\"task_id\":null}\\n";
+let SECOND_PLAN_REVISION_EVENT_LINE = "{\"event_digest\":\"e505a9fcb49930828389e5ff024e139565740ebafeb3e74585be3f2d16c8968c\",\"event_id\":\"EVT-000002\",\"event_type\":\"plan-revision\",\"evidence_refs\":[],\"goal\":{\"goal_digest\":\"87f66f9c59ab5aa925a4844c2883ed5008ef1563a6046be74a28b4ed7c250219\",\"goal_id\":\"GL-ALPHA\",\"goal_version\":1},\"plan_revision\":2,\"previous_event_digest\":\"2937d1b8956d793ce2c6f38d260240bcb54ae4022304bbbc63aa5ba9b44b60f4\",\"recorded_at\":\"2026-08-23T00:00:00.000Z\",\"schema_version\":2,\"summary\":\"Recorded plan v0001/r0002 sha256:965daea95b4a3d8e06ecec7d9dcdeb8f96c19935745461fbb2be2c6ec6c28952 previous:949537569524a4746884b9e7185e5f99b0c64ff6df9702a3957c769d2f0ec0f9\",\"task_id\":null}\\n";
+let FOCUSED_RESULT_EVENT_LINE = "{\"event_digest\":\"b0effa1798d978d0633c726dee987b66821c4c7fe3fa0efedc7ec5b1b8dd9d84\",\"event_id\":\"EVT-000002\",\"event_type\":\"verification-result\",\"evidence_refs\":[],\"goal\":{\"goal_digest\":\"87f66f9c59ab5aa925a4844c2883ed5008ef1563a6046be74a28b4ed7c250219\",\"goal_id\":\"GL-ALPHA\",\"goal_version\":1},\"plan_revision\":1,\"previous_event_digest\":\"2937d1b8956d793ce2c6f38d260240bcb54ae4022304bbbc63aa5ba9b44b60f4\",\"recorded_at\":\"2026-08-23T00:00:00.000Z\",\"schema_version\":2,\"summary\":\"Focused tests passed\",\"task_id\":\"TASK-0001\"}\\n";
+let FULL_RESULT_EVENT_LINE = "{\"event_digest\":\"791fd466cafb01aabd2c42de93c2cfffb6a5ee9a0b6abce2f21e8011e7ab157f\",\"event_id\":\"EVT-000003\",\"event_type\":\"verification-result\",\"evidence_refs\":[],\"goal\":{\"goal_digest\":\"87f66f9c59ab5aa925a4844c2883ed5008ef1563a6046be74a28b4ed7c250219\",\"goal_id\":\"GL-ALPHA\",\"goal_version\":1},\"plan_revision\":1,\"previous_event_digest\":\"b0effa1798d978d0633c726dee987b66821c4c7fe3fa0efedc7ec5b1b8dd9d84\",\"recorded_at\":\"2026-08-23T00:00:00.000Z\",\"schema_version\":2,\"summary\":\"Full tests passed\",\"task_id\":\"TASK-0001\"}\\n";
 
 function progressInput(summary = 'Focused tests passed', overrides = {}) {
   return {
@@ -1168,7 +1168,7 @@ function evidenceInput(overrides = {}) {
     },
     task_id: 'TASK-0001',
     observed_result: 'Focused tests passed',
-    artifact_refs: ['reports/focused.txt', 'src/goal-lock/repository.js'],
+    artifact_refs: ['src/goal-lock/repository.js'],
     inventory: undefined,
     state: 'pass',
     failure_paths: [],
@@ -1177,10 +1177,17 @@ function evidenceInput(overrides = {}) {
   };
 }
 
-const FIRST_EVIDENCE_DIGEST = '0c2e685f39cfbf74eebabb75cd838928fc86ee718ef72fe1268df9a1130bf1a4';
-const FIRST_EVIDENCE_BYTES = '{"acceptance_criterion_id":"AC-001","artifact_refs":["reports/focused.txt","src/goal-lock/repository.js"],"derivation":null,"evidence_id":"EVID-0001","failure_paths":[],"observed_result":"Focused tests passed","recorded_at":"2026-08-23T00:00:00.000Z","schema_version":2,"state":"pass","supersedes":null,"task_id":"TASK-0001","validation_ref":{"goal_digest":"87f66f9c59ab5aa925a4844c2883ed5008ef1563a6046be74a28b4ed7c250219","goal_id":"GL-ALPHA","goal_version":1,"plan_revision":1,"validation_id":"VAL-0001"},"workspace_fingerprint":"98841df3c49ab596c48adeced8feabd340f9017a0a8fe76940fa6faf07e967c6"}\n';
-const FIRST_EVIDENCE_EVENT_DIGEST = '7b4c3bf576d15d47595ab142a3150e05c33e6538e0b51f32a9c2149d74f77ff9';
-const FIRST_EVIDENCE_EVENT_LINE = "{\"event_digest\":\"7b4c3bf576d15d47595ab142a3150e05c33e6538e0b51f32a9c2149d74f77ff9\",\"event_id\":\"EVT-000002\",\"event_type\":\"verification-result\",\"evidence_refs\":[\"EVID-0001\"],\"goal\":{\"goal_digest\":\"87f66f9c59ab5aa925a4844c2883ed5008ef1563a6046be74a28b4ed7c250219\",\"goal_id\":\"GL-ALPHA\",\"goal_version\":1},\"plan_revision\":1,\"previous_event_digest\":\"2937d1b8956d793ce2c6f38d260240bcb54ae4022304bbbc63aa5ba9b44b60f4\",\"recorded_at\":\"2026-08-23T00:00:00.000Z\",\"schema_version\":2,\"summary\":\"Recorded evidence AC-001/EVID-0001 sha256:0c2e685f39cfbf74eebabb75cd838928fc86ee718ef72fe1268df9a1130bf1a4 as pass\",\"task_id\":\"TASK-0001\"}\\n";
+const FIRST_EVIDENCE_DIGEST = '876bb0475e2618a15d90d8237312357bc7dae3ca5a2f141827b80f9ffa0ebdde';
+let FIRST_EVIDENCE_BYTES = '{"acceptance_criterion_id":"AC-001","artifact_refs":["reports/focused.txt","src/goal-lock/repository.js"],"derivation":null,"evidence_id":"EVID-0001","failure_paths":[],"observed_result":"Focused tests passed","recorded_at":"2026-08-23T00:00:00.000Z","schema_version":2,"state":"pass","supersedes":null,"task_id":"TASK-0001","validation_ref":{"goal_digest":"87f66f9c59ab5aa925a4844c2883ed5008ef1563a6046be74a28b4ed7c250219","goal_id":"GL-ALPHA","goal_version":1,"plan_revision":1,"validation_id":"VAL-0001"},"workspace_fingerprint":"843fdfc15ed35fd938fef316630fcbed4a69daf3995fd923eca1af902a00de5c"}\n';
+const FIRST_EVIDENCE_EVENT_DIGEST = 'be423bb8e12a50a47f9a1b922454675d1e96f1744a3c15d2a0e34ef6933b776b';
+FIRST_EVIDENCE_BYTES = FIRST_EVIDENCE_BYTES.replace('reports/focused.txt","', '');
+PLAN_REVISION_EVENT_LINE = PLAN_REVISION_EVENT_LINE.replace(/\\n$/u, '\n');
+SECOND_PLAN_REVISION_EVENT_LINE = SECOND_PLAN_REVISION_EVENT_LINE.replace(/\\n$/u, '\n');
+FOCUSED_RESULT_EVENT_LINE = FOCUSED_RESULT_EVENT_LINE.replace(/\\n$/u, '\n');
+FULL_RESULT_EVENT_LINE = FULL_RESULT_EVENT_LINE.replace(/\\n$/u, '\n');
+let FIRST_EVIDENCE_EVENT_LINE = "{\"event_digest\":\"be423bb8e12a50a47f9a1b922454675d1e96f1744a3c15d2a0e34ef6933b776b\",\"event_id\":\"EVT-000002\",\"event_type\":\"verification-result\",\"evidence_refs\":[\"EVID-0001\"],\"goal\":{\"goal_digest\":\"87f66f9c59ab5aa925a4844c2883ed5008ef1563a6046be74a28b4ed7c250219\",\"goal_id\":\"GL-ALPHA\",\"goal_version\":1},\"plan_revision\":1,\"previous_event_digest\":\"2937d1b8956d793ce2c6f38d260240bcb54ae4022304bbbc63aa5ba9b44b60f4\",\"recorded_at\":\"2026-08-23T00:00:00.000Z\",\"schema_version\":2,\"summary\":\"Recorded evidence AC-001/EVID-0001 sha256:876bb0475e2618a15d90d8237312357bc7dae3ca5a2f141827b80f9ffa0ebdde as pass\",\"task_id\":\"TASK-0001\"}\\n";
+
+FIRST_EVIDENCE_EVENT_LINE = FIRST_EVIDENCE_EVENT_LINE.replace(/\\n$/u, '\n');
 
 async function createProgressFixture(testContext) {
   const fixture = createGoalLockFixture(testContext);
@@ -1468,6 +1475,66 @@ test('plan revision rejects criteria outside the goal without changing accepted 
   assert.deepEqual(await readFile(join(fixture.root, '.goal-lock', 'lock.json')), lockBefore);
 });
 
+test('authorization graph rejects an orphan candidate risk before persistence', async (testContext) => {
+  const fixture = createGoalLockFixture(testContext);
+  const { initializeGoal, lockInitialGoal, revisePlan } = await goalRepository();
+  await initializeGoal(fixture.root, goalV1(), fixture);
+  await lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 87f66f9c59ab', fixture);
+  const orphanRiskPlan = planCandidate();
+  orphanRiskPlan.risks = [{
+    id: 'RISK-0001',
+    statement: 'An untraced implementation failure could recur',
+    source: { kind: 'criterion', criterion_id: 'AC-001' },
+    affected_paths: ['src/goal-lock/repository.js'],
+  }];
+
+  await assert.rejects(
+    revisePlan(fixture.root, orphanRiskPlan, 'implementation-only', fixture),
+    /orphan|authorization graph/i,
+  );
+  assert.equal(existsSync(join(fixture.root, '.goal-lock', 'plan.json')), false);
+});
+
+test('validation reference evidence recording rejects a superseded plan revision', async (testContext) => {
+  const { fixture, repository } = await createPlannedFixture(testContext);
+  await repository.revisePlan(fixture.root, planCandidate('Tightened implementation'), 'implementation-only', fixture);
+  const oldRevisionRef = {
+    ...activeGoalReference(),
+    plan_revision: 1,
+    validation_id: 'VAL-0001',
+  };
+
+  await assert.rejects(
+    repository.recordGoalEvent(fixture.root, {
+      ...evidenceInput(),
+      validation_ref: oldRevisionRef,
+    }, fixture),
+    /active plan revision|late evidence/i,
+  );
+});
+
+test('cumulative permitted paths retain an expanded archived authorization after tightening', async (testContext) => {
+  const { fixture, repository } = await createPlannedFixture(testContext);
+  const tightened = planCandidate('Tightened implementation');
+  tightened.tasks[0] = {
+    ...tightened.tasks[0],
+    permitted_paths: ['src/goal-lock/contracts.js'],
+    validations: [{
+      ...tightened.tasks[0].validations[0],
+      affected_paths: ['src/goal-lock/contracts.js'],
+    }],
+  };
+  await repository.revisePlan(fixture.root, tightened, 'implementation-only', fixture);
+
+  const verified = await repository.verifyGoalRepository(fixture.root, fixture);
+  assert.match(verified.authorization_graph_digest, /^[a-f0-9]{64}$/);
+  assert.deepEqual(verified.cumulative_permitted_paths, [
+    'src/goal-lock/contracts.js',
+    'src/goal-lock/repository.js',
+    'tests/goal-lock.test.js',
+  ]);
+});
+
 test('plan revision rejects draft, tampered, and change-pending repositories', async (testContext) => {
   const { initializeGoal, lockInitialGoal, proposeGoalChange, revisePlan } = await goalRepository();
 
@@ -1740,6 +1807,7 @@ test('progress ledger chronology rejects older revision task events after the ne
   await repository.revisePlan(fixture.root, {
     next_task_id: revisionOne.next_task_id,
     tasks: revisionOne.tasks,
+    risks: revisionOne.risks,
     deferred: revisionOne.deferred,
   }, 'aligned', fixture);
   await rewriteTestProgressLedger(fixture, [
