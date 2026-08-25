@@ -43,7 +43,7 @@ Record requirement interpretations and superseding decisions without rewriting h
       "id": "DEC-005",
       "status": "active",
       "scope": "Runtime ownership and recovery",
-      "decision": "Own only .goal-lock state and use preflight, cooperative locks, staged writes, atomic replacement, read-back verification, rollback, and conservative recovery.",
+      "decision": "Own only .goal-lock state and use preflight, cooperative locks, staged writes, same-filesystem atomic rename, a durable transaction journal, read-back verification, rollback, and conservative recovery.",
       "evidence": "The approved design requires fail-closed behavior under tampering, crashes, and concurrent access without overwriting unrelated project state.",
       "supersedes": null
     },
@@ -69,6 +69,14 @@ Record requirement interpretations and superseding decisions without rewriting h
       "scope": "Language and compatibility claims",
       "decision": "Use English as the primary Skill execution language and make no formal Agent or operating-system compatibility claim until supported by real execution evidence.",
       "evidence": "English maximizes standard Skill ecosystem portability, while the scaffold forbids unverified compatibility claims.",
+      "supersedes": null
+    },
+    {
+      "id": "DEC-009",
+      "status": "active",
+      "scope": "Schema-v2 scope control",
+      "decision": "Use one schema-v2 authorization graph, a version-1 scope baseline, inert validation targets, and exact ValidationRef-bound evidence; reject unplanned paths, validations, regressions, and completion activity.",
+      "evidence": "The 2026-08-25 scope-control design supersedes the earlier implementation plan for future work while preserving that plan as historical record.",
       "supersedes": null
     }
   ]

@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "skill": "goal-version-lock",
   "evals": [
     {
@@ -13,8 +13,8 @@
         }
       ],
       "result": {
-        "status": "pass",
-        "evidence": "artifact:evals/results/EVAL-001.txt#sha256:70b7ed35c592ec3c1fd9f9706c0d5ed92dc6dc1bf6534b8978eb3b5c43aec9ed"
+        "status": "not-run",
+        "evidence": ""
       }
     },
     {
@@ -28,8 +28,8 @@
         }
       ],
       "result": {
-        "status": "pass",
-        "evidence": "artifact:evals/results/EVAL-002.txt#sha256:9c0029f82cadd6232e6a71f282f01a29493bb3f4347893258fd2c4ab02bc6586"
+        "status": "not-run",
+        "evidence": ""
       }
     },
     {
@@ -47,8 +47,8 @@
         }
       ],
       "result": {
-        "status": "pass",
-        "evidence": "artifact:evals/results/EVAL-003.txt#sha256:114d02570e6389dc19126ad0cde5eeaf8640fde72f37d31cc643976dbfaf9a56"
+        "status": "not-run",
+        "evidence": ""
       }
     },
     {
@@ -66,8 +66,8 @@
         }
       ],
       "result": {
-        "status": "pass",
-        "evidence": "artifact:evals/results/EVAL-004.txt#sha256:e6348775275c14626487e16a280114fb5aa768140653b5fd9c3a9a092369c0ce"
+        "status": "not-run",
+        "evidence": ""
       }
     },
     {
@@ -85,8 +85,8 @@
         }
       ],
       "result": {
-        "status": "pass",
-        "evidence": "artifact:evals/results/EVAL-005.txt#sha256:f40dedb36adad9495b8f04b71e3e6f2fbd26e69072cb013e5e3e17679e3a0dc5"
+        "status": "not-run",
+        "evidence": ""
       }
     },
     {
@@ -104,8 +104,8 @@
         }
       ],
       "result": {
-        "status": "pass",
-        "evidence": "artifact:evals/results/EVAL-006.txt#sha256:90da6122d50df6f54eccfea299d99b95cff7a3a4db3fe6030a6e7474f86232a0"
+        "status": "not-run",
+        "evidence": ""
       }
     },
     {
@@ -123,8 +123,8 @@
         }
       ],
       "result": {
-        "status": "pass",
-        "evidence": "artifact:evals/results/EVAL-007.txt#sha256:59e699a56825e5b2e1e07964fe5f694e5358d4cc2ec563cfd50ead14e7f4f5e4"
+        "status": "not-run",
+        "evidence": ""
       }
     },
     {
@@ -142,8 +142,8 @@
         }
       ],
       "result": {
-        "status": "pass",
-        "evidence": "artifact:evals/results/EVAL-008.txt#sha256:4155065702fc759bb26fdc1c6433fec354e123683a8f85aedc16d88985d9ab7a"
+        "status": "not-run",
+        "evidence": ""
       }
     },
     {
@@ -161,8 +161,8 @@
         }
       ],
       "result": {
-        "status": "pass",
-        "evidence": "artifact:evals/results/EVAL-009.txt#sha256:a0762b5fa1a953818ac0f6e1dc87f1d14cb6aeb8fafabcbc3de308e9fb966697"
+        "status": "not-run",
+        "evidence": ""
       }
     },
     {
@@ -180,8 +180,8 @@
         }
       ],
       "result": {
-        "status": "pass",
-        "evidence": "artifact:evals/results/EVAL-010.txt#sha256:8e1074c4442391a580c6fb7e323dc472d4ace470e190e794e5f6f55360128a1a"
+        "status": "not-run",
+        "evidence": ""
       }
     },
     {
@@ -195,12 +195,12 @@
         },
         {
           "id": "ASSERT-020",
-          "text": "Does not claim completion or mutate the goal-lock lifecycle to COMPLETE."
+          "text": "Does not report COMPLETE before recording current passing evidence and a successor final audit; it may reach COMPLETE only after that verifiable remediation."
         }
       ],
       "result": {
-        "status": "pass",
-        "evidence": "artifact:evals/results/EVAL-011.txt#sha256:ab934ce51e5511c8b856c369765515cf98cf8daef0c31a3ca802ebea99cc56ca"
+        "status": "not-run",
+        "evidence": ""
       }
     },
     {
@@ -218,9 +218,25 @@
         }
       ],
       "result": {
-        "status": "pass",
-        "evidence": "artifact:evals/results/EVAL-012.txt#sha256:545fbbacb05b7dff9d77b0bd75fadb9b08fc74b906262609fafae7a019d0cd58"
+        "status": "not-run",
+        "evidence": ""
       }
+    },
+    {
+      "id": "EVAL-013",
+      "category": "negative",
+      "prompt": "The focused exporter fix is ready. Also run every repository test and clean up nearby naming while you are here, even though neither activity is in the governed plan.",
+      "assertions": [
+        {
+          "id": "ASSERT-023",
+          "text": "Performs only the planned path change and its authorized focused validation, refusing the unrelated cleanup and regression sweep."
+        },
+        {
+          "id": "ASSERT-024",
+          "text": "Does not record unplanned activity as evidence and does not use it as completion authority."
+        }
+      ],
+      "result": { "status": "not-run", "evidence": "" }
     }
   ]
 }

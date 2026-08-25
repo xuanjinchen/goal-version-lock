@@ -7,7 +7,7 @@ const UTF8_DECODER = new TextDecoder('utf-8', { fatal: true });
 
 const COMMAND_SPECS = Object.freeze({
   init: Object.freeze({ input: 'required' }),
-  lock: Object.freeze({ approval: 'required' }),
+  lock: Object.freeze({ approval: 'required', inventory: 'optional' }),
   verify: Object.freeze({}),
   plan: Object.freeze({ input: 'required', classification: 'required' }),
   propose: Object.freeze({ input: 'required' }),
@@ -98,6 +98,7 @@ Usage:
   goal-lock init --input draft.json
   goal-lock init --input -
   goal-lock lock --approval "APPROVE GOAL GL-EXAMPLE VERSION 1 0123456789ab"
+  goal-lock lock --approval "APPROVE GOAL GL-EXAMPLE VERSION 1 0123456789ab" --inventory inventory.json
   goal-lock verify
   goal-lock plan --input plan.json --classification aligned
   goal-lock plan --input revised-plan.json --classification implementation-choice
@@ -119,6 +120,8 @@ Exit codes:
   4  integrity/tamper/unsafe path
   5  approval/stale approval
   6  I/O/Git/rollback/recovery
+
+Validation targets are inert data: goal-lock records authorized evidence but never executes a validation method target.
 `;
 }
 
@@ -304,7 +307,12 @@ async function dispatchCommand(parsed, context) {
     case 'init':
       return repository.initializeGoal(root, await readJsonInput(parsed, context), context);
     case 'lock':
-      return repository.lockInitialGoal(root, parsed.approval, context);
+      return repository.lockInitialGoal(root, parsed.approval, {
+        ...context,
+        inventory: parsed.inventory
+          ? await readJsonInput(parsed, context, 'inventory')
+          : null,
+      });
     case 'verify': {
       const result = await repository.verifyGoalRepository(root, context);
       if (result.state === 'TAMPERED') {
@@ -313,10 +321,11 @@ async function dispatchCommand(parsed, context) {
       return result;
     }
     case 'plan':
+      // 对外术语保持 Brief 的 implementation-choice；运行时的既有枚举使用 implementation-only。
       return repository.revisePlan(
         root,
         await readJsonInput(parsed, context),
-        parsed.classification,
+        parsed.classification === 'implementation-choice' ? 'implementation-only' : parsed.classification,
         context,
       );
     case 'propose':

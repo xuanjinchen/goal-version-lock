@@ -22,6 +22,11 @@ const COMMAND_CASES = [
     command: 'lock',
     approval: 'APPROVE GOAL GL-EXAMPLE VERSION 1 0123456789ab',
   }],
+  [['lock', '--approval', 'APPROVE GOAL GL-EXAMPLE VERSION 1 0123456789ab', '--inventory', 'inventory.json'], {
+    command: 'lock',
+    approval: 'APPROVE GOAL GL-EXAMPLE VERSION 1 0123456789ab',
+    inventory: 'inventory.json',
+  }],
   [['verify'], { command: 'verify' }],
   [['plan', '--input', 'plan.json', '--classification', 'aligned'], {
     command: 'plan', input: 'plan.json', classification: 'aligned',
@@ -176,6 +181,13 @@ function planInput() {
         affected_paths: ['delivery.txt'],
         criterion_ids: ['AC-001'],
         risk_ids: [],
+      }, {
+        id: 'VAL-0002',
+        kind: 'mandatory-gate',
+        method: { type: 'delivery-gate', target: 'goal-lock-cli-final-gate' },
+        affected_paths: ['@governed-workspace'],
+        criterion_ids: ['AC-001'],
+        risk_ids: [],
       }],
       status: 'pending',
     }],
@@ -194,7 +206,7 @@ function progressInput(eventType, summary, evidenceRefs = []) {
   };
 }
 
-function evidenceInput() {
+function evidenceInput({ validationId = 'VAL-0001', supersedes = null } = {}) {
   return {
     kind: 'evidence',
     acceptance_criterion_id: 'AC-001',
@@ -203,15 +215,15 @@ function evidenceInput() {
       goal_version: 1,
       goal_digest: '9157a4eea1293409f55852b47dfc7b734552e7068828542b78cd55a0a08decfb',
       plan_revision: 1,
-      validation_id: 'VAL-0001',
+      validation_id: validationId,
     },
     task_id: 'TASK-0001',
     observed_result: 'The real process behaved as required',
     artifact_refs: ['delivery.txt'],
-    workspace_fingerprint: 'a'.repeat(64),
+    inventory: null,
     state: 'pass',
     failure_paths: [],
-    supersedes: null,
+    supersedes,
   };
 }
 
@@ -257,6 +269,12 @@ async function createCliFixture(testContext) {
     child.once('error', reject);
     child.once('exit', (code) => code === 0 ? resolve() : reject(new Error(`git init exited ${code}`)));
   });
+  return root;
+}
+
+async function createNonGitCliFixture(testContext) {
+  const root = await mkdtemp(path.join(tmpdir(), 'goal-lock-cli-non-git-'));
+  testContext.after(() => rm(root, { recursive: true, force: true }));
   return root;
 }
 
@@ -327,7 +345,8 @@ test('real process runs the complete lifecycle in cwd with single-envelope stdio
     writeJson(root, 'plan.json', planInput()),
     writeJson(root, 'task-start.json', progressInput('task-start', 'Started the CLI lifecycle')),
     writeJson(root, 'evidence.json', evidenceInput()),
-    writeJson(root, 'task-complete.json', progressInput('task-complete', 'Completed the CLI lifecycle', ['EVID-0001'])),
+    writeJson(root, 'mandatory-evidence.json', evidenceInput({ validationId: 'VAL-0002', supersedes: 'EVID-0001' })),
+    writeJson(root, 'task-complete.json', progressInput('task-complete', 'Completed the CLI lifecycle', ['EVID-0001', 'EVID-0002'])),
     writeJson(root, 'final-audit.json', {
       kind: 'final-audit',
       semantic_summary: 'Reviewed the fixture against the locked goal.',
@@ -357,20 +376,82 @@ test('real process runs the complete lifecycle in cwd with single-envelope stdio
   parseSuccess(await runProcess(root, ['record', '--input', 'task-start.json']), 'record');
   const evidence = parseSuccess(await runProcess(root, ['record', '--input', 'evidence.json']), 'record');
   assert.equal(evidence.evidence_id, 'EVID-0001');
+  const mandatoryEvidence = parseSuccess(await runProcess(root, ['record', '--input', 'mandatory-evidence.json']), 'record');
+  assert.equal(mandatoryEvidence.evidence_id, 'EVID-0002');
   parseSuccess(await runProcess(root, ['record', '--input', 'task-complete.json']), 'record');
   assert.equal(parseSuccess(await runProcess(root, ['verify']), 'verify').state, 'LOCKED');
   parseSuccess(await runProcess(root, ['record', '--input', 'final-audit.json']), 'record');
-  const gate = parseSuccess(await runProcess(root, ['gate', '--inventory', 'inventory.json']), 'gate');
+  const gate = parseSuccess(await runProcess(root, ['gate']), 'gate');
   assert.equal(gate.state, 'COMPLETE');
   assert.equal(gate.checklist.every((item) => item.passed), true);
 
   assert.deepEqual(await nonGoalLockSnapshot(root), before);
   assert.deepEqual((await readdir(path.join(root, '.goal-lock'))).sort(), [
-    'current.json', 'evidence', 'history', 'lock.json', 'plan.json', 'progress.jsonl',
+    'current.json', 'evidence', 'history', 'lock.json', 'plan.json', 'progress.jsonl', 'scope.json',
   ]);
 });
 
-test('real processes catch a v2-approval mutation that loses disk-resumed history, staleness, or the completion chain', async (testContext) => {
+test('real process accepts lock inventory only when Git discovery is unavailable', async (testContext) => {
+  const gitRoot = await createCliFixture(testContext);
+  await Promise.all([
+    writeFile(path.join(gitRoot, 'delivery.txt'), 'Git discovery owns this baseline\n'),
+    writeJson(gitRoot, 'inventory.json', ['delivery.txt']),
+  ]);
+  const gitDraft = parseSuccess(
+    await runProcess(gitRoot, ['init', '--input', '-'], Buffer.from(JSON.stringify(goalDraft()))),
+    'init',
+  );
+  assert.equal(
+    parseFailure(
+      await runProcess(gitRoot, ['lock', '--approval', gitDraft.approval_required, '--inventory', 'inventory.json']),
+      4,
+      'lock',
+    ).code,
+    'WORKSPACE_INVENTORY_INVALID',
+  );
+
+  const nonGitRoot = await createNonGitCliFixture(testContext);
+  await Promise.all([
+    writeFile(path.join(nonGitRoot, 'delivery.txt'), 'Explicit inventory owns this baseline\n'),
+    writeJson(nonGitRoot, 'inventory.json', ['delivery.txt']),
+  ]);
+  const nonGitDraft = parseSuccess(
+    await runProcess(nonGitRoot, ['init', '--input', '-'], Buffer.from(JSON.stringify(goalDraft()))),
+    'init',
+  );
+  parseSuccess(
+    await runProcess(nonGitRoot, ['lock', '--approval', nonGitDraft.approval_required, '--inventory', 'inventory.json']),
+    'lock',
+  );
+  const scope = JSON.parse(await readFile(path.join(nonGitRoot, '.goal-lock', 'scope.json'), 'utf8'));
+  assert.equal(scope.mode, 'inventory');
+});
+
+test('real process records evidence through an exact validation reference without executing its target', async (testContext) => {
+  const root = await createCliFixture(testContext);
+  const plan = planInput();
+  plan.tasks[0].validations[0].method.target = 'this-is-inert-validation-data';
+  const evidence = evidenceInput();
+  assert.equal(Object.hasOwn(evidence, 'method'), false);
+  assert.equal(evidence.validation_ref.validation_id, 'VAL-0001');
+  await Promise.all([
+    writeFile(path.join(root, 'delivery.txt'), 'inert target fixture\n'),
+    writeJson(root, 'plan.json', plan),
+    writeJson(root, 'task-start.json', progressInput('task-start', 'Started inert validation fixture')),
+    writeJson(root, 'evidence.json', evidence),
+  ]);
+  const initialized = parseSuccess(
+    await runProcess(root, ['init', '--input', '-'], Buffer.from(JSON.stringify(goalDraft()))),
+    'init',
+  );
+  parseSuccess(await runProcess(root, ['lock', '--approval', initialized.approval_required]), 'lock');
+  parseSuccess(await runProcess(root, ['plan', '--input', 'plan.json', '--classification', 'aligned']), 'plan');
+  parseSuccess(await runProcess(root, ['record', '--input', 'task-start.json']), 'record');
+  const recorded = parseSuccess(await runProcess(root, ['record', '--input', 'evidence.json']), 'record');
+  assert.equal(recorded.evidence_id, 'EVID-0001');
+});
+
+test('real processes preserve v2 approval history and invalidate affected evidence', async (testContext) => {
   const root = await createCliFixture(testContext);
   await writeFile(path.join(root, 'delivery.txt'), 'version two delivery\n');
   const draft = {
@@ -402,27 +483,6 @@ test('real processes catch a v2-approval mutation that loses disk-resumed histor
     risks: [],
     deferred: [],
   };
-  const versionTwoPlan = {
-    next_task_id: 'TASK-0002',
-    tasks: [
-      {
-        id: 'TASK-0002', outcome: 'Deliver unaffected work', acceptance_criteria: ['AC-002'],
-        dependencies: [], permitted_paths: ['delivery.txt'], validations: [{
-          id: 'VAL-0003', kind: 'focused', method: { type: 'deterministic-test', target: 'unaffected-work-v2' },
-          affected_paths: ['delivery.txt'], criterion_ids: ['AC-002'], risk_ids: [],
-        }], status: 'pending',
-      },
-      {
-        id: 'TASK-0003', outcome: 'Re-verify changed work', acceptance_criteria: ['AC-001'],
-        dependencies: [], permitted_paths: ['delivery.txt'], validations: [{
-          id: 'VAL-0004', kind: 'focused', method: { type: 'deterministic-test', target: 'changed-work-v2' },
-          affected_paths: ['delivery.txt'], criterion_ids: ['AC-001'], risk_ids: [],
-        }], status: 'pending',
-      },
-    ],
-    risks: [],
-    deferred: [],
-  };
   const initialized = parseSuccess(
     await runProcess(root, ['init', '--input', '-'], Buffer.from(JSON.stringify(draft))),
     'init',
@@ -446,20 +506,26 @@ test('real processes catch a v2-approval mutation that loses disk-resumed histor
       plan_revision: 2, validation_id: 'VAL-0001',
     },
     observed_result: 'Version one changed work passed.', artifact_refs: ['delivery.txt'],
-    workspace_fingerprint: 'a'.repeat(64), state: 'pass', failure_paths: [], supersedes: null,
+    inventory: null, state: 'pass', failure_paths: [], supersedes: null,
   }))), 'record');
   assert.equal(firstEvidence.evidence_id, 'EVID-0001');
   parseSuccess(await runProcess(root, ['record', '--input', '-'], Buffer.from(JSON.stringify({
     kind: 'progress', event_type: 'task-complete', task_id: 'TASK-0001', summary: 'Completed changed work', evidence_refs: ['EVID-0001'],
   }))), 'record');
 
+  const changedCriteria = draft.acceptance_criteria.map((criterion) => criterion.id === 'AC-001'
+    ? { ...criterion, outcome: 'Changed work is re-verified against the version two goal' }
+    : criterion);
   const proposal = parseSuccess(await runProcess(root, ['propose', '--input', '-'], Buffer.from(JSON.stringify({
     candidate: {
       objective: 'Prove a disk-resumed version two lifecycle', scope: draft.scope, non_goals: draft.non_goals,
-      constraints: draft.constraints, acceptance_criteria: draft.acceptance_criteria,
+      constraints: draft.constraints, acceptance_criteria: changedCriteria,
       authorization_boundary: draft.authorization_boundary, assumptions: draft.assumptions,
     },
-    changes: [{ field: 'objective', before: draft.objective, after: 'Prove a disk-resumed version two lifecycle' }],
+    changes: [
+      { field: 'objective', before: draft.objective, after: 'Prove a disk-resumed version two lifecycle' },
+      { field: 'acceptance_criteria', before: draft.acceptance_criteria, after: changedCriteria },
+    ],
     rationale: 'Changed work requires a fresh version-bound verification.', affected_tasks: ['TASK-0001'],
     criterion_impact: { affected: ['AC-001'], unaffected: ['AC-002'] },
     risks: ['Old evidence could be reused.'], validation: ['Run focused checks'], rollback: ['Reject the proposal'],
@@ -485,38 +551,6 @@ test('real processes catch a v2-approval mutation that loses disk-resumed histor
     assert.equal(events[index].previous_event_digest, index === 0 ? null : events[index - 1].event_digest);
   }
 
-  parseSuccess(
-    await runProcess(root, ['plan', '--input', '-', '--classification', 'aligned'], Buffer.from(JSON.stringify(versionTwoPlan))),
-    'plan',
-  );
-  for (const [taskId, criterionId, supersedes] of [
-    ['TASK-0002', 'AC-002', null],
-    ['TASK-0003', 'AC-001', 'EVID-0002'],
-  ]) {
-    parseSuccess(await runProcess(root, ['record', '--input', '-'], Buffer.from(JSON.stringify({
-      kind: 'progress', event_type: 'task-start', task_id: taskId, summary: `Started ${taskId}`, evidence_refs: [],
-    }))), 'record');
-    const evidence = parseSuccess(await runProcess(root, ['record', '--input', '-'], Buffer.from(JSON.stringify({
-      kind: 'evidence', acceptance_criterion_id: criterionId, task_id: taskId,
-      validation_ref: {
-        goal_id: versionTwoGoal.goal_id, goal_version: versionTwoGoal.goal_version,
-        goal_digest: proposal.candidate_digest, plan_revision: 1,
-        validation_id: taskId === 'TASK-0002' ? 'VAL-0003' : 'VAL-0004',
-      },
-      observed_result: `Fresh ${criterionId} evidence passed.`, artifact_refs: ['delivery.txt'],
-      workspace_fingerprint: 'b'.repeat(64), state: 'pass', failure_paths: [], supersedes,
-    }))), 'record');
-    parseSuccess(await runProcess(root, ['record', '--input', '-'], Buffer.from(JSON.stringify({
-      kind: 'progress', event_type: 'task-complete', task_id: taskId, summary: `Completed ${taskId}`, evidence_refs: [evidence.evidence_id],
-    }))), 'record');
-  }
-  parseSuccess(await runProcess(root, ['record', '--input', '-'], Buffer.from(JSON.stringify({
-    kind: 'final-audit', semantic_summary: 'Audited the completed version two fixture.', inventory: null,
-  }))), 'record');
-  const gate = parseSuccess(await runProcess(root, ['gate']), 'gate');
-  assert.equal(gate.state, 'COMPLETE');
-  assert.equal(gate.goal.goal_version, 2);
-  assert.equal(gate.checklist.every((item) => item.passed), true);
 });
 
 test('real process maps usage, transition, integrity, approval, and I/O failures to redacted stderr', async (testContext) => {

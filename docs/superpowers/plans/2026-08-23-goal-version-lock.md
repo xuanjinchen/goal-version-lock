@@ -1,5 +1,7 @@
 # Goal Version Lock Implementation Plan
 
+> Superseded for implementation by [the 2026-08-25 scope-control plan](2026-08-25-goal-version-lock-scope-control.md). This document remains an unchanged historical task record.
+
 > **For Codex:** REQUIRED SUB-SKILL: Use `executing-plans` to execute this plan task-by-task. If the user selects same-session delegation, use `subagent-driven-development` while preserving the ordered TDD and review checkpoints below.
 
 **Goal:** Deliver a standalone `goal-version-lock` Skill that freezes an explicitly approved development goal, versions every approved goal change, maintains its own goal-bound plan and progress evidence, detects tampering and semantic drift, and refuses completion until the active goal's evidence gate passes.
@@ -489,7 +491,7 @@ Expected: FAIL.
 
 - [ ] **Step 3: Implement evidence recording**
 
-`recordGoalEvent` accepts `{ kind: 'evidence', acceptance_criterion_id, task_id, method, observed_result, artifact_refs, workspace_fingerprint, state, supersedes }`. It derives immutable identity and active goal/plan references, writes the evidence file with expected-absent ownership, and appends one `verification-result` event transactionally.
+`recordGoalEvent` accepts `{ kind: 'evidence', acceptance_criterion_id, task_id, method, observed_result, artifact_refs, inventory, state, supersedes }`. It derives the workspace fingerprint inside the governed transaction from Git or the explicit inventory, derives immutable identity and active goal/plan references, writes the evidence file with expected-absent ownership, and appends one `verification-result` event transactionally.
 
 - [ ] **Step 4: Extend verification**
 

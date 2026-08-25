@@ -139,7 +139,7 @@ Use the Skill when the user asks to lock, freeze with controlled version changes
 
 ## Core Workflow
 
-Create a draft, obtain explicit version-1 approval, verify before each work slice, plan and record progress against the active digest, route semantic changes through a two-stage CR, invalidate affected evidence after approval, and run a goal-aware completion gate before claiming success.
+Create a draft, obtain explicit version-1 approval, verify before each work slice, plan and record progress against the active digest, route semantic changes through a two-stage CR, invalidate affected evidence after approval, and run a goal-aware completion gate before claiming success. Select only authorized task paths and validation references; unplanned cleanup, regression, evaluation, evidence, and completion activity is denied.
 
 ## Non-Goals and Authorization
 
