@@ -558,8 +558,7 @@ export async function gitWorkspaceFingerprint(root) {
 
 /** 兼容旧调用方：非 Git 摘要仍由同一份清单派生。 */
 export async function inventoryWorkspaceFingerprint(root, inventory) {
-  const reader = await createWorkspaceReader(root);
-  return workspaceFingerprintFromManifest(await inventoryManifest(reader, inventory));
+  return workspaceFingerprintFromManifest(await captureWorkspaceManifest(root, inventory));
 }
 
 /** 兼容旧调用方：捕获一次清单后派生单一工作区指纹。 */

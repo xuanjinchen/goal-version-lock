@@ -10,6 +10,7 @@ import {
   captureWorkspaceManifest,
   computeWorkspaceDelta,
   createScopeBaseline,
+  inventoryWorkspaceFingerprint,
   verifyScopeBaseline,
   workspaceFingerprintFromManifest,
 } from '../src/goal-lock/workspace.js';
@@ -165,6 +166,15 @@ test('inventory manifests retain only declared files and fail closed when a base
   assert.throws(() => computeWorkspaceDelta(baseline.entries, omitted.entries), GoalLockError);
   await unlink(join(fixture.root, 'delivery.txt'));
   await assert.rejects(captureWorkspaceManifest(fixture.root, ['delivery.txt', 'new.txt'], fixture), GoalLockError);
+});
+
+test('inventory fingerprint rejects a competing inventory in a Git workspace', async (testContext) => {
+  const fixture = createGoalLockFixture(testContext);
+  await writeWorkspace(fixture.root, 'delivery.txt', 'delivery\n');
+  await assert.rejects(
+    inventoryWorkspaceFingerprint(fixture.root, ['delivery.txt']),
+    (error) => error instanceof GoalLockError && error.code === 'WORKSPACE_INVENTORY_INVALID',
+  );
 });
 
 test('scope baselines bind a manifest to the version-one goal and fingerprint its canonical bytes', async (testContext) => {
