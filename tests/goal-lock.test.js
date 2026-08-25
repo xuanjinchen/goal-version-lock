@@ -539,6 +539,360 @@ async function createChangeProposalFixture(testContext) {
   return { fixture, repository };
 }
 
+function useMonotonicFixtureClock(fixture) {
+  let second = 0;
+  fixture.now = () => `2026-08-23T00:00:${String(second++).padStart(2, '0')}.000Z`;
+  return fixture;
+}
+
+function twoCriterionGoal() {
+  const goal = goalV1();
+  goal.acceptance_criteria.push({
+    id: 'AC-002',
+    outcome: 'Evidence lineage remains exact',
+    verification: 'Inspect immutable evidence history',
+  });
+  return goal;
+}
+
+function twoCriterionPlanCandidate() {
+  return {
+    next_task_id: 'TASK-0001',
+    tasks: [{
+      id: 'TASK-0001',
+      outcome: 'Implement the locked state transition',
+      acceptance_criteria: ['AC-001'],
+      dependencies: [],
+      permitted_paths: ['src/goal-lock/repository.js'],
+      validations: [{
+        id: 'VAL-0001',
+        kind: 'focused',
+        method: { type: 'deterministic-test', target: 'goal-lock-focused-tests' },
+        affected_paths: ['src/goal-lock/repository.js'],
+        criterion_ids: ['AC-001'],
+        risk_ids: [],
+      }],
+      status: 'pending',
+    }, {
+      id: 'TASK-0002',
+      outcome: 'Verify immutable evidence lineage',
+      acceptance_criteria: ['AC-002'],
+      dependencies: [],
+      permitted_paths: ['tests/goal-lock.test.js'],
+      validations: [{
+        id: 'VAL-0002',
+        kind: 'affected-regression',
+        method: { type: 'deterministic-test', target: 'goal-lock-lineage-tests' },
+        affected_paths: ['tests/goal-lock.test.js'],
+        criterion_ids: ['AC-002'],
+        risk_ids: [],
+      }],
+      status: 'pending',
+    }],
+    risks: [],
+    deferred: [],
+  };
+}
+
+function twoCriterionChangeInput(overrides = {}) {
+  const base = twoCriterionGoal();
+  const candidateCriteria = structuredClone(base.acceptance_criteria);
+  candidateCriteria[0].outcome = 'State remains safely locked';
+  const input = {
+    candidate: {
+      objective: 'Ship a safer lock',
+      scope: base.scope,
+      non_goals: base.non_goals,
+      constraints: base.constraints,
+      acceptance_criteria: candidateCriteria,
+      authorization_boundary: base.authorization_boundary,
+      assumptions: base.assumptions,
+    },
+    changes: [{ field: 'objective', before: base.objective, after: 'Ship a safer lock' }, {
+      field: 'acceptance_criteria',
+      before: base.acceptance_criteria,
+      after: candidateCriteria,
+    }],
+    rationale: 'Strengthen one criterion without changing the other',
+    affected_tasks: ['TASK-0001'],
+    criterion_impact: { affected: ['AC-001'], unaffected: ['AC-002'] },
+    risks: ['Changed work needs fresh evidence'],
+    validation: ['Run the affected checks'],
+    rollback: ['Reject the proposal'],
+  };
+  return { ...input, ...overrides };
+}
+
+async function createTwoCriterionChangeFixture(testContext) {
+  const fixture = useMonotonicFixtureClock(createGoalLockFixture(testContext));
+  const repository = await goalRepository();
+  const goal = twoCriterionGoal();
+  await repository.initializeGoal(fixture.root, goal, fixture);
+  await repository.lockInitialGoal(fixture.root, approvalPhraseForGoal(goal), fixture);
+  await repository.revisePlan(fixture.root, twoCriterionPlanCandidate(), 'aligned', fixture);
+  const goalReference = {
+    goal_id: goal.goal_id,
+    goal_version: goal.goal_version,
+    goal_digest: independentSha256(canonicalBytes(goal)),
+  };
+  return { fixture, repository, goal, goalReference };
+}
+
+function twoCriterionEvidenceInput(goalReference, criterionId) {
+  const second = criterionId === 'AC-002';
+  return {
+    kind: 'evidence',
+    acceptance_criterion_id: criterionId,
+    validation_ref: {
+      ...goalReference,
+      plan_revision: 1,
+      validation_id: second ? 'VAL-0002' : 'VAL-0001',
+    },
+    task_id: second ? 'TASK-0002' : 'TASK-0001',
+    observed_result: `${criterionId} verification passed`,
+    artifact_refs: [second ? 'tests/goal-lock.test.js' : 'src/goal-lock/repository.js'],
+    inventory: undefined,
+    state: 'pass',
+    failure_paths: [],
+    supersedes: null,
+  };
+}
+
+test('criterion impact public approval preserves the immutable scope lineage into version two', async (testContext) => {
+  const { fixture, repository } = await createChangeProposalFixture(testContext);
+  const directory = join(fixture.root, '.goal-lock');
+  const scopeBytes = await readFile(join(directory, 'scope.json'));
+  const originalLock = parseCanonicalJson(await readFile(join(directory, 'lock.json')), 'original lock');
+
+  const proposal = await repository.proposeGoalChange(fixture.root, changeProposalInput(), fixture);
+  await repository.approveGoalChange(fixture.root, proposal.change_request_id, proposal.approval_required, fixture);
+
+  const versionTwoLock = parseCanonicalJson(await readFile(join(directory, 'lock.json')), 'version two lock');
+  assert.deepEqual(versionTwoLock.scope_head, originalLock.scope_head);
+  assert.deepEqual(await readFile(join(directory, 'scope.json')), scopeBytes);
+  assert.equal(versionTwoLock.goal_version, 2);
+  assert.equal((await repository.verifyGoalRepository(fixture.root, fixture)).state, 'LOCKED');
+});
+
+test('criterion impact derives the exact exhaustive candidate partition and rejects caller mismatches', async (testContext) => {
+  const accepted = await createTwoCriterionChangeFixture(testContext);
+  const acceptedInput = twoCriterionChangeInput();
+  const acceptedBefore = structuredClone(acceptedInput);
+  await accepted.repository.proposeGoalChange(accepted.fixture.root, acceptedInput, accepted.fixture);
+  const change = parseCanonicalJson(
+    await readFile(join(accepted.fixture.root, '.goal-lock', 'changes', 'CR-0001.json')),
+    'two-criterion change',
+  );
+  assert.deepEqual(change.criterion_impact, {
+    affected: ['AC-001'],
+    unaffected: ['AC-002'],
+  });
+  assert.deepEqual(acceptedInput, acceptedBefore);
+
+  const cases = [
+    ['overlap', (input) => { input.criterion_impact = { affected: ['AC-001'], unaffected: ['AC-001', 'AC-002'] }; }],
+    ['omission', (input) => { input.criterion_impact = { affected: ['AC-001'], unaffected: [] }; }],
+    ['changed criterion marked unaffected', (input) => { input.criterion_impact = { affected: [], unaffected: ['AC-001', 'AC-002'] }; }],
+    ['unchanged criterion marked affected', (input) => { input.criterion_impact = { affected: ['AC-001', 'AC-002'], unaffected: [] }; }],
+    ['new criterion marked unaffected', (input) => {
+      const added = { id: 'AC-003', outcome: 'New behavior is verified', verification: 'Run a new check' };
+      input.candidate.acceptance_criteria.push(added);
+      input.changes[1].after.push(added);
+      input.criterion_impact.unaffected.push('AC-003');
+    }],
+  ];
+  for (const [label, mutate] of cases) {
+    const current = await createTwoCriterionChangeFixture(testContext);
+    const input = twoCriterionChangeInput();
+    mutate(input);
+    const before = structuredClone(input);
+    await assert.rejects(
+      current.repository.proposeGoalChange(current.fixture.root, input, current.fixture),
+      (error) => error instanceof GoalLockError && error.kind === 'input',
+      label,
+    );
+    assert.deepEqual(input, before, label);
+    assert.equal(existsSync(join(current.fixture.root, '.goal-lock', 'changes')), false, label);
+  }
+});
+
+test('carry-forward and invalidation bind exact source evidence without rewriting source bytes', async (testContext) => {
+  const { fixture, repository, goalReference } = await createTwoCriterionChangeFixture(testContext);
+  await repository.recordGoalEvent(fixture.root, twoCriterionEvidenceInput(goalReference, 'AC-001'), fixture);
+  await repository.recordGoalEvent(fixture.root, twoCriterionEvidenceInput(goalReference, 'AC-002'), fixture);
+  const directory = join(fixture.root, '.goal-lock');
+  const planBefore = parseCanonicalJson(await readFile(join(directory, 'plan.json')), 'source plan');
+  const sourcePaths = [
+    join(directory, 'evidence', 'AC-001', 'EVID-0001.json'),
+    join(directory, 'evidence', 'AC-002', 'EVID-0001.json'),
+  ];
+  const sourceBytes = await Promise.all(sourcePaths.map((path) => readFile(path)));
+  const proposalInput = twoCriterionChangeInput();
+  const proposalInputBefore = structuredClone(proposalInput);
+  const proposal = await repository.proposeGoalChange(fixture.root, proposalInput, fixture);
+
+  await repository.approveGoalChange(fixture.root, proposal.change_request_id, proposal.approval_required, fixture);
+
+  assert.deepEqual(proposalInput, proposalInputBefore);
+  for (const [index, path] of sourcePaths.entries()) assert.deepEqual(await readFile(path), sourceBytes[index]);
+  const sourceAffected = parseCanonicalJson(sourceBytes[0], 'source affected evidence');
+  const sourceUnaffected = parseCanonicalJson(sourceBytes[1], 'source unaffected evidence');
+  const invalidation = parseCanonicalJson(
+    await readFile(join(directory, 'evidence', 'AC-001', 'EVID-0002.json')),
+    'affected invalidation',
+  );
+  const carried = parseCanonicalJson(
+    await readFile(join(directory, 'evidence', 'AC-002', 'EVID-0002.json')),
+    'unaffected carry-forward',
+  );
+  assert.equal(invalidation.state, 'stale');
+  assert.deepEqual(invalidation.derivation, {
+    kind: 'invalidation',
+    source_validation_ref: sourceAffected.validation_ref,
+    source_evidence_id: sourceAffected.evidence_id,
+    source_evidence_digest: independentSha256(sourceBytes[0]),
+  });
+  assert.equal(carried.state, sourceUnaffected.state);
+  assert.deepEqual(carried.derivation, {
+    kind: 'carry-forward',
+    source_validation_ref: sourceUnaffected.validation_ref,
+    source_evidence_id: sourceUnaffected.evidence_id,
+    source_evidence_digest: independentSha256(sourceBytes[1]),
+  });
+  assert.deepEqual(Object.keys(carried.derivation).sort(), [
+    'kind', 'source_evidence_digest', 'source_evidence_id', 'source_validation_ref',
+  ]);
+  const versionTwoPlan = parseCanonicalJson(await readFile(join(directory, 'plan.json')), 'version two plan');
+  assert.deepEqual(
+    versionTwoPlan.tasks.find((task) => task.id === 'TASK-0002'),
+    planBefore.tasks.find((task) => task.id === 'TASK-0002'),
+  );
+  assert.deepEqual(carried.validation_ref, {
+    goal_id: versionTwoPlan.goal.goal_id,
+    goal_version: 2,
+    goal_digest: versionTwoPlan.goal.goal_digest,
+    plan_revision: 1,
+    validation_id: 'VAL-0002',
+  });
+  assert.equal((await repository.verifyGoalRepository(fixture.root, fixture)).state, 'LOCKED');
+});
+
+test('carry-forward requires byte-identical adjacent task and validation definitions', async (testContext) => {
+  for (const [label, mutate] of [
+    ['task', (task) => { task.outcome = 'Verify lineage with a changed task definition'; }],
+    ['validation', (task) => { task.validations[0].method.target = 'changed-lineage-check'; }],
+  ]) {
+    const { fixture, repository, goalReference } = await createTwoCriterionChangeFixture(testContext);
+    await repository.recordGoalEvent(fixture.root, twoCriterionEvidenceInput(goalReference, 'AC-002'), fixture);
+    const directory = join(fixture.root, '.goal-lock');
+    const sourcePath = join(directory, 'evidence', 'AC-002', 'EVID-0001.json');
+    const sourceBytes = await readFile(sourcePath);
+    const candidatePlan = twoCriterionPlanCandidate();
+    mutate(candidatePlan.tasks[1]);
+    await repository.revisePlan(fixture.root, candidatePlan, 'aligned', fixture);
+    const proposal = await repository.proposeGoalChange(fixture.root, twoCriterionChangeInput(), fixture);
+
+    await repository.approveGoalChange(fixture.root, proposal.change_request_id, proposal.approval_required, fixture);
+
+    assert.deepEqual(await readFile(sourcePath), sourceBytes, label);
+    assert.equal(existsSync(join(directory, 'evidence', 'AC-002', 'EVID-0002.json')), false, label);
+    assert.equal((await repository.verifyGoalRepository(fixture.root, fixture)).state, 'LOCKED', label);
+  }
+});
+
+test('mandatory-gate result is single-use and only failure-bounded remediation enables a successor reference', async (testContext) => {
+  const fixture = useMonotonicFixtureClock(createGoalLockFixture(testContext));
+  const repository = await goalRepository();
+  const goal = goalV1();
+  await repository.initializeGoal(fixture.root, goal, fixture);
+  await repository.lockInitialGoal(fixture.root, approvalPhraseForGoal(goal), fixture);
+  const initialPlan = planCandidate();
+  initialPlan.tasks[0].validations = [{
+    id: 'VAL-0001',
+    kind: 'mandatory-gate',
+    method: { type: 'delivery-gate', target: 'goal-lock-delivery-gate' },
+    affected_paths: ['@governed-workspace'],
+    criterion_ids: ['AC-001'],
+    risk_ids: [],
+  }];
+  await repository.revisePlan(fixture.root, initialPlan, 'aligned', fixture);
+  const failedInput = evidenceInput({
+    observed_result: 'The mandatory gate failed in the repository implementation',
+    state: 'fail',
+    failure_paths: ['src/goal-lock/repository.js'],
+  });
+  await repository.recordGoalEvent(fixture.root, failedInput, fixture);
+  const directory = join(fixture.root, '.goal-lock');
+  const failedPath = join(directory, 'evidence', 'AC-001', 'EVID-0001.json');
+  const failedBytes = await readFile(failedPath);
+  const afterFailure = await goalLockByteSnapshot(directory);
+
+  await assert.rejects(
+    repository.recordGoalEvent(fixture.root, evidenceInput({
+      observed_result: 'A retry cannot replace the failed mandatory result',
+      supersedes: 'EVID-0001',
+    }), fixture),
+    (error) => error instanceof GoalLockError && error.kind === 'input',
+  );
+  assert.deepEqual(await goalLockByteSnapshot(directory), afterFailure);
+
+  const failedValidationRef = failedInput.validation_ref;
+  const remediationPlan = planCandidate('Remediate the exact mandatory-gate failure');
+  remediationPlan.risks = [{
+    id: 'RISK-0001',
+    statement: 'The failed gate localized a repository implementation defect',
+    source: { kind: 'failed-validation', validation_ref: failedValidationRef, evidence_id: 'EVID-0001' },
+    affected_paths: ['src/goal-lock/repository.js'],
+  }];
+  remediationPlan.tasks[0].validations = [{
+    id: 'VAL-0003',
+    kind: 'affected-regression',
+    method: { type: 'deterministic-test', target: 'goal-lock-failure-remediation' },
+    affected_paths: ['src/goal-lock/repository.js'],
+    criterion_ids: [],
+    risk_ids: ['RISK-0001'],
+  }, {
+    id: 'VAL-0004',
+    kind: 'mandatory-gate',
+    method: { type: 'delivery-gate', target: 'goal-lock-delivery-gate' },
+    affected_paths: ['@governed-workspace'],
+    criterion_ids: ['AC-001'],
+    risk_ids: [],
+  }];
+  const unrelatedPlan = structuredClone(remediationPlan);
+  unrelatedPlan.risks[0].affected_paths = ['tests/goal-lock.test.js'];
+  unrelatedPlan.tasks[0].validations[0].affected_paths = ['tests/goal-lock.test.js'];
+  await assert.rejects(
+    repository.revisePlan(fixture.root, unrelatedPlan, 'aligned', fixture),
+    (error) => error instanceof GoalLockError && error.kind === 'input',
+  );
+
+  await repository.revisePlan(fixture.root, remediationPlan, 'aligned', fixture);
+  const revisionTwoReference = { ...activeGoalReference(), plan_revision: 2 };
+  await repository.recordGoalEvent(fixture.root, evidenceInput({
+    validation_ref: { ...revisionTwoReference, validation_id: 'VAL-0003' },
+    observed_result: 'The localized remediation passed',
+    supersedes: 'EVID-0001',
+  }), fixture);
+  await repository.recordGoalEvent(fixture.root, evidenceInput({
+    validation_ref: { ...revisionTwoReference, validation_id: 'VAL-0004' },
+    observed_result: 'The successor mandatory gate passed once',
+    supersedes: 'EVID-0002',
+  }), fixture);
+  const successorBytes = await readFile(join(directory, 'evidence', 'AC-001', 'EVID-0003.json'));
+  await assert.rejects(
+    repository.recordGoalEvent(fixture.root, evidenceInput({
+      validation_ref: { ...revisionTwoReference, validation_id: 'VAL-0004' },
+      observed_result: 'The successor mandatory gate cannot repeat',
+      supersedes: 'EVID-0003',
+    }), fixture),
+    (error) => error instanceof GoalLockError && error.kind === 'input',
+  );
+  assert.deepEqual(await readFile(failedPath), failedBytes);
+  assert.deepEqual(await readFile(join(directory, 'evidence', 'AC-001', 'EVID-0003.json')), successorBytes);
+  assert.equal(existsSync(join(directory, 'evidence', 'AC-001', 'EVID-0004.json')), false);
+});
+
 test('change proposal derives one exact canonical request and advances only the lock integrity index', async (testContext) => {
   const { fixture, repository } = await createChangeProposalFixture(testContext);
   const directory = join(fixture.root, '.goal-lock');
@@ -903,7 +1257,10 @@ test('change verification rejects a proposed request that is not the terminal lo
 
 async function proposeChangeForApproval(testContext, overrides = {}, withEvidence = false) {
   const { fixture, repository } = await createChangeProposalFixture(testContext);
-  if (withEvidence) await repository.recordGoalEvent(fixture.root, evidenceInput(), fixture);
+  if (withEvidence) {
+    useMonotonicFixtureClock(fixture);
+    await repository.recordGoalEvent(fixture.root, evidenceInput(), fixture);
+  }
   const receipt = await repository.proposeGoalChange(
     fixture.root,
     changeProposalInput(overrides),
@@ -1025,9 +1382,15 @@ test('exact change approval atomically installs the candidate, archives the plan
   assert.equal(plan.next_task_id, null);
   const staleEvidence = parseCanonicalJson(await readFile(join(directory, 'evidence', 'AC-001', 'EVID-0002.json')), 'stale evidence');
   assert.equal(staleEvidence.state, 'stale');
-  assert.equal(staleEvidence.goal.goal_version, 2);
-  assert.equal(staleEvidence.plan_revision, 1);
+  assert.equal(staleEvidence.validation_ref.goal_version, 2);
+  assert.equal(staleEvidence.validation_ref.plan_revision, 1);
   assert.equal(staleEvidence.supersedes, 'EVID-0001');
+  assert.deepEqual(staleEvidence.derivation, {
+    kind: 'invalidation',
+    source_validation_ref: parseCanonicalJson(priorEvidence, 'prior evidence').validation_ref,
+    source_evidence_id: 'EVID-0001',
+    source_evidence_digest: independentSha256(priorEvidence),
+  });
   const progress = (await readFile(join(directory, 'progress.jsonl'), 'utf8'))
     .trim().split('\n').map((line) => parseCanonicalJson(Buffer.from(`${line}\n`), 'progress event'));
   assert.deepEqual(progress.slice(-4).map((event) => event.event_type), [
@@ -1057,7 +1420,7 @@ test('selective invalidation retains unaffected task status across the new goal 
   }), fixture);
   const receipt = await repository.proposeGoalChange(fixture.root, changeProposalInput({
     affected_tasks: [],
-    criterion_impact: { affected: [], unaffected: ['AC-001'] },
+    criterion_impact: { affected: ['AC-001'], unaffected: [] },
   }), fixture);
 
   await repository.approveGoalChange(fixture.root, 'CR-0001', receipt.approval_required, fixture);
@@ -1068,25 +1431,20 @@ test('selective invalidation retains unaffected task status across the new goal 
   assert.equal((await repository.verifyGoalRepository(fixture.root, fixture)).state, 'LOCKED');
 });
 
-test('selective invalidation preserves unaffected plan and evidence state and creates an empty revision without a prior plan', async (testContext) => {
-  for (const [label, affectedTasks, affectedCriteria, expectTaskStale, expectEvidenceStale] of [
-    ['none', [], [], false, false],
-    ['task only', ['TASK-0001'], [], true, false],
-    ['evidence only', [], ['AC-001'], false, true],
-    ['all affected', ['TASK-0001'], ['AC-001'], true, true],
+test('selective invalidation separates affected task status from mandatory affected evidence and creates an empty revision without a prior plan', async (testContext) => {
+  for (const [label, affectedTasks, expectTaskStale] of [
+    ['evidence only', [], false],
+    ['task and evidence', ['TASK-0001'], true],
   ]) {
     const { fixture, repository, receipt } = await proposeChangeForApproval(testContext, {
       affected_tasks: affectedTasks,
-      criterion_impact: {
-        affected: affectedCriteria,
-        unaffected: affectedCriteria.length === 0 ? ['AC-001'] : [],
-      },
+      criterion_impact: { affected: ['AC-001'], unaffected: [] },
     }, true);
     await repository.approveGoalChange(fixture.root, 'CR-0001', receipt.approval_required, fixture);
     const directory = join(fixture.root, '.goal-lock');
     const plan = parseCanonicalJson(await readFile(join(directory, 'plan.json')), `${label} plan`);
     assert.equal(plan.tasks.find((task) => task.id === 'TASK-0001').status, expectTaskStale ? 'stale' : 'pending', label);
-    assert.equal(existsSync(join(directory, 'evidence', 'AC-001', 'EVID-0002.json')), expectEvidenceStale, label);
+    assert.equal(existsSync(join(directory, 'evidence', 'AC-001', 'EVID-0002.json')), true, label);
     assert.equal((await repository.verifyGoalRepository(fixture.root, fixture)).state, 'LOCKED', label);
   }
 
@@ -1094,10 +1452,13 @@ test('selective invalidation preserves unaffected plan and evidence state and cr
   const repository = await goalRepository();
   await repository.initializeGoal(fixture.root, goalV1(), fixture);
   await repository.lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 87f66f9c59ab', fixture);
-  const receipt = await repository.proposeGoalChange(fixture.root, changeProposalInput({
+  const removal = changeProposalInput({
     affected_tasks: [],
-    criterion_impact: { affected: [], unaffected: ['AC-001'] },
-  }), fixture);
+    criterion_impact: { affected: [], unaffected: [] },
+  });
+  removal.candidate.acceptance_criteria = [];
+  removal.changes[1].after = [];
+  const receipt = await repository.proposeGoalChange(fixture.root, removal, fixture);
   await repository.approveGoalChange(fixture.root, 'CR-0001', receipt.approval_required, fixture);
   const plan = parseCanonicalJson(await readFile(join(fixture.root, '.goal-lock', 'plan.json')), 'empty v2 plan');
   assert.equal(plan.goal.goal_version, 2);

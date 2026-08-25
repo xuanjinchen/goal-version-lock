@@ -228,6 +228,30 @@ function validateSemanticChangeCoverage(baseGoal, candidateGoal, changes, create
   return expected;
 }
 
+function deriveCriterionImpact(baseGoal, candidateGoal) {
+  const baseCriteria = new Map(baseGoal.acceptance_criteria.map((criterion) => [criterion.id, criterion]));
+  const affected = [];
+  const unaffected = [];
+  for (const criterion of candidateGoal.acceptance_criteria) {
+    const prior = baseCriteria.get(criterion.id);
+    (prior && canonicalValuesEqual(prior, criterion) ? unaffected : affected).push(criterion.id);
+  }
+  return { affected, unaffected };
+}
+
+function assertCriterionImpactMatches(baseGoal, candidateGoal, supplied, createError) {
+  const derived = deriveCriterionImpact(baseGoal, candidateGoal);
+  let matches = false;
+  try {
+    matches = canonicalValuesEqual(supplied, derived);
+  } catch {
+    matches = false;
+  }
+  // 候选目标逐项决定唯一分区，调用方不能把新/变更 criterion 伪装成可携带的 unaffected。
+  if (!matches) throw createError();
+  return derived;
+}
+
 async function readCanonicalObject(reader, relativePath, label) {
   const input = await reader.readFile(relativePath);
   try {
@@ -271,6 +295,10 @@ function repositoryAuthorizationGraph(history, planState, evidenceState, changeS
 function assertEvidenceReplayAuthorized(graph, evidenceState, progressState) {
   for (const record of evidenceState.records) {
     const evidence = record.value;
+    if (evidence.state === 'stale' && evidence.derivation?.kind === 'invalidation') {
+      // stale 派生只证明旧证据失效；其 source 与图边已核验，不能再按“可用证据”规则重放。
+      continue;
+    }
     const supersedingPlan = progressState.events.find((event) => (
       event.event_type === 'plan-revision'
       && (event.goal.goal_version > evidence.validation_ref.goal_version
@@ -379,10 +407,9 @@ async function verifyChangeState(reader, rootNames, lock, current, goalHistory) 
     validateSemanticChangeCoverage(base.goal, value.candidate_goal, value.changes, () => (
       integrityError('CHANGE_COVERAGE_INVALID', 'Change request field-level changes do not exactly cover the semantic difference.')
     ), { requireOrder: true });
-    const criterionIds = new Set(base.goal.acceptance_criteria.map((criterion) => criterion.id));
-    if (value.affected_criteria.some((criterionId) => !criterionIds.has(criterionId))) {
-      throw integrityError('CHANGE_CRITERION_UNKNOWN', 'Change request affected criteria must exist in its base goal.');
-    }
+    assertCriterionImpactMatches(base.goal, value.candidate_goal, value.criterion_impact, () => (
+      integrityError('CHANGE_CRITERION_IMPACT_INVALID', 'Change request criterion impact must exactly partition its candidate goal.')
+    ));
     if (value.status === 'approved') {
       const acceptedGoal = goalHistory.get(value.candidate_goal.goal_version);
       if (!acceptedGoal || acceptedGoal.digest !== value.candidate_digest || !acceptedGoal.bytes.equals(canonicalBytes(value.candidate_goal))) {
@@ -734,6 +761,42 @@ async function verifyEvidenceState(reader, rootNames, lock, goalHistory, planSta
       const expectedSupersedes = index === 0 ? null : `EVID-${String(index).padStart(4, '0')}`;
       if (value.supersedes !== expectedSupersedes) {
         throw integrityError('EVIDENCE_SUPERSESSION_INVALID', 'Evidence must supersede the immediately preceding record for its criterion.');
+      }
+      const source = criterionRecords.at(-1);
+      if (value.derivation !== null) {
+        // 派生记录只信任紧邻前驱的已验证字节，避免以自报 source 摘要把旧证据洗成当前证据。
+        if (!source
+          || !canonicalValuesEqual(value.derivation.source_validation_ref, source.value.validation_ref)
+          || value.derivation.source_evidence_id !== source.value.evidence_id
+          || value.derivation.source_evidence_digest !== source.digest) {
+          throw integrityError('EVIDENCE_DERIVATION_INVALID', 'Evidence derivation must bind the immediately preceding verified record.');
+        }
+        const sourceReference = value.derivation.source_validation_ref;
+        const sourcePlan = plans.get(`${sourceReference.goal_version}/${sourceReference.plan_revision}`);
+        const targetPlan = plans.get(`${value.validation_ref.goal_version}/${value.validation_ref.plan_revision}`);
+        const sourceTask = sourcePlan?.tasks.find((candidate) => candidate.id === source.value.task_id);
+        const targetTask = targetPlan?.tasks.find((candidate) => candidate.id === value.task_id);
+        const sourceValidation = sourceTask?.validations.find((candidate) => candidate.id === sourceReference.validation_id);
+        const targetValidation = targetTask?.validations.find((candidate) => candidate.id === value.validation_ref.validation_id);
+        if (value.validation_ref.goal_version !== sourceReference.goal_version + 1) {
+          throw integrityError('EVIDENCE_DERIVATION_INVALID', 'Evidence derivation must cross exactly one adjacent goal version.');
+        }
+        if (value.derivation.kind === 'carry-forward') {
+          const sourceGoal = goalHistory.get(sourceReference.goal_version)?.goal;
+          const targetGoal = goalHistory.get(value.validation_ref.goal_version)?.goal;
+          const sourceCriterion = sourceGoal?.acceptance_criteria.find((candidate) => candidate.id === criterion);
+          const targetCriterion = targetGoal?.acceptance_criteria.find((candidate) => candidate.id === criterion);
+          if (!sourceTask
+            || !targetTask
+            || !sourceValidation
+            || !targetValidation
+            || value.state !== source.value.state
+            || !canonicalValuesEqual(sourceCriterion, targetCriterion)
+            || !canonicalValuesEqual(sourceTask, targetTask)
+            || !canonicalValuesEqual(sourceValidation, targetValidation)) {
+            throw integrityError('EVIDENCE_DERIVATION_INVALID', 'Carry-forward requires byte-identical adjacent criterion, task, and validation definitions.');
+          }
+        }
       }
       const normalizedRecord = {
         ...record,
@@ -1106,7 +1169,7 @@ function validateChangeProposalInput(input) {
     || (Object.getPrototypeOf(input) !== Object.prototype && Object.getPrototypeOf(input) !== null)) {
     throw inputError('INVALID_CHANGE_INPUT', 'Change proposal input must be an object.');
   }
-  const fields = ['candidate', 'changes', 'rationale', 'affected_tasks', 'affected_criteria', 'risks', 'validation', 'rollback'];
+  const fields = ['candidate', 'changes', 'rationale', 'affected_tasks', 'criterion_impact', 'risks', 'validation', 'rollback'];
   const keys = Object.keys(input);
   if (keys.length !== fields.length || fields.some((field) => !Object.hasOwn(input, field))) {
     throw inputError('INVALID_CHANGE_INPUT', 'Change proposal input contains missing or derived fields.');
@@ -1185,14 +1248,10 @@ function validateChangeRejectionInput(changeRequestId, reason) {
   }
 }
 
-function assertChangeReferencesExist(input, current, planState) {
+function assertChangeReferencesExist(input, planState) {
   const taskIds = new Set(planState.current?.value.tasks.map((task) => task.id) ?? []);
   if (input.affected_tasks.some((taskId) => !taskIds.has(taskId))) {
     throw inputError('INVALID_CHANGE_REFERENCE', 'Affected tasks must exist in the current plan.');
-  }
-  const criterionIds = new Set(current.goal.acceptance_criteria.map((criterion) => criterion.id));
-  if (input.affected_criteria.some((criterionId) => !criterionIds.has(criterionId))) {
-    throw inputError('INVALID_CHANGE_REFERENCE', 'Affected criteria must exist in the current goal.');
   }
 }
 
@@ -1847,7 +1906,7 @@ export async function proposeGoalChange(root, input, context = {}) {
     let candidateGoal;
     try {
       candidateGoal = validateGoalContract({
-        schema_version: 1,
+        schema_version: 2,
         goal_id: current.goal.goal_id,
         goal_version: current.goal.goal_version + 1,
         ...input.candidate,
@@ -1860,11 +1919,17 @@ export async function proposeGoalChange(root, input, context = {}) {
     const normalizedChanges = validateSemanticChangeCoverage(current.goal, candidateGoal, input.changes, () => (
       inputError('INVALID_CHANGE_COVERAGE', 'Changes must exactly cover every semantic difference.')
     ));
+    const criterionImpact = assertCriterionImpactMatches(
+      current.goal,
+      candidateGoal,
+      input.criterion_impact,
+      () => inputError('INVALID_CRITERION_IMPACT', 'Criterion impact must exactly partition the candidate goal.'),
+    );
 
     const candidateBytes = canonicalBytes(candidateGoal);
     const candidateDigest = sha256(candidateBytes);
     const incomplete = {
-      schema_version: 1,
+      schema_version: 2,
       id: changeRequestId,
       status: 'proposed',
       base_goal: baseGoal,
@@ -1874,7 +1939,7 @@ export async function proposeGoalChange(root, input, context = {}) {
       changes: normalizedChanges,
       rationale: input.rationale,
       affected_tasks: input.affected_tasks,
-      affected_criteria: input.affected_criteria,
+      criterion_impact: criterionImpact,
       risks: input.risks,
       validation: input.validation,
       rollback: input.rollback,
@@ -1903,7 +1968,7 @@ export async function proposeGoalChange(root, input, context = {}) {
       if (error instanceof GoalLockError && error.kind === 'input') throw error;
       throw new GoalLockError('INVALID_CHANGE_INPUT', 'input', 2, 'Change proposal violates the change request contract.', { cause: error });
     }
-    assertChangeReferencesExist(changeRequest, current, planState);
+    assertChangeReferencesExist(changeRequest, planState);
 
     const changeBytes = canonicalBytes(changeRequest);
     const changeDigest = sha256(changeBytes);
@@ -2007,7 +2072,15 @@ export async function approveGoalChange(root, changeRequestId, approval, context
       throw approvalError('APPROVAL_REJECTED', 'Change approval must exactly match the current proposal confirmation phrase.');
     }
 
-    const { current, history, planState, progressState, evidenceState, lockInput } = snapshot;
+    const {
+      current,
+      history,
+      planState,
+      progressState,
+      evidenceState,
+      lockInput,
+      authorizationGraph,
+    } = snapshot;
     const candidate = proposed.value.candidate_goal;
     const candidateBytes = canonicalBytes(candidate);
     const candidateDigest = sha256(candidateBytes);
@@ -2025,11 +2098,12 @@ export async function approveGoalChange(root, changeRequestId, approval, context
       status: proposed.value.affected_tasks.includes(task.id) ? 'stale' : task.status,
     }));
     const plan = validatePlanCriteria(validatePlan({
-      schema_version: 1,
+      schema_version: 2,
       goal: goalReference,
       plan_revision: 1,
       next_task_id: nextExecutableTaskId(tasks, null),
       tasks,
+      risks: priorPlan?.risks ?? [],
       deferred: priorPlan?.deferred ?? [],
     }, goalReference), candidate);
     const planBytes = canonicalBytes(plan);
@@ -2055,8 +2129,12 @@ export async function approveGoalChange(root, changeRequestId, approval, context
       evidence_refs: [],
     });
 
-    const staleEvidence = [];
-    for (const criterionId of proposed.value.affected_criteria) {
+    const derivedEvidence = [];
+    const affectedCriteria = new Set(proposed.value.criterion_impact.affected);
+    const unaffectedCriteria = new Set(proposed.value.criterion_impact.unaffected);
+    const sourcePlans = plansByReference(planState);
+    for (const criterion of candidate.acceptance_criteria) {
+      const criterionId = criterion.id;
       const priorRecords = evidenceState.recordsByCriterion.get(criterionId) ?? [];
       const latest = priorRecords.at(-1);
       if (latest) {
@@ -2070,20 +2148,54 @@ export async function approveGoalChange(root, changeRequestId, approval, context
         if (!task) {
           throw stateError('EVIDENCE_INVALIDATION_TASK_MISSING', 'Affected evidence must retain its owning task in the new plan.');
         }
+        const sourceReference = latest.value.validation_ref;
+        const sourcePlan = sourcePlans.get(`${sourceReference.goal_version}/${sourceReference.plan_revision}`);
+        const sourceTask = sourcePlan?.tasks.find((candidateTask) => candidateTask.id === latest.value.task_id);
+        const sourceValidation = sourceTask?.validations.find((validation) => validation.id === sourceReference.validation_id);
+        let targetValidation = task.validations.find((validation) => validation.id === sourceReference.validation_id);
+        if (affectedCriteria.has(criterionId) && !targetValidation) {
+          const authorizedTarget = authorizationGraph.validations.find((validation) => (
+            validation.validation_ref.goal_version === current.goal.goal_version
+            && validation.validation_ref.goal_digest === current.digest
+            && validation.validation_ref.plan_revision === priorPlan.plan_revision
+            && validation.task_id === task.id
+            && validation.reachable_criterion_ids.includes(criterionId)
+          ));
+          targetValidation = task.validations.find((validation) => validation.id === authorizedTarget?.validation_ref.validation_id);
+        }
+        const canCarry = unaffectedCriteria.has(criterionId)
+          && sourceTask
+          && sourceValidation
+          && targetValidation
+          && canonicalValuesEqual(sourceTask, task)
+          && canonicalValuesEqual(sourceValidation, targetValidation);
+        if (!affectedCriteria.has(criterionId) && !canCarry) continue;
+        if (!targetValidation) {
+          throw stateError('EVIDENCE_INVALIDATION_VALIDATION_MISSING', 'Affected evidence requires a criterion-bound validation in the new plan.');
+        }
         const recordedAt = (context.now ?? (() => new Date().toISOString()))();
         const evidence = validateEvidence({
           ...latest.value,
           evidence_id: `EVID-${String(priorRecords.length + 1).padStart(4, '0')}`,
-          goal: goalReference,
-          plan_revision: plan.plan_revision,
+          validation_ref: {
+            ...goalReference,
+            plan_revision: plan.plan_revision,
+            validation_id: targetValidation.id,
+          },
           task_id: task.id,
-          state: 'stale',
+          state: affectedCriteria.has(criterionId) ? 'stale' : latest.value.state,
           supersedes: latest.value.evidence_id,
+          derivation: {
+            kind: affectedCriteria.has(criterionId) ? 'invalidation' : 'carry-forward',
+            source_validation_ref: latest.value.validation_ref,
+            source_evidence_id: latest.value.evidence_id,
+            source_evidence_digest: latest.digest,
+          },
           recorded_at: recordedAt,
         }, goalReference);
         const bytes = canonicalBytes(evidence);
         const digest = sha256(bytes);
-        staleEvidence.push({ criterionId, evidence, bytes, digest });
+        derivedEvidence.push({ criterionId, evidence, bytes, digest });
         appendEvent({
           event_type: 'verification-result',
           task_id: task.id,
@@ -2091,19 +2203,21 @@ export async function approveGoalChange(root, changeRequestId, approval, context
           evidence_refs: [evidence.evidence_id],
         }, recordedAt);
       }
-      appendEvent({
-        event_type: 'evidence-invalidation',
-        task_id: null,
-        summary: `Invalidated evidence ${criterionId} for approved goal change ${proposed.value.id}`,
-        evidence_refs: [],
-      });
+      if (affectedCriteria.has(criterionId)) {
+        appendEvent({
+          event_type: 'evidence-invalidation',
+          task_id: null,
+          summary: `Invalidated evidence ${criterionId} for approved goal change ${proposed.value.id}`,
+          evidence_refs: [],
+        });
+      }
     }
 
     const approved = validateChangeRequest({ ...proposed.value, status: 'approved' });
     const approvedBytes = canonicalBytes(approved);
     const approvedDigest = sha256(approvedBytes);
     const nextEvidenceHeads = { ...lockInput.lock.evidence_heads };
-    for (const record of staleEvidence) {
+    for (const record of derivedEvidence) {
       nextEvidenceHeads[record.criterionId] = {
         evidence_id: record.evidence.evidence_id,
         digest: record.digest,
@@ -2163,7 +2277,7 @@ export async function approveGoalChange(root, changeRequestId, approval, context
     for (const record of evidenceState.records) {
       entries.push({ target: record.target, expected: { kind: 'sha256', digest: record.digest }, content: record.bytes });
     }
-    for (const record of staleEvidence) {
+    for (const record of derivedEvidence) {
       entries.push({
         target: `.goal-lock/evidence/${record.criterionId}/${record.evidence.evidence_id}.json`,
         expected: { kind: 'absent' },
