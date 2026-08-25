@@ -5433,9 +5433,10 @@ test('final audit stores only its derived scope, graph, delta, and workspace bin
     }, completed.fixture),
     (error) => error instanceof GoalLockError && error.kind === 'input',
   );
+  const semanticSummary = 'Reviewed final semantics containing }: without ambiguity.';
   const receipt = await completed.repository.recordGoalEvent(completed.fixture.root, {
     kind: 'final-audit',
-    semantic_summary: 'Reviewed final semantics.',
+    semantic_summary: semanticSummary,
     inventory: undefined,
   }, completed.fixture);
   assert.deepEqual({
@@ -5447,7 +5448,13 @@ test('final audit stores only its derived scope, graph, delta, and workspace bin
   const terminal = parseLedgerEvents(
     await readFile(join(completed.fixture.root, '.goal-lock', 'progress.jsonl')),
   ).at(-1);
-  assert.equal(terminal.summary, `Final audit ${JSON.stringify(expected)}: Reviewed final semantics.`);
+  assert.equal(terminal.summary.includes(JSON.stringify(expected)), true);
+  assert.equal(terminal.summary.endsWith(semanticSummary), true);
+  assert.equal((await completed.repository.gateGoalCompletion(
+    completed.fixture.root,
+    undefined,
+    completed.fixture,
+  )).state, 'COMPLETE');
 
   const unauthorized = await createCompletionFixture(testContext, { audit: false });
   await writeDelivery(unauthorized.fixture.root, 'unapproved.js', 'export const unapproved = true;\n');
@@ -5587,11 +5594,13 @@ test('completion gate is reversible across evidence remediation, successor audit
   )).state, 'COMPLETE');
 
   await writeDelivery(value.fixture.root, 'src/goal-lock/repository.js', 'authorized remediation\n');
-  assert.equal((await value.repository.gateGoalCompletion(
+  const changedWorkspace = await value.repository.gateGoalCompletion(
     value.fixture.root,
     value.inventory,
     value.fixture,
-  )).state, 'BLOCKED');
+  );
+  assert.equal(changedWorkspace.state, 'BLOCKED');
+  assert.deepEqual(failedCompletionConditions(changedWorkspace), ['final_audit']);
   await value.repository.recordGoalEvent(value.fixture.root, {
     kind: 'final-audit',
     semantic_summary: 'Reviewed the authorized workspace change.',

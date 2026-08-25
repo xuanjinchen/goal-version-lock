@@ -1635,7 +1635,7 @@ export async function recordGoalEvent(root, input, context = {}) {
       const event = buildProgressEvent(progressState, goalReference, plan.plan_revision, {
         event_type: 'final-audit',
         task_id: null,
-        summary: `Final audit ${JSON.stringify(facts.auditBinding)}: ${input.semantic_summary}`,
+        summary: finalAuditSummary(facts.auditBinding, input.semantic_summary),
         evidence_refs: [],
       }, context);
       const entries = verifiedHistoryEntries(current, history, planState);
@@ -1650,7 +1650,7 @@ export async function recordGoalEvent(root, input, context = {}) {
         expected: { kind: 'sha256', digest: lockInput.digest },
         content: canonicalBytes(nextLockForEvent(lockInput, event)),
       });
-      // 已夹持复验的指纹与 progress head 同事务安装，调用方无法注入可信摘要。
+      // 已夹持复验的四项绑定与 progress head 同事务安装，调用方无法注入可信摘要。
       await commitGoalFiles(root, entries, { ...context, ...ownership });
       return {
         state: 'LOCKED',
@@ -1827,12 +1827,34 @@ function failedRepositoryCondition(code, message) {
   return 'integrity';
 }
 
+const FINAL_AUDIT_PREFIX = 'Final audit binding-json:';
+
+function finalAuditSummary(binding, semanticSummary) {
+  const bindingJson = JSON.stringify(binding);
+  return `${FINAL_AUDIT_PREFIX}${Buffer.byteLength(bindingJson, 'utf8')}:${bindingJson}: ${semanticSummary}`;
+}
+
 function auditedBinding(event) {
   if (event?.event_type !== 'final-audit') return null;
-  const match = /^Final audit (\{[^\r\n]+\}): .+$/s.exec(event.summary);
-  if (!match) return null;
+  const summary = Buffer.from(event.summary, 'utf8');
+  const prefix = Buffer.from(FINAL_AUDIT_PREFIX, 'ascii');
+  if (!summary.subarray(0, prefix.length).equals(prefix)) return null;
+  const lengthEnd = summary.indexOf(0x3a, prefix.length);
+  if (lengthEnd === -1) return null;
+  const lengthText = summary.subarray(prefix.length, lengthEnd).toString('ascii');
+  if (!/^[1-9][0-9]*$/u.test(lengthText)) return null;
+  const bindingLength = Number(lengthText);
+  const bindingStart = lengthEnd + 1;
+  const bindingEnd = bindingStart + bindingLength;
+  // 绑定按 UTF-8 字节长度切分，自由摘要中的同形分隔符永远不会改变 JSON 边界。
+  if (!Number.isSafeInteger(bindingLength)
+    || summary[bindingEnd] !== 0x3a
+    || summary[bindingEnd + 1] !== 0x20
+    || bindingEnd + 2 >= summary.length) {
+    return null;
+  }
   try {
-    const binding = JSON.parse(match[1]);
+    const binding = JSON.parse(summary.subarray(bindingStart, bindingEnd).toString('utf8'));
     const fields = ['scope_digest', 'authorization_graph_digest', 'delta_digest', 'workspace_fingerprint'];
     if (Object.keys(binding).length !== fields.length
       || fields.some((field) => !Object.hasOwn(binding, field))
