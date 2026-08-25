@@ -276,6 +276,29 @@ test('fails closed for untraced graph and evidence mutations', () => {
     },
     want: 'Evidence EVID-0002 was recorded after its plan revision was superseded',
   }, {
+    name: 'mandatory gate same-ID mutation',
+    run() {
+      const graph = buildAuthorizationGraph(history());
+      return () => assertEvidenceAuthorized(graph, evidence({
+        evidence_id: 'EVID-0003',
+        validation_ref: validationRef(2, 'VAL-0003'),
+        observed_result: 'The accepted result was changed under the same ID',
+        state: 'pass',
+        failure_paths: [],
+        recorded_at: '2026-08-25T04:00:00.000Z',
+      }), { mode: 'write' });
+    },
+    want: 'Mandatory validation GL-AUTH/1/2/VAL-0003 already has an accepted result',
+  }, {
+    name: 'malformed replay cutoff',
+    run() {
+      const graph = buildAuthorizationGraph(history());
+      return () => assertEvidenceAuthorized(graph, evidence({
+        evidence_id: 'EVID-0002',
+      }), { mode: 'replay', superseded_at: 'zzzz' });
+    },
+    want: 'Evidence chronology superseded_at must be an RFC 3339 UTC timestamp',
+  }, {
     name: 'stale evidence',
     run() {
       const graph = buildAuthorizationGraph(history());

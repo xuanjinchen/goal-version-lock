@@ -165,6 +165,35 @@ function assertEvidenceCore(validation, evidence, { allowStale = false } = {}) {
   }
 }
 
+function utcTimestampParts(value) {
+  const match = typeof value === 'string'
+    && /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?Z$/.exec(value);
+  if (!match) return null;
+  const [, yearText, monthText, dayText, hourText, minuteText, secondText, fraction = ''] = match;
+  const year = Number(yearText);
+  const month = Number(monthText);
+  const day = Number(dayText);
+  const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const daysInMonth = [31, leapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  if (month < 1 || month > 12
+    || day < 1 || day > daysInMonth[month - 1]
+    || Number(hourText) > 23 || Number(minuteText) > 59 || Number(secondText) > 59) {
+    return null;
+  }
+  return { wholeSeconds: value.slice(0, 19), fraction };
+}
+
+function compareUtcTimestamps(left, right) {
+  if (left.wholeSeconds !== right.wholeSeconds) {
+    return left.wholeSeconds < right.wholeSeconds ? -1 : 1;
+  }
+  // 补零比较保留契约允许的任意小数秒精度，避免 Date.parse 静默截断亚毫秒顺序。
+  const width = Math.max(left.fraction.length, right.fraction.length);
+  const leftFraction = left.fraction.padEnd(width, '0');
+  const rightFraction = right.fraction.padEnd(width, '0');
+  return leftFraction === rightFraction ? 0 : leftFraction < rightFraction ? -1 : 1;
+}
+
 function assertChronology(graph, evidence, chronology) {
   if (chronology === null || typeof chronology !== 'object' || Array.isArray(chronology)) {
     deny('Evidence chronology must be a plain object');
@@ -188,8 +217,11 @@ function assertChronology(graph, evidence, chronology) {
     && activePlan.goal.goal_digest === evidence.validation_ref.goal_digest
     && activePlan.plan_revision === evidence.validation_ref.plan_revision;
   if (targetsActivePlan) return;
-  if (typeof chronology.superseded_at !== 'string'
-    || evidence.recorded_at >= chronology.superseded_at) {
+  const cutoff = utcTimestampParts(chronology.superseded_at);
+  if (cutoff === null) {
+    deny('Evidence chronology superseded_at must be an RFC 3339 UTC timestamp');
+  }
+  if (compareUtcTimestamps(utcTimestampParts(evidence.recorded_at), cutoff) >= 0) {
     deny(`Evidence ${evidence.evidence_id} was recorded after its plan revision was superseded`);
   }
 }
@@ -252,7 +284,7 @@ export function buildAuthorizationGraph({ goalHistory, planRecords, evidenceReco
           criterion_ids: [...validation.criterion_ids].sort(),
           risk_ids: [...validation.risk_ids].sort(),
           reachable_criterion_ids: [],
-          evidence_ids: [],
+          evidence_bindings: [],
           owned_criterion_ids: [...task.acceptance_criteria].sort(),
           plan_risk_prefix: `${riskKey(goal, plan.plan_revision, '')}`,
         };
@@ -327,10 +359,16 @@ export function buildAuthorizationGraph({ goalHistory, planRecords, evidenceReco
     const key = `${referenceKey(evidence.validation_ref)}\u0000${evidence.evidence_id}`;
     if (evidenceBySource.has(key)) deny(`Evidence ${evidence.evidence_id} is duplicated for its validation`);
     evidenceBySource.set(key, evidence);
-    if (evidence.state !== 'stale') validation.evidence_ids.push(evidence.evidence_id);
+    if (evidence.state !== 'stale') {
+      // 单次 gate 绑定完整规范化证据摘要，同一 ID 不能替换已接受的不可变结果。
+      validation.evidence_bindings.push({
+        evidence_id: evidence.evidence_id,
+        evidence_digest: sha256(canonicalBytes(evidence)),
+      });
+    }
   }
   for (const validation of validationsByKey.values()) {
-    if (validation.kind === 'mandatory-gate' && validation.evidence_ids.length > 1) {
+    if (validation.kind === 'mandatory-gate' && validation.evidence_bindings.length > 1) {
       deny(`Mandatory validation ${displayReference(validation.validation_ref)} already has an accepted result`);
     }
   }
@@ -409,7 +447,10 @@ export function buildAuthorizationGraph({ goalHistory, planRecords, evidenceReco
     .sort((left, right) => compareReferences(left.validation_ref, right.validation_ref))
     .map(({ owned_criterion_ids: _owned, plan_risk_prefix: _prefix, ...node }) => ({
       ...node,
-      evidence_ids: [...new Set(node.evidence_ids)].sort(),
+      evidence_bindings: node.evidence_bindings.sort((left, right) => (
+        left.evidence_id.localeCompare(right.evidence_id)
+          || left.evidence_digest.localeCompare(right.evidence_digest)
+      )),
     }));
   const riskEdges = [...risksByKey.values()]
     .sort((left, right) => left.goal.goal_version - right.goal.goal_version
@@ -464,10 +505,17 @@ export function assertEvidenceAuthorized(graph, evidence, chronology) {
   const validation = resolveValidationRef(graph, normalized.validation_ref);
   assertEvidenceCore(validation, normalized);
   assertChronology(graph, normalized, chronology);
-  if (validation.kind === 'mandatory-gate'
-    && validation.evidence_ids.length > 0
-    && !validation.evidence_ids.includes(normalized.evidence_id)) {
-    deny(`Mandatory validation ${displayReference(normalized.validation_ref)} already has an accepted result`);
+  if (validation.kind === 'mandatory-gate') {
+    const bindings = validation.evidence_bindings ?? [];
+    if (chronology.mode === 'write' && bindings.length > 0) {
+      deny(`Mandatory validation ${displayReference(normalized.validation_ref)} already has an accepted result`);
+    }
+    const digest = sha256(canonicalBytes(normalized));
+    if (chronology.mode === 'replay'
+      && !bindings.some((binding) => binding.evidence_id === normalized.evidence_id
+        && binding.evidence_digest === digest)) {
+      deny(`Mandatory validation ${displayReference(normalized.validation_ref)} does not match its accepted result`);
+    }
   }
   return normalized;
 }
