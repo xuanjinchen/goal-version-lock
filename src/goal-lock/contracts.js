@@ -18,7 +18,9 @@ const IDENTIFIERS = {
   change_request_id: /^CR-[0-9]{4}$/,
   event_id: /^EVT-[0-9]{6}$/,
   evidence_id: /^EVID-[0-9]{4}$/,
+  risk_id: /^RISK-[0-9]{4}$/,
   task_id: /^TASK-[0-9]{4}$/,
+  validation_id: /^VAL-[0-9]{4}$/,
 };
 const CHANGE_REQUEST_FIELDS = [
   'schema_version',
@@ -31,7 +33,7 @@ const CHANGE_REQUEST_FIELDS = [
   'changes',
   'rationale',
   'affected_tasks',
-  'affected_criteria',
+  'criterion_impact',
   'risks',
   'validation',
   'rollback',
@@ -73,7 +75,7 @@ function exactKeys(value, label, keys) {
   const actual = Object.keys(value);
   if (actual.length !== keys.length || keys.some((key) => !Object.hasOwn(value, key))) {
     const missing = keys.filter((key) => !Object.hasOwn(value, key));
-    fail('INVALID_CONTRACT', 'input', 2, `${label} has missing or unknown fields${missing.length ? `: ${missing.join(', ')}` : ''}`);
+    fail('INVALID_CONTRACT', 'input', 2, `${label} must contain exact fields; missing or unknown fields${missing.length ? `: ${missing.join(', ')}` : ''}`);
   }
 }
 
@@ -87,6 +89,13 @@ function requiredText(value, label) {
 function positiveInteger(value, label) {
   if (!Number.isSafeInteger(value) || value < 1) {
     fail('INVALID_CONTRACT', 'input', 2, `${label} must be a positive integer`);
+  }
+  return value;
+}
+
+function nonNegativeInteger(value, label) {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    fail('INVALID_CONTRACT', 'input', 2, `${label} must be a non-negative integer`);
   }
   return value;
 }
@@ -149,6 +158,32 @@ function uniqueIdentifiers(value, label, type) {
   return normalized;
 }
 
+function validateGoalReference(value, label = 'goal reference') {
+  exactKeys(value, label, ['goal_id', 'goal_version', 'goal_digest']);
+  return {
+    goal_id: identifier(value.goal_id, 'goal_id', `${label}.goal_id`),
+    goal_version: positiveInteger(value.goal_version, `${label}.goal_version`),
+    goal_digest: digest(value.goal_digest, `${label}.goal_digest`),
+  };
+}
+
+function assertGoalReferenceMatches(actual, expected, label) {
+  for (const field of ['goal_id', 'goal_version', 'goal_digest']) {
+    if (actual[field] !== expected[field]) {
+      fail('INVALID_CONTRACT', 'input', 2, `${label}.${field} does not match the expected goal`);
+    }
+  }
+}
+
+function uniquePaths(value, label, options = {}) {
+  const paths = array(value, label, options)
+    .map((entry, index) => normalizeRelativePath(entry, `${label}[${index}]`));
+  if (new Set(paths).size !== paths.length) {
+    fail('INVALID_CONTRACT', 'input', 2, `${label} contains duplicates`);
+  }
+  return paths;
+}
+
 function validatePredecessor(value, goalVersion) {
   if (goalVersion === 1) {
     if (value !== null) fail('INVALID_CONTRACT', 'input', 2, 'predecessor must be null for goal_version 1');
@@ -176,10 +211,86 @@ export function normalizeRelativePath(value, label = 'path') {
   return value;
 }
 
+/** ValidationRef 以五元组固定一次验证的目标、计划修订和不可复用身份。 */
+export function validateValidationRef(value, label = 'validation_ref') {
+  exactKeys(value, label, ['goal_id', 'goal_version', 'goal_digest', 'plan_revision', 'validation_id']);
+  return deepFreeze({
+    goal_id: identifier(value.goal_id, 'goal_id', `${label}.goal_id`),
+    goal_version: positiveInteger(value.goal_version, `${label}.goal_version`),
+    goal_digest: digest(value.goal_digest, `${label}.goal_digest`),
+    plan_revision: positiveInteger(value.plan_revision, `${label}.plan_revision`),
+    validation_id: identifier(value.validation_id, 'validation_id', `${label}.validation_id`),
+  });
+}
+
+/** 范围基线摘要覆盖规范化后的完整记录，索引字段只属于 Git 已跟踪文件。 */
+export function validateScopeBaseline(value, goalReference) {
+  exactKeys(value, 'scope baseline', [
+    'schema_version',
+    'scope_version',
+    'goal',
+    'mode',
+    'entries',
+    'recorded_at',
+    'record_digest',
+  ]);
+  if (value.schema_version !== 2) fail('INVALID_CONTRACT', 'input', 2, 'scope baseline.schema_version must equal 2');
+  if (value.scope_version !== 1) fail('INVALID_CONTRACT', 'input', 2, 'scope baseline.scope_version must equal 1');
+  if (!['git', 'inventory'].includes(value.mode)) fail('INVALID_CONTRACT', 'input', 2, 'scope baseline.mode is invalid');
+  const expectedGoal = validateGoalReference(goalReference);
+  const goal = validateGoalReference(value.goal, 'scope baseline.goal');
+  assertGoalReferenceMatches(goal, expectedGoal, 'scope baseline.goal');
+  const entries = array(value.entries, 'scope baseline.entries').map((entry, index) => {
+    const label = `scope baseline.entries[${index}]`;
+    exactKeys(entry, label, ['path', 'source', 'mode', 'size', 'digest', 'index_mode', 'index_digest']);
+    if (!['tracked', 'untracked', 'inventory'].includes(entry.source)) {
+      fail('INVALID_CONTRACT', 'input', 2, `${label}.source is invalid`);
+    }
+    if (!['100644', '100755'].includes(entry.mode)) fail('INVALID_CONTRACT', 'input', 2, `${label}.mode is invalid`);
+    const tracked = entry.source === 'tracked';
+    if (tracked) {
+      if (!['100644', '100755'].includes(entry.index_mode)) fail('INVALID_CONTRACT', 'input', 2, `${label}.index_mode is invalid`);
+      digest(entry.index_digest, `${label}.index_digest`);
+    } else if (entry.index_mode !== null || entry.index_digest !== null) {
+      fail('INVALID_CONTRACT', 'input', 2, `${label} index fields must be null for untracked or inventory entries`);
+    }
+    if (value.mode === 'git' ? entry.source === 'inventory' : entry.source !== 'inventory') {
+      fail('INVALID_CONTRACT', 'input', 2, `${label}.source does not match scope baseline.mode`);
+    }
+    return {
+      path: normalizeRelativePath(entry.path, `${label}.path`),
+      source: entry.source,
+      mode: entry.mode,
+      size: nonNegativeInteger(entry.size, `${label}.size`),
+      digest: digest(entry.digest, `${label}.digest`),
+      index_mode: entry.index_mode,
+      index_digest: entry.index_digest,
+    };
+  });
+  const paths = entries.map(({ path }) => path);
+  if (new Set(paths).size !== paths.length || paths.some((path, index) => index > 0 && paths[index - 1] >= path)) {
+    fail('INVALID_CONTRACT', 'input', 2, 'scope baseline.entries must be sorted by unique path');
+  }
+  const normalized = {
+    schema_version: 2,
+    scope_version: 1,
+    goal,
+    mode: value.mode,
+    entries,
+    recorded_at: timestamp(value.recorded_at, 'scope baseline.recorded_at'),
+    record_digest: digest(value.record_digest, 'scope baseline.record_digest'),
+  };
+  const { record_digest: suppliedDigest, ...withoutDigest } = normalized;
+  if (sha256(canonicalBytes(withoutDigest)) !== suppliedDigest) {
+    fail('INTEGRITY_FAILURE', 'integrity', 4, 'scope baseline.record_digest does not match the scope baseline');
+  }
+  return deepFreeze(normalized);
+}
+
 export function validateGoalContract(value, options = {}) {
   const fields = ['schema_version', 'goal_id', 'goal_version', 'objective', 'scope', 'non_goals', 'constraints', 'acceptance_criteria', 'authorization_boundary', 'assumptions', 'predecessor', 'accepted_change_id'];
   exactKeys(value, 'goal', fields);
-  if (value.schema_version !== 1) fail('INVALID_CONTRACT', 'input', 2, 'schema_version must equal 1');
+  if (value.schema_version !== 2) fail('INVALID_CONTRACT', 'input', 2, 'schema_version must equal 2');
   const goalVersion = positiveInteger(value.goal_version, 'goal_version');
   const goalId = identifier(value.goal_id, 'goal_id', 'goal_id');
   if (options.goal_id !== undefined && options.goal_id !== goalId) fail('INVALID_CONTRACT', 'input', 2, 'goal_id does not match the expected goal');
@@ -191,7 +302,7 @@ export function validateGoalContract(value, options = {}) {
     exactKeys(constraint, `constraints[${index}]`, ['id', 'text']);
     return { id: requiredText(constraint.id, `constraints[${index}].id`), text: requiredText(constraint.text, `constraints[${index}].text`) };
   });
-  const criteria = array(value.acceptance_criteria, 'acceptance_criteria').map((criterion, index) => {
+  const criteria = array(value.acceptance_criteria, 'acceptance_criteria', { nonEmpty: true }).map((criterion, index) => {
     exactKeys(criterion, `acceptance_criteria[${index}]`, ['id', 'outcome', 'verification']);
     return {
       id: identifier(criterion.id, 'acceptance_criterion_id', `acceptance_criteria[${index}].id`),
@@ -217,7 +328,7 @@ export function validateGoalContract(value, options = {}) {
   }
 
   return deepFreeze({
-    schema_version: 1,
+    schema_version: 2,
     goal_id: goalId,
     goal_version: goalVersion,
     objective: requiredText(value.objective, 'objective'),
@@ -233,43 +344,100 @@ export function validateGoalContract(value, options = {}) {
 }
 
 export function validatePlan(value, goalReference) {
-  const fields = ['schema_version', 'goal', 'plan_revision', 'next_task_id', 'tasks', 'deferred'];
+  const fields = ['schema_version', 'goal', 'plan_revision', 'next_task_id', 'tasks', 'risks', 'deferred'];
   exactKeys(value, 'plan', fields);
-  if (value.schema_version !== 1) fail('INVALID_CONTRACT', 'input', 2, 'schema_version must equal 1');
+  if (value.schema_version !== 2) fail('INVALID_CONTRACT', 'input', 2, 'schema_version must equal 2');
 
-  exactKeys(goalReference, 'goal reference', ['goal_id', 'goal_version', 'goal_digest']);
-  const expectedGoal = {
-    goal_id: identifier(goalReference.goal_id, 'goal_id', 'goal reference.goal_id'),
-    goal_version: positiveInteger(goalReference.goal_version, 'goal reference.goal_version'),
-    goal_digest: digest(goalReference.goal_digest, 'goal reference.goal_digest'),
-  };
-  exactKeys(value.goal, 'goal', ['goal_id', 'goal_version', 'goal_digest']);
-  const goal = {
-    goal_id: identifier(value.goal.goal_id, 'goal_id', 'goal.goal_id'),
-    goal_version: positiveInteger(value.goal.goal_version, 'goal.goal_version'),
-    goal_digest: digest(value.goal.goal_digest, 'goal.goal_digest'),
-  };
-  if (goal.goal_id !== expectedGoal.goal_id) fail('INVALID_CONTRACT', 'input', 2, 'goal.goal_id does not match the current goal');
-  if (goal.goal_version !== expectedGoal.goal_version) fail('INVALID_CONTRACT', 'input', 2, 'goal.goal_version does not match the current goal');
-  if (goal.goal_digest !== expectedGoal.goal_digest) fail('INVALID_CONTRACT', 'input', 2, 'goal.goal_digest does not match the current goal');
+  const expectedGoal = validateGoalReference(goalReference);
+  const goal = validateGoalReference(value.goal, 'goal');
+  assertGoalReferenceMatches(goal, expectedGoal, 'goal');
+
+  const riskIds = new Set();
+  const risks = array(value.risks, 'risks').map((risk, index) => {
+    const label = `risks[${index}]`;
+    exactKeys(risk, label, ['id', 'statement', 'source', 'affected_paths']);
+    const id = identifier(risk.id, 'risk_id', `${label}.id`);
+    if (riskIds.has(id)) fail('INVALID_CONTRACT', 'input', 2, `risks contains duplicate risk ID ${id}`);
+    riskIds.add(id);
+    plainObject(risk.source, `${label}.source`);
+    let source;
+    if (risk.source.kind === 'criterion') {
+      exactKeys(risk.source, `${label}.source`, ['kind', 'criterion_id']);
+      source = {
+        kind: 'criterion',
+        criterion_id: identifier(risk.source.criterion_id, 'acceptance_criterion_id', `${label}.source.criterion_id`),
+      };
+    } else if (risk.source.kind === 'failed-validation') {
+      exactKeys(risk.source, `${label}.source`, ['kind', 'validation_ref', 'evidence_id']);
+      source = {
+        kind: 'failed-validation',
+        validation_ref: validateValidationRef(risk.source.validation_ref, `${label}.source.validation_ref`),
+        evidence_id: identifier(risk.source.evidence_id, 'evidence_id', `${label}.source.evidence_id`),
+      };
+    } else {
+      fail('INVALID_CONTRACT', 'input', 2, `${label}.source.kind is invalid`);
+    }
+    return {
+      id,
+      statement: requiredText(risk.statement, `${label}.statement`),
+      source,
+      affected_paths: uniquePaths(risk.affected_paths, `${label}.affected_paths`, { nonEmpty: true }),
+    };
+  });
 
   const taskIds = new Set();
-  const tasks = array(value.tasks, 'tasks').map((task, index) => {
+  const validationIds = new Set();
+  const tasks = array(value.tasks, 'tasks', { nonEmpty: true }).map((task, index) => {
     const label = `tasks[${index}]`;
-    exactKeys(task, label, ['id', 'outcome', 'acceptance_criteria', 'dependencies', 'permitted_paths', 'verification', 'status']);
+    exactKeys(task, label, ['id', 'outcome', 'acceptance_criteria', 'dependencies', 'permitted_paths', 'validations', 'status']);
     const id = identifier(task.id, 'task_id', `${label}.id`);
     if (taskIds.has(id)) fail('INVALID_CONTRACT', 'input', 2, `tasks contains duplicate task ID ${id}`);
     taskIds.add(id);
-    const acceptanceCriteria = array(task.acceptance_criteria, `${label}.acceptance_criteria`, { nonEmpty: true })
-      .map((criterionId) => identifier(criterionId, 'acceptance_criterion_id', `${label}.acceptance_criteria`));
-    const uniqueCriteria = new Set(acceptanceCriteria);
-    if (uniqueCriteria.size !== acceptanceCriteria.length) fail('INVALID_CONTRACT', 'input', 2, `${label}.acceptance_criteria contains duplicates`);
-    const dependencies = array(task.dependencies, `${label}.dependencies`)
-      .map((dependencyId) => identifier(dependencyId, 'task_id', `${label}.dependencies`));
-    if (new Set(dependencies).size !== dependencies.length) fail('INVALID_CONTRACT', 'input', 2, `${label}.dependencies contains duplicates`);
-    const permittedPaths = array(task.permitted_paths, `${label}.permitted_paths`)
-      .map((permittedPath) => normalizeRelativePath(permittedPath, `${label}.permitted_paths`));
-    if (new Set(permittedPaths).size !== permittedPaths.length) fail('INVALID_CONTRACT', 'input', 2, `${label}.permitted_paths contains duplicates`);
+    const acceptanceCriteria = uniqueIdentifiers(task.acceptance_criteria, `${label}.acceptance_criteria`, 'acceptance_criterion_id');
+    if (acceptanceCriteria.length === 0) fail('INVALID_CONTRACT', 'input', 2, `${label}.acceptance_criteria must be a non-empty array`);
+    const dependencies = uniqueIdentifiers(task.dependencies, `${label}.dependencies`, 'task_id');
+    const permittedPaths = uniquePaths(task.permitted_paths, `${label}.permitted_paths`);
+    const validations = array(task.validations, `${label}.validations`).map((validation, validationIndex) => {
+      const validationLabel = `${label}.validations[${validationIndex}]`;
+      exactKeys(validation, validationLabel, ['id', 'kind', 'method', 'affected_paths', 'criterion_ids', 'risk_ids']);
+      const validationId = identifier(validation.id, 'validation_id', `${validationLabel}.id`);
+      if (validationIds.has(validationId)) fail('INVALID_CONTRACT', 'input', 2, `plan contains duplicate validation ID ${validationId}`);
+      validationIds.add(validationId);
+      if (!['focused', 'affected-regression', 'mandatory-gate'].includes(validation.kind)) {
+        fail('INVALID_CONTRACT', 'input', 2, `${validationLabel}.kind is invalid`);
+      }
+      exactKeys(validation.method, `${validationLabel}.method`, ['type', 'target']);
+      if (!['deterministic-test', 'behavior-eval', 'audit', 'manual-review', 'delivery-gate'].includes(validation.method.type)) {
+        fail('INVALID_CONTRACT', 'input', 2, `${validationLabel}.method.type is invalid`);
+      }
+      const rawAffectedPaths = array(validation.affected_paths, `${validationLabel}.affected_paths`, { nonEmpty: true });
+      let affectedPaths;
+      if (rawAffectedPaths.includes('@governed-workspace')) {
+        // 该闭合 token 只代表一次 mandatory gate，不能与任何具体交付路径混合扩权。
+        if (validation.kind !== 'mandatory-gate' || rawAffectedPaths.length !== 1) {
+          fail('INVALID_CONTRACT', 'input', 2, `${validationLabel}.affected_paths may use @governed-workspace only as the sole mandatory-gate token`);
+        }
+        affectedPaths = ['@governed-workspace'];
+      } else {
+        affectedPaths = uniquePaths(rawAffectedPaths, `${validationLabel}.affected_paths`, { nonEmpty: true });
+      }
+      const criterionIds = uniqueIdentifiers(validation.criterion_ids, `${validationLabel}.criterion_ids`, 'acceptance_criterion_id');
+      const validationRiskIds = uniqueIdentifiers(validation.risk_ids, `${validationLabel}.risk_ids`, 'risk_id');
+      if (criterionIds.length === 0 && validationRiskIds.length === 0) {
+        fail('INVALID_CONTRACT', 'input', 2, `${validationLabel} must trace to at least one criterion or risk`);
+      }
+      return {
+        id: validationId,
+        kind: validation.kind,
+        method: {
+          type: validation.method.type,
+          target: requiredText(validation.method.target, `${validationLabel}.method.target`),
+        },
+        affected_paths: affectedPaths,
+        criterion_ids: criterionIds,
+        risk_ids: validationRiskIds,
+      };
+    });
     if (!['pending', 'in_progress', 'blocked', 'complete', 'stale'].includes(task.status)) {
       fail('INVALID_CONTRACT', 'input', 2, `${label}.status is invalid`);
     }
@@ -279,7 +447,7 @@ export function validatePlan(value, goalReference) {
       acceptance_criteria: acceptanceCriteria,
       dependencies,
       permitted_paths: permittedPaths,
-      verification: requiredText(task.verification, `${label}.verification`),
+      validations,
       status: task.status,
     };
   });
@@ -329,61 +497,73 @@ export function validatePlan(value, goalReference) {
   }
 
   return deepFreeze({
-    schema_version: 1,
+    schema_version: 2,
     goal,
     plan_revision: positiveInteger(value.plan_revision, 'plan_revision'),
     next_task_id: nextTaskId,
     tasks,
+    risks,
     deferred,
   });
 }
 
-/** 证据沿袭只接受完整不可变封装，并精确绑定调用方已验证的目标版本。 */
+/** 证据不再声明独立执行方法，只能引用计划历史中的精确 ValidationRef。 */
 export function validateEvidence(value, goalReference) {
-  const fields = ['schema_version', 'evidence_id', 'acceptance_criterion_id', 'goal', 'plan_revision', 'task_id', 'method', 'observed_result', 'artifact_refs', 'workspace_fingerprint', 'state', 'supersedes', 'recorded_at'];
+  const fields = ['schema_version', 'evidence_id', 'acceptance_criterion_id', 'validation_ref', 'task_id', 'observed_result', 'artifact_refs', 'workspace_fingerprint', 'state', 'failure_paths', 'supersedes', 'derivation', 'recorded_at'];
   exactKeys(value, 'evidence', fields);
-  if (value.schema_version !== 1) fail('INVALID_CONTRACT', 'input', 2, 'schema_version must equal 1');
+  if (value.schema_version !== 2) fail('INVALID_CONTRACT', 'input', 2, 'schema_version must equal 2');
 
-  exactKeys(goalReference, 'goal reference', ['goal_id', 'goal_version', 'goal_digest']);
-  const expectedGoal = {
-    goal_id: identifier(goalReference.goal_id, 'goal_id', 'goal reference.goal_id'),
-    goal_version: positiveInteger(goalReference.goal_version, 'goal reference.goal_version'),
-    goal_digest: digest(goalReference.goal_digest, 'goal reference.goal_digest'),
-  };
-  exactKeys(value.goal, 'evidence.goal', ['goal_id', 'goal_version', 'goal_digest']);
-  const goal = {
-    goal_id: identifier(value.goal.goal_id, 'goal_id', 'evidence.goal.goal_id'),
-    goal_version: positiveInteger(value.goal.goal_version, 'evidence.goal.goal_version'),
-    goal_digest: digest(value.goal.goal_digest, 'evidence.goal.goal_digest'),
-  };
-  if (goal.goal_id !== expectedGoal.goal_id) fail('INVALID_CONTRACT', 'input', 2, 'evidence.goal.goal_id does not match the expected goal');
-  if (goal.goal_version !== expectedGoal.goal_version) fail('INVALID_CONTRACT', 'input', 2, 'evidence.goal.goal_version does not match the expected goal');
-  if (goal.goal_digest !== expectedGoal.goal_digest) fail('INVALID_CONTRACT', 'input', 2, 'evidence.goal.goal_digest does not match the expected goal');
-
-  const artifactRefs = array(value.artifact_refs, 'evidence.artifact_refs')
-    .map((artifactPath, index) => normalizeRelativePath(artifactPath, `evidence.artifact_refs[${index}]`));
-  if (new Set(artifactRefs).size !== artifactRefs.length) {
-    fail('INVALID_CONTRACT', 'input', 2, 'evidence.artifact_refs contains duplicates');
-  }
+  const expectedGoal = validateGoalReference(goalReference);
+  const validationRef = validateValidationRef(value.validation_ref, 'evidence.validation_ref');
+  assertGoalReferenceMatches(validationRef, expectedGoal, 'evidence.validation_ref');
+  const artifactRefs = uniquePaths(value.artifact_refs, 'evidence.artifact_refs');
   if (!['pass', 'fail', 'stale'].includes(value.state)) {
     fail('INVALID_CONTRACT', 'input', 2, 'evidence.state is invalid');
+  }
+  const failurePaths = uniquePaths(value.failure_paths, 'evidence.failure_paths');
+  if (value.state !== 'fail' && failurePaths.length > 0) {
+    fail('INVALID_CONTRACT', 'input', 2, 'evidence.failure_paths must be empty unless state is fail');
   }
   const supersedes = value.supersedes === null
     ? null
     : identifier(value.supersedes, 'evidence_id', 'evidence.supersedes');
+  let derivation = null;
+  if (value.derivation !== null) {
+    exactKeys(value.derivation, 'evidence.derivation', [
+      'kind',
+      'source_validation_ref',
+      'source_evidence_id',
+      'source_evidence_digest',
+    ]);
+    if (!['carry-forward', 'invalidation'].includes(value.derivation.kind)) {
+      fail('INVALID_CONTRACT', 'input', 2, 'evidence.derivation.kind is invalid');
+    }
+    derivation = {
+      kind: value.derivation.kind,
+      source_validation_ref: validateValidationRef(value.derivation.source_validation_ref, 'evidence.derivation.source_validation_ref'),
+      source_evidence_id: identifier(value.derivation.source_evidence_id, 'evidence_id', 'evidence.derivation.source_evidence_id'),
+      source_evidence_digest: digest(value.derivation.source_evidence_digest, 'evidence.derivation.source_evidence_digest'),
+    };
+    if (supersedes !== derivation.source_evidence_id) {
+      fail('INVALID_CONTRACT', 'input', 2, 'evidence.derivation must bind the superseded evidence');
+    }
+    if (derivation.kind === 'invalidation' && value.state !== 'stale') {
+      fail('INVALID_CONTRACT', 'input', 2, 'evidence invalidation derivations must be stale');
+    }
+  }
   return deepFreeze({
-    schema_version: 1,
+    schema_version: 2,
     evidence_id: identifier(value.evidence_id, 'evidence_id', 'evidence.evidence_id'),
     acceptance_criterion_id: identifier(value.acceptance_criterion_id, 'acceptance_criterion_id', 'evidence.acceptance_criterion_id'),
-    goal,
-    plan_revision: positiveInteger(value.plan_revision, 'evidence.plan_revision'),
+    validation_ref: validationRef,
     task_id: identifier(value.task_id, 'task_id', 'evidence.task_id'),
-    method: requiredText(value.method, 'evidence.method'),
     observed_result: requiredText(value.observed_result, 'evidence.observed_result'),
     artifact_refs: artifactRefs,
     workspace_fingerprint: digest(value.workspace_fingerprint, 'evidence.workspace_fingerprint'),
     state: value.state,
+    failure_paths: failurePaths,
     supersedes,
+    derivation,
     recorded_at: timestamp(value.recorded_at, 'evidence.recorded_at'),
   });
 }
@@ -392,7 +572,7 @@ export function validateEvidence(value, goalReference) {
 export function validateProgressEvent(value, previousDigest) {
   const fields = ['schema_version', 'event_id', 'recorded_at', 'goal', 'plan_revision', 'task_id', 'event_type', 'summary', 'evidence_refs', 'previous_event_digest', 'event_digest'];
   exactKeys(value, 'progress event', fields);
-  if (value.schema_version !== 1) fail('INVALID_CONTRACT', 'input', 2, 'schema_version must equal 1');
+  if (value.schema_version !== 2) fail('INVALID_CONTRACT', 'input', 2, 'schema_version must equal 2');
 
   exactKeys(value.goal, 'progress event.goal', ['goal_id', 'goal_version', 'goal_digest']);
   const goal = {
@@ -428,7 +608,7 @@ export function validateProgressEvent(value, previousDigest) {
   }
 
   const normalized = {
-    schema_version: 1,
+    schema_version: 2,
     event_id: identifier(value.event_id, 'event_id', 'progress event.event_id'),
     recorded_at: timestamp(value.recorded_at, 'progress event.recorded_at'),
     goal,
@@ -455,9 +635,9 @@ function nullableHead(value, label, idType, idField) {
 }
 
 export function validateLockRecord(value) {
-  const fields = ['schema_version', 'goal_id', 'goal_version', 'goal_digest', 'approval_type', 'proposal_digest', 'approved_at', 'predecessor_digest', 'state_revision', 'progress_head', 'change_head', 'evidence_heads', 'record_digest'];
+  const fields = ['schema_version', 'goal_id', 'goal_version', 'goal_digest', 'approval_type', 'proposal_digest', 'approved_at', 'predecessor_digest', 'state_revision', 'scope_head', 'plan_head', 'progress_head', 'change_head', 'change_heads', 'evidence_heads', 'record_digest'];
   exactKeys(value, 'lock', fields);
-  if (value.schema_version !== 1) fail('INVALID_CONTRACT', 'input', 2, 'schema_version must equal 1');
+  if (value.schema_version !== 2) fail('INVALID_CONTRACT', 'input', 2, 'schema_version must equal 2');
   const goalVersion = positiveInteger(value.goal_version, 'goal_version');
   const predecessorDigest = value.predecessor_digest;
   if (goalVersion === 1 ? predecessorDigest !== null : predecessorDigest === null) fail('INVALID_CONTRACT', 'input', 2, 'predecessor_digest does not match goal_version');
@@ -475,8 +655,25 @@ export function validateLockRecord(value) {
       digest: digest(head.digest, `evidence_heads.${criterionId}.digest`),
     };
   }
+  plainObject(value.change_heads, 'change_heads');
+  const changeHeads = {};
+  for (const [changeRequestId, changeDigest] of Object.entries(value.change_heads)) {
+    identifier(changeRequestId, 'change_request_id', 'change_heads key');
+    changeHeads[changeRequestId] = digest(changeDigest, `change_heads.${changeRequestId}`);
+  }
+  let planHead = null;
+  if (value.plan_head !== null) {
+    exactKeys(value.plan_head, 'plan_head', ['goal_version', 'plan_revision', 'digest']);
+    planHead = {
+      goal_version: positiveInteger(value.plan_head.goal_version, 'plan_head.goal_version'),
+      plan_revision: positiveInteger(value.plan_head.plan_revision, 'plan_head.plan_revision'),
+      digest: digest(value.plan_head.digest, 'plan_head.digest'),
+    };
+  }
+  exactKeys(value.scope_head, 'scope_head', ['scope_version', 'digest']);
+  if (value.scope_head.scope_version !== 1) fail('INVALID_CONTRACT', 'input', 2, 'scope_head.scope_version must equal 1');
   const normalized = {
-    schema_version: 1,
+    schema_version: 2,
     goal_id: identifier(value.goal_id, 'goal_id', 'goal_id'),
     goal_version: goalVersion,
     goal_digest: digest(value.goal_digest, 'goal_digest'),
@@ -485,8 +682,14 @@ export function validateLockRecord(value) {
     approved_at: timestamp(value.approved_at, 'approved_at'),
     predecessor_digest: predecessorDigest,
     state_revision: positiveInteger(value.state_revision, 'state_revision'),
+    scope_head: {
+      scope_version: 1,
+      digest: digest(value.scope_head.digest, 'scope_head.digest'),
+    },
+    plan_head: planHead,
     progress_head: nullableHead(value.progress_head, 'progress_head', 'event_id', 'event_id'),
     change_head: nullableHead(value.change_head, 'change_head', 'change_request_id', 'change_request_id'),
+    change_heads: changeHeads,
     evidence_heads: evidenceHeads,
     record_digest: digest(value.record_digest, 'record_digest'),
   };
@@ -498,7 +701,7 @@ export function validateLockRecord(value) {
 
 export function validateChangeRequest(value) {
   exactKeys(value, 'change request', CHANGE_REQUEST_FIELDS);
-  if (value.schema_version !== 1) fail('INVALID_CONTRACT', 'input', 2, 'change request.schema_version must equal 1');
+  if (value.schema_version !== 2) fail('INVALID_CONTRACT', 'input', 2, 'change request.schema_version must equal 2');
   const id = identifier(value.id, 'change_request_id', 'change request.id');
   if (!['proposed', 'approved', 'rejected', 'superseded'].includes(value.status)) {
     fail('INVALID_CONTRACT', 'input', 2, 'change request.status is invalid');
@@ -534,8 +737,28 @@ export function validateChangeRequest(value) {
     }
     return { field, before: structuredClone(change.before), after: structuredClone(change.after) };
   });
+  exactKeys(value.criterion_impact, 'change request.criterion_impact', ['affected', 'unaffected']);
+  const affectedCriteria = uniqueIdentifiers(
+    value.criterion_impact.affected,
+    'change request.criterion_impact.affected',
+    'acceptance_criterion_id',
+  );
+  const unaffectedCriteria = uniqueIdentifiers(
+    value.criterion_impact.unaffected,
+    'change request.criterion_impact.unaffected',
+    'acceptance_criterion_id',
+  );
+  const affectedSet = new Set(affectedCriteria);
+  if (unaffectedCriteria.some((criterionId) => affectedSet.has(criterionId))) {
+    fail('INVALID_CONTRACT', 'input', 2, 'change request.criterion_impact arrays must be disjoint');
+  }
+  const candidateCriteria = candidateGoal.acceptance_criteria.map(({ id: criterionId }) => criterionId);
+  const partition = [...affectedCriteria, ...unaffectedCriteria];
+  if (partition.length !== candidateCriteria.length || candidateCriteria.some((criterionId) => !partition.includes(criterionId))) {
+    fail('INVALID_CONTRACT', 'input', 2, 'change request.criterion_impact must exhaust every candidate criterion');
+  }
   const normalized = {
-    schema_version: 1,
+    schema_version: 2,
     id,
     status: value.status,
     base_goal: baseGoal,
@@ -545,7 +768,7 @@ export function validateChangeRequest(value) {
     changes,
     rationale: requiredText(value.rationale, 'change request.rationale'),
     affected_tasks: uniqueIdentifiers(value.affected_tasks, 'change request.affected_tasks', 'task_id'),
-    affected_criteria: uniqueIdentifiers(value.affected_criteria, 'change request.affected_criteria', 'acceptance_criterion_id'),
+    criterion_impact: { affected: affectedCriteria, unaffected: unaffectedCriteria },
     risks: textArray(value.risks, 'change request.risks'),
     validation: textArray(value.validation, 'change request.validation'),
     rollback: textArray(value.rollback, 'change request.rollback'),

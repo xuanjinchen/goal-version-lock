@@ -10,6 +10,8 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import test from 'node:test';
 
 import { formatGoalLockHelp, parseGoalLockArgs, runGoalLockCli } from '../src/goal-lock/cli.js';
+import { validateEvidence, validatePlan } from '../src/goal-lock/contracts.js';
+import { schemaV2Evidence, schemaV2Plan } from './helpers/goal-lock-fixture.js';
 
 const SCRIPT_PATH = fileURLToPath(new URL('../scripts/goal-lock.js', import.meta.url));
 
@@ -143,7 +145,7 @@ test('help formatting can load without repository, transaction, or workspace run
 
 function goalDraft() {
   return {
-    schema_version: 1,
+    schema_version: 2,
     goal_id: 'GL-CLI',
     goal_version: 1,
     objective: 'Exercise the real goal-lock process lifecycle',
@@ -167,9 +169,17 @@ function planInput() {
       acceptance_criteria: ['AC-001'],
       dependencies: [],
       permitted_paths: ['delivery.txt'],
-      verification: 'Spawn the goal-lock CLI',
+      validations: [{
+        id: 'VAL-0001',
+        kind: 'focused',
+        method: { type: 'deterministic-test', target: 'goal-lock-cli-process' },
+        affected_paths: ['delivery.txt'],
+        criterion_ids: ['AC-001'],
+        risk_ids: [],
+      }],
       status: 'pending',
     }],
+    risks: [],
     deferred: [],
   };
 }
@@ -188,12 +198,19 @@ function evidenceInput() {
   return {
     kind: 'evidence',
     acceptance_criterion_id: 'AC-001',
+    validation_ref: {
+      goal_id: 'GL-CLI',
+      goal_version: 1,
+      goal_digest: '9157a4eea1293409f55852b47dfc7b734552e7068828542b78cd55a0a08decfb',
+      plan_revision: 1,
+      validation_id: 'VAL-0001',
+    },
     task_id: 'TASK-0001',
-    method: 'node --test tests/goal-lock-cli.test.js',
     observed_result: 'The real process behaved as required',
     artifact_refs: ['delivery.txt'],
-    workspace_fingerprint: 'a'.repeat(64),
+    inventory: null,
     state: 'pass',
+    failure_paths: [],
     supersedes: null,
   };
 }
@@ -216,12 +233,21 @@ function changeProposalInput() {
     }],
     rationale: 'Validate the change command surface',
     affected_tasks: [],
-    affected_criteria: [],
+    criterion_impact: { affected: [], unaffected: ['AC-001'] },
     risks: ['The CLI mapping could be incomplete'],
     validation: ['Spawn the real process'],
     rollback: ['Reject the proposal'],
   };
 }
+
+test('schema v2 CLI contract fixtures use validation references without v1 method authority', () => {
+  const plan = schemaV2Plan();
+  const evidence = schemaV2Evidence();
+
+  assert.equal(validatePlan(plan, plan.goal).schema_version, 2);
+  assert.equal(validateEvidence(evidence, plan.goal).validation_ref.validation_id, 'VAL-0001');
+  assert.equal(Object.hasOwn(evidence, 'method'), false);
+});
 
 async function createCliFixture(testContext) {
   const root = await mkdtemp(path.join(tmpdir(), 'goal-lock-cli-'));
@@ -360,13 +386,20 @@ test('real processes catch a v2-approval mutation that loses disk-resumed histor
     tasks: [
       {
         id: 'TASK-0001', outcome: 'Deliver changed work', acceptance_criteria: ['AC-001'],
-        dependencies: [], permitted_paths: ['delivery.txt'], verification: 'Run focused checks', status: 'pending',
+        dependencies: [], permitted_paths: ['delivery.txt'], validations: [{
+          id: 'VAL-0001', kind: 'focused', method: { type: 'deterministic-test', target: 'changed-work-focused' },
+          affected_paths: ['delivery.txt'], criterion_ids: ['AC-001'], risk_ids: [],
+        }], status: 'pending',
       },
       {
         id: 'TASK-0002', outcome: 'Deliver unaffected work', acceptance_criteria: ['AC-002'],
-        dependencies: [], permitted_paths: ['delivery.txt'], verification: 'Run focused checks', status: 'pending',
+        dependencies: [], permitted_paths: ['delivery.txt'], validations: [{
+          id: 'VAL-0002', kind: 'focused', method: { type: 'deterministic-test', target: 'unaffected-work-focused' },
+          affected_paths: ['delivery.txt'], criterion_ids: ['AC-002'], risk_ids: [],
+        }], status: 'pending',
       },
     ],
+    risks: [],
     deferred: [],
   };
   const versionTwoPlan = {
@@ -374,13 +407,20 @@ test('real processes catch a v2-approval mutation that loses disk-resumed histor
     tasks: [
       {
         id: 'TASK-0002', outcome: 'Deliver unaffected work', acceptance_criteria: ['AC-002'],
-        dependencies: [], permitted_paths: ['delivery.txt'], verification: 'Run focused checks', status: 'pending',
+        dependencies: [], permitted_paths: ['delivery.txt'], validations: [{
+          id: 'VAL-0003', kind: 'focused', method: { type: 'deterministic-test', target: 'unaffected-work-v2' },
+          affected_paths: ['delivery.txt'], criterion_ids: ['AC-002'], risk_ids: [],
+        }], status: 'pending',
       },
       {
         id: 'TASK-0003', outcome: 'Re-verify changed work', acceptance_criteria: ['AC-001'],
-        dependencies: [], permitted_paths: ['delivery.txt'], verification: 'Run focused checks', status: 'pending',
+        dependencies: [], permitted_paths: ['delivery.txt'], validations: [{
+          id: 'VAL-0004', kind: 'focused', method: { type: 'deterministic-test', target: 'changed-work-v2' },
+          affected_paths: ['delivery.txt'], criterion_ids: ['AC-001'], risk_ids: [],
+        }], status: 'pending',
       },
     ],
+    risks: [],
     deferred: [],
   };
   const initialized = parseSuccess(
@@ -400,9 +440,13 @@ test('real processes catch a v2-approval mutation that loses disk-resumed histor
     kind: 'progress', event_type: 'task-start', task_id: 'TASK-0001', summary: 'Started changed work', evidence_refs: [],
   }))), 'record');
   const firstEvidence = parseSuccess(await runProcess(root, ['record', '--input', '-'], Buffer.from(JSON.stringify({
-    kind: 'evidence', acceptance_criterion_id: 'AC-001', task_id: 'TASK-0001', method: 'node --test',
+    kind: 'evidence', acceptance_criterion_id: 'AC-001', task_id: 'TASK-0001',
+    validation_ref: {
+      goal_id: initialized.goal_id, goal_version: initialized.goal_version, goal_digest: initialized.goal_digest,
+      plan_revision: 2, validation_id: 'VAL-0001',
+    },
     observed_result: 'Version one changed work passed.', artifact_refs: ['delivery.txt'],
-    workspace_fingerprint: 'a'.repeat(64), state: 'pass', supersedes: null,
+    inventory: null, state: 'pass', failure_paths: [], supersedes: null,
   }))), 'record');
   assert.equal(firstEvidence.evidence_id, 'EVID-0001');
   parseSuccess(await runProcess(root, ['record', '--input', '-'], Buffer.from(JSON.stringify({
@@ -417,7 +461,8 @@ test('real processes catch a v2-approval mutation that loses disk-resumed histor
     },
     changes: [{ field: 'objective', before: draft.objective, after: 'Prove a disk-resumed version two lifecycle' }],
     rationale: 'Changed work requires a fresh version-bound verification.', affected_tasks: ['TASK-0001'],
-    affected_criteria: ['AC-001'], risks: ['Old evidence could be reused.'], validation: ['Run focused checks'], rollback: ['Reject the proposal'],
+    criterion_impact: { affected: ['AC-001'], unaffected: ['AC-002'] },
+    risks: ['Old evidence could be reused.'], validation: ['Run focused checks'], rollback: ['Reject the proposal'],
   }))), 'propose');
   parseFailure(await runProcess(root, ['approve', '--cr', proposal.change_request_id, '--approval', 'APPROVE']), 5, 'approve');
   parseSuccess(await runProcess(root, ['approve', '--cr', proposal.change_request_id, '--approval', proposal.approval_required]), 'approve');
@@ -452,9 +497,14 @@ test('real processes catch a v2-approval mutation that loses disk-resumed histor
       kind: 'progress', event_type: 'task-start', task_id: taskId, summary: `Started ${taskId}`, evidence_refs: [],
     }))), 'record');
     const evidence = parseSuccess(await runProcess(root, ['record', '--input', '-'], Buffer.from(JSON.stringify({
-      kind: 'evidence', acceptance_criterion_id: criterionId, task_id: taskId, method: 'node --test',
+      kind: 'evidence', acceptance_criterion_id: criterionId, task_id: taskId,
+      validation_ref: {
+        goal_id: versionTwoGoal.goal_id, goal_version: versionTwoGoal.goal_version,
+        goal_digest: proposal.candidate_digest, plan_revision: 1,
+        validation_id: taskId === 'TASK-0002' ? 'VAL-0003' : 'VAL-0004',
+      },
       observed_result: `Fresh ${criterionId} evidence passed.`, artifact_refs: ['delivery.txt'],
-      workspace_fingerprint: 'b'.repeat(64), state: 'pass', supersedes,
+      inventory: null, state: 'pass', failure_paths: [], supersedes,
     }))), 'record');
     parseSuccess(await runProcess(root, ['record', '--input', '-'], Buffer.from(JSON.stringify({
       kind: 'progress', event_type: 'task-complete', task_id: taskId, summary: `Completed ${taskId}`, evidence_refs: [evidence.evidence_id],

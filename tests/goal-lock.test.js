@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { chmod, link, lstat, mkdir, readFile, readdir, rename, rm, symlink, unlink, writeFile } from 'node:fs/promises';
@@ -17,7 +17,12 @@ import {
   validateLockRecord,
 } from '../src/goal-lock/contracts.js';
 import { commitGoalFiles, recoverGoalLock, withGoalLock } from '../src/goal-lock/transaction.js';
-import { createGoalLockFixture } from './helpers/goal-lock-fixture.js';
+import {
+  activeGoalReference,
+  createGoalLockFixture,
+  schemaV2Evidence,
+  schemaV2Plan,
+} from './helpers/goal-lock-fixture.js';
 
 async function goalRepository() {
   return import('../src/goal-lock/repository.js');
@@ -33,6 +38,7 @@ function independentSha256(bytes) {
 
 async function installVersionTwo(fixture, changeId = 'CR-0001') {
   const directory = join(fixture.root, '.goal-lock');
+  const priorLock = parseCanonicalJson(await readFile(join(directory, 'lock.json')), 'prior test lock');
   const previousBytes = canonicalBytes(goalV1());
   const goal = {
     ...goalV1(),
@@ -51,7 +57,7 @@ async function installVersionTwo(fixture, changeId = 'CR-0001') {
   await mkdir(join(directory, 'changes'), { recursive: true });
   await writeFile(join(directory, 'changes', `${changeId}.json`), changeBytes);
   const lockWithoutDigest = {
-    schema_version: 1,
+    schema_version: 2,
     goal_id: 'GL-ALPHA',
     goal_version: 2,
     goal_digest: digest,
@@ -60,8 +66,11 @@ async function installVersionTwo(fixture, changeId = 'CR-0001') {
     approved_at: '2026-08-23T01:00:00.000Z',
     predecessor_digest: independentSha256(previousBytes),
     state_revision: 2,
+    scope_head: priorLock.scope_head,
+    plan_head: null,
     progress_head: null,
     change_head: { change_request_id: changeId, digest: independentSha256(changeBytes) },
+    change_heads: { [changeId]: independentSha256(changeBytes) },
     evidence_heads: {},
   };
   await writeFile(join(directory, 'lock.json'), canonicalBytes({
@@ -110,12 +119,13 @@ async function installVersionThree(fixture, firstChangeStatus) {
     recordedAt: '2026-08-23T02:00:00.000Z',
   });
   const secondChangeBytes = canonicalBytes(secondChange);
+  const priorLock = parseCanonicalJson(await readFile(join(directory, 'lock.json')), 'prior test lock');
   await writeFile(join(directory, 'current.json'), bytes);
   await writeFile(join(directory, 'history', 'goals', 'v0003.json'), bytes);
   await writeFile(firstChangePath, firstChangeBytes);
   await writeFile(join(directory, 'changes', 'CR-0002.json'), secondChangeBytes);
   const lockWithoutDigest = {
-    schema_version: 1,
+    schema_version: 2,
     goal_id: goal.goal_id,
     goal_version: 3,
     goal_digest: digest,
@@ -124,8 +134,14 @@ async function installVersionThree(fixture, firstChangeStatus) {
     approved_at: '2026-08-23T02:00:00.000Z',
     predecessor_digest: versionTwo.digest,
     state_revision: 3,
+    scope_head: priorLock.scope_head,
+    plan_head: null,
     progress_head: null,
     change_head: { change_request_id: 'CR-0002', digest: independentSha256(secondChangeBytes) },
+    change_heads: {
+      'CR-0001': independentSha256(firstChangeBytes),
+      'CR-0002': independentSha256(secondChangeBytes),
+    },
     evidence_heads: {},
   };
   await writeFile(join(directory, 'lock.json'), canonicalBytes({
@@ -135,28 +151,21 @@ async function installVersionThree(fixture, firstChangeStatus) {
   return { goal, bytes, digest };
 }
 
-function activeGoalReference() {
-  return {
-    goal_id: 'GL-ALPHA',
-    goal_version: 1,
-    goal_digest: '92d74f6bf766e096e71b949ff57e2d9a12302a4519226d05cf67c2b544babaa6',
-  };
-}
-
 function structuralPlan() {
   return {
-    schema_version: 1,
+    schema_version: 2,
     goal: activeGoalReference(),
     plan_revision: 1,
     next_task_id: null,
     tasks: [],
+    risks: [],
     deferred: [],
   };
 }
 
 function completePlan(revision = 1) {
   return {
-    schema_version: 1,
+    schema_version: 2,
     goal: activeGoalReference(),
     plan_revision: revision,
     next_task_id: 'TASK-0001',
@@ -167,7 +176,14 @@ function completePlan(revision = 1) {
         acceptance_criteria: ['AC-001'],
         dependencies: [],
         permitted_paths: ['src/goal-lock/repository.js'],
-        verification: 'Run the focused goal-lock tests',
+        validations: [{
+          id: 'VAL-0001',
+          kind: 'focused',
+          method: { type: 'deterministic-test', target: 'goal-lock-focused-tests' },
+          affected_paths: ['src/goal-lock/repository.js'],
+          criterion_ids: ['AC-001'],
+          risk_ids: [],
+        }],
         status: 'pending',
       },
       {
@@ -176,10 +192,18 @@ function completePlan(revision = 1) {
         acceptance_criteria: ['AC-001'],
         dependencies: ['TASK-0001'],
         permitted_paths: ['tests/goal-lock.test.js'],
-        verification: 'Run the complete goal-lock test file',
+        validations: [{
+          id: 'VAL-0002',
+          kind: 'affected-regression',
+          method: { type: 'deterministic-test', target: 'goal-lock-regression-tests' },
+          affected_paths: ['tests/goal-lock.test.js'],
+          criterion_ids: ['AC-001'],
+          risk_ids: [],
+        }],
         status: 'pending',
       },
     ],
+    risks: [],
     deferred: [{ id: 'TASK-0003', reason: 'Not scheduled in this revision' }],
   };
 }
@@ -194,6 +218,64 @@ test('plan public API exports validatePlan with the fixed goal-reference signatu
   assert.deepEqual(goalContracts.validatePlan(completePlan(), activeGoalReference()), completePlan());
 });
 
+test('schema v2 canonical plan fixture is the only accepted plan schema', () => {
+  const plan = schemaV2Plan();
+
+  assert.equal(goalContracts.validatePlan(plan, plan.goal).schema_version, 2);
+  assert.throws(
+    () => goalContracts.validatePlan({ ...plan, schema_version: 1 }, plan.goal),
+    /schema_version must equal 2/,
+  );
+  assert.throws(
+    () => goalContracts.validatePlan({
+      ...plan,
+      tasks: [{ ...plan.tasks[0], verification: 'node --test' }],
+    }, plan.goal),
+    /exact fields|validations/,
+  );
+});
+
+test('schema v2 public reference, scope baseline, goal, and progress contracts are immutable', () => {
+  const goalReference = activeGoalReference();
+  const validationRef = {
+    ...goalReference,
+    plan_revision: 1,
+    validation_id: 'VAL-0001',
+  };
+  assert.deepEqual(goalContracts.validateValidationRef(validationRef), validationRef);
+  assert.equal(Object.isFrozen(goalContracts.validateValidationRef(validationRef)), true);
+
+  const scopeWithoutDigest = {
+    schema_version: 2,
+    scope_version: 1,
+    goal: goalReference,
+    mode: 'git',
+    entries: [{
+      path: 'src/goal-lock/contracts.js',
+      source: 'tracked',
+      mode: '100644',
+      size: 1,
+      digest: '1'.repeat(64),
+      index_mode: '100644',
+      index_digest: '2'.repeat(64),
+    }],
+    recorded_at: '2026-08-23T00:00:00.000Z',
+  };
+  const scope = {
+    ...scopeWithoutDigest,
+    record_digest: independentSha256(canonicalBytes(scopeWithoutDigest)),
+  };
+  const validatedScope = goalContracts.validateScopeBaseline(scope, goalReference);
+  assert.deepEqual(validatedScope, scope);
+  assert.equal(Object.isFrozen(validatedScope.entries[0]), true);
+
+  assert.equal(validateGoalContract(goalV1()).schema_version, 2);
+  const progress = structuralProgressEvent();
+  const { event_digest: _placeholder, ...progressPayload } = progress;
+  progress.event_digest = independentSha256(canonicalBytes(progressPayload));
+  assert.equal(goalContracts.validateProgressEvent(progress, null).schema_version, 2);
+});
+
 test('plan contract accepts a complete goal-bound plan without mutating input', () => {
   const input = completePlan();
 
@@ -205,13 +287,24 @@ test('plan contract accepts a complete goal-bound plan without mutating input', 
   assert.equal(input.tasks[0].status, 'pending');
 });
 
+test('goal and plan contracts reject vacuous completion inputs before repository mutation', () => {
+  const goal = goalV1();
+  goal.acceptance_criteria = [];
+  assert.throws(() => validateGoalContract(goal), /acceptance_criteria.*non-empty/i);
+
+  assert.throws(
+    () => goalContracts.validatePlan(structuralPlan(), activeGoalReference()),
+    /tasks.*non-empty/i,
+  );
+});
+
 test('plan contract requires its exact goal reference, revision, and root fields', () => {
   const cases = [
     ['goal.goal_id', (plan) => { plan.goal.goal_id = 'GL-OTHER'; }],
     ['goal.goal_version', (plan) => { plan.goal.goal_version = 2; }],
     ['goal.goal_digest', (plan) => { plan.goal.goal_digest = 'f'.repeat(64); }],
     ['plan_revision', (plan) => { plan.plan_revision = 0; }],
-    ['schema_version', (plan) => { plan.schema_version = 2; }],
+    ['schema_version', (plan) => { plan.schema_version = 1; }],
     ['unknown', (plan) => { plan.unexpected = true; }],
   ];
 
@@ -231,19 +324,63 @@ test('plan contract enforces unique stable task references and criterion coverag
     ['dependency exists', (plan) => { plan.tasks[1].dependencies = ['TASK-9999']; }],
     ['dependency cycle', (plan) => { plan.tasks[0].dependencies = ['TASK-0002']; }],
     ['deferred reason', (plan) => { plan.deferred[0].reason = ' '; }],
+    ['duplicate validation', (plan) => { plan.tasks[1].validations[0].id = 'VAL-0001'; }],
+    ['validation trace', (plan) => {
+      plan.tasks[0].validations[0].criterion_ids = [];
+      plan.tasks[0].validations[0].risk_ids = [];
+    }],
   ];
 
   for (const [label, mutate] of cases) {
     const input = completePlan();
     mutate(input);
-    assert.throws(() => validateCompletePlan(input), /task|acceptance|depend|cycle|deferred|reason/i, label);
+    assert.throws(() => validateCompletePlan(input), /task|acceptance|depend|cycle|deferred|reason|validation/i, label);
   }
 });
 
-test('plan contract enforces normalized paths, verification text, statuses, and one executable next task', () => {
+test('plan contract closes validation and risk schema enums without broad path aliases', () => {
+  const cases = [
+    ['validation kind', (plan) => { plan.tasks[0].validations[0].kind = 'full'; }],
+    ['method type', (plan) => { plan.tasks[0].validations[0].method.type = 'shell'; }],
+    ['workspace token on focused validation', (plan) => {
+      plan.tasks[0].validations[0].affected_paths = ['@governed-workspace'];
+    }],
+    ['workspace token mixed with path', (plan) => {
+      plan.tasks[0].validations[0].kind = 'mandatory-gate';
+      plan.tasks[0].validations[0].affected_paths = ['@governed-workspace', 'src/goal-lock/repository.js'];
+    }],
+    ['risk source kind', (plan) => {
+      plan.risks = [{
+        id: 'RISK-0001',
+        statement: 'A bounded failure can recur',
+        source: { kind: 'unknown', criterion_id: 'AC-001' },
+        affected_paths: ['src/goal-lock/repository.js'],
+      }];
+    }],
+  ];
+
+  for (const [label, mutate] of cases) {
+    const input = completePlan();
+    mutate(input);
+    assert.throws(() => validateCompletePlan(input), /validation|method|affected_paths|workspace|risk|source/i, label);
+  }
+
+  const mandatoryGate = completePlan();
+  mandatoryGate.tasks[0].validations[0] = {
+    id: 'VAL-0001',
+    kind: 'mandatory-gate',
+    method: { type: 'delivery-gate', target: 'goal-lock-delivery-gate' },
+    affected_paths: ['@governed-workspace'],
+    criterion_ids: ['AC-001'],
+    risk_ids: [],
+  };
+  assert.equal(validateCompletePlan(mandatoryGate).tasks[0].validations[0].kind, 'mandatory-gate');
+});
+
+test('plan contract enforces normalized paths, validation methods, statuses, and one executable next task', () => {
   const cases = [
     ['normalized path', (plan) => { plan.tasks[0].permitted_paths = ['src\\goal-lock\\repository.js']; }],
-    ['verification text', (plan) => { plan.tasks[0].verification = ''; }],
+    ['validation target', (plan) => { plan.tasks[0].validations[0].method.target = ''; }],
     ['status enum', (plan) => { plan.tasks[0].status = 'started'; }],
     ['next task exists', (plan) => { plan.next_task_id = 'TASK-9999'; }],
     ['next task is executable', (plan) => { plan.tasks[0].status = 'complete'; }],
@@ -253,7 +390,7 @@ test('plan contract enforces normalized paths, verification text, statuses, and 
   for (const [label, mutate] of cases) {
     const input = completePlan();
     mutate(input);
-    assert.throws(() => validateCompletePlan(input), /path|verification|status|next_task_id|executable/i, label);
+    assert.throws(() => validateCompletePlan(input), /path|validation|target|status|next_task_id|executable/i, label);
   }
 
   const noExecutableTask = completePlan();
@@ -282,6 +419,7 @@ function planCandidate(outcome = 'Implement the locked state transition') {
   return {
     next_task_id: plan.next_task_id,
     tasks: plan.tasks,
+    risks: plan.risks,
     deferred: plan.deferred,
   };
 }
@@ -312,7 +450,7 @@ function changeProposalInput(overrides = {}) {
     ],
     rationale: 'Strengthen the accepted safety outcome',
     affected_tasks: ['TASK-0001'],
-    affected_criteria: ['AC-001'],
+    criterion_impact: { affected: ['AC-001'], unaffected: [] },
     risks: ['Existing implementation may need revision'],
     validation: ['Run the complete goal-lock test file'],
     rollback: ['Reject the proposal and keep version one'],
@@ -320,18 +458,18 @@ function changeProposalInput(overrides = {}) {
   };
 }
 
-const CHANGE_CANDIDATE_DIGEST = 'e2757e366e6229d0b8be1698a457ed61788bb11534da8671447c5eb78bd2db79';
-const CHANGE_PROPOSAL_DIGEST = '3cbab5b6bf74c7b173fef5e628f946f295e209d3e62fbc3954b52339b981ee88';
-const CHANGE_RECORD_DIGEST = '9c71174dc8aeb3cedb2577670d386bdfa18949c65fe4e6820c784b7884342660';
+const CHANGE_CANDIDATE_DIGEST = 'a7e98e50b3ba9f3972097dcb238601f6b288e0f2fe7544356e351b2bff940353';
+const CHANGE_PROPOSAL_DIGEST = '9da5916506b1ae9a80aede717b95b3127c7408513892f249571281a558a61925';
+const CHANGE_RECORD_DIGEST = 'b783aa96bbb96e8b8f03b8f026b70aa1c6533be53e061be362fce49effc60481';
 
 function expectedChangeRequest(overrides = {}) {
   return {
-    schema_version: 1,
+    schema_version: 2,
     id: 'CR-0001',
     status: 'proposed',
     base_goal: activeGoalReference(),
     candidate_goal: {
-      schema_version: 1,
+      schema_version: 2,
       goal_id: 'GL-ALPHA',
       goal_version: 2,
       ...changeCandidate(),
@@ -343,11 +481,11 @@ function expectedChangeRequest(overrides = {}) {
     changes: changeProposalInput().changes,
     rationale: 'Strengthen the accepted safety outcome',
     affected_tasks: ['TASK-0001'],
-    affected_criteria: ['AC-001'],
+    criterion_impact: { affected: ['AC-001'], unaffected: [] },
     risks: ['Existing implementation may need revision'],
     validation: ['Run the complete goal-lock test file'],
     rollback: ['Reject the proposal and keep version one'],
-    approval_phrase: 'APPROVE CR-0001 GOAL VERSION 2 3cbab5b6bf74',
+    approval_phrase: 'APPROVE CR-0001 GOAL VERSION 2 9da5916506b1',
     recorded_at: '2026-08-23T00:00:00.000Z',
     ...overrides,
   };
@@ -357,7 +495,7 @@ async function createChangeProposalFixture(testContext) {
   const fixture = createGoalLockFixture(testContext);
   const repository = await goalRepository();
   await repository.initializeGoal(fixture.root, goalV1(), fixture);
-  await repository.lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 92d74f6bf766', fixture);
+  await repository.lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 87f66f9c59ab', fixture);
   await repository.revisePlan(fixture.root, planCandidate(), 'aligned', fixture);
   return { fixture, repository };
 }
@@ -377,7 +515,7 @@ test('change proposal derives one exact canonical request and advances only the 
     candidate_goal_version: 2,
     candidate_digest: CHANGE_CANDIDATE_DIGEST,
     proposal_digest: CHANGE_PROPOSAL_DIGEST,
-    approval_required: 'APPROVE CR-0001 GOAL VERSION 2 3cbab5b6bf74',
+    approval_required: 'APPROVE CR-0001 GOAL VERSION 2 9da5916506b1',
   });
   const changeBytes = await readFile(join(directory, 'changes', 'CR-0001.json'));
   assert.deepEqual(changeBytes, canonicalBytes(expectedChangeRequest()));
@@ -440,7 +578,7 @@ test('change proposal requires existing affected task and criterion identifiers'
   const { fixture, repository } = await createChangeProposalFixture(testContext);
   for (const [label, overrides] of [
     ['task', { affected_tasks: ['TASK-9999'] }],
-    ['criterion', { affected_criteria: ['AC-999'] }],
+    ['criterion', { criterion_impact: { affected: ['AC-999'], unaffected: [] } }],
     ['unsafe task', { affected_tasks: ['../TASK-0001'] }],
   ]) {
     await assert.rejects(
@@ -616,7 +754,7 @@ test('rejects change when the proposed request is not the terminal lock head', a
   const fixture = createGoalLockFixture(testContext);
   const repository = await goalRepository();
   await repository.initializeGoal(fixture.root, goalV1(), fixture);
-  await repository.lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 92d74f6bf766', fixture);
+  await repository.lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 87f66f9c59ab', fixture);
   const before = await installNonHeadProposedChangeState(fixture);
   const lockBefore = await readFile(join(fixture.root, '.goal-lock', 'lock.json'));
 
@@ -681,7 +819,7 @@ test('change verification fails closed for malformed identity, digest, base, can
       refreshTestChange(change);
     }],
     ['unknown affected criterion', (change) => {
-      change.affected_criteria = ['AC-999'];
+      change.criterion_impact = { affected: ['AC-999'], unaffected: [] };
       refreshTestChange(change);
     }],
   ];
@@ -716,12 +854,50 @@ test('change verification rejects a proposed request that is not the terminal lo
   const fixture = createGoalLockFixture(testContext);
   const repository = await goalRepository();
   await repository.initializeGoal(fixture.root, goalV1(), fixture);
-  await repository.lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 92d74f6bf766', fixture);
+  await repository.lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 87f66f9c59ab', fixture);
   await installNonHeadProposedChangeState(fixture);
 
   const verification = await repository.verifyGoalRepository(fixture.root, fixture);
 
   assert.equal(verification.state, 'TAMPERED');
+});
+
+test('plan authority rejects direct current and archived semantic rewrites plus post-audit permitted-path drift', async (testContext) => {
+  const current = await createPlannedFixture(testContext);
+  await rewriteTestPlan(current.fixture, (plan) => { plan.tasks[0].outcome = 'Directly rewritten outcome'; });
+  assert.equal((await current.repository.verifyGoalRepository(current.fixture.root, current.fixture)).state, 'TAMPERED');
+
+  const archived = await createPlannedFixture(testContext);
+  await archived.repository.revisePlan(
+    archived.fixture.root,
+    planCandidate('Second accepted plan revision'),
+    'implementation-choice',
+    archived.fixture,
+  );
+  const archivedPath = join(archived.fixture.root, '.goal-lock', 'history', 'plans', 'v0001-r0001.json');
+  const archivedPlan = parseCanonicalJson(await readFile(archivedPath), 'archived plan');
+  archivedPlan.tasks[0].permitted_paths = ['src/direct-tamper.js'];
+  await writeFile(archivedPath, canonicalBytes(archivedPlan));
+  assert.equal((await archived.repository.verifyGoalRepository(archived.fixture.root, archived.fixture)).state, 'TAMPERED');
+
+  const audited = await createCompletionFixture(testContext);
+  await rewriteTestPlan(audited.fixture, (plan) => { plan.tasks[0].permitted_paths = ['src/post-audit-tamper.js']; });
+  assert.equal((await audited.repository.gateGoalCompletion(audited.fixture.root, audited.inventory, audited.fixture)).state, 'BLOCKED');
+});
+
+test('change authority rejects a rewritten nonterminal request after a later CR becomes the head', async (testContext) => {
+  const { fixture, repository } = await createChangeProposalFixture(testContext);
+  const first = await repository.proposeGoalChange(fixture.root, changeProposalInput(), fixture);
+  await repository.rejectGoalChange(fixture.root, 'CR-0001', 'Keep version one', fixture);
+  await repository.proposeGoalChange(fixture.root, changeProposalInput({ rationale: 'Second proposal' }), fixture);
+  const firstPath = join(fixture.root, '.goal-lock', 'changes', 'CR-0001.json');
+  const firstRecord = parseCanonicalJson(await readFile(firstPath), 'first change');
+  firstRecord.rationale = 'Rewritten historical rationale';
+  refreshTestChange(firstRecord);
+  await writeFile(firstPath, canonicalBytes(firstRecord));
+
+  assert.match(first.approval_required, /^APPROVE CR-0001/u);
+  assert.equal((await repository.verifyGoalRepository(fixture.root, fixture)).state, 'TAMPERED');
 });
 
 async function proposeChangeForApproval(testContext, overrides = {}, withEvidence = false) {
@@ -753,11 +929,11 @@ async function goalLockByteSnapshot(directory, relative = '') {
 test('exact change approval rejects generic, inexact, stale, competing, and tampered proposals', async (testContext) => {
   for (const approval of [
     'APPROVE',
-    'APPROVE CR-0002 GOAL VERSION 2 3cbab5b6bf74',
-    'APPROVE CR-0001 GOAL VERSION 3 3cbab5b6bf74',
+    'APPROVE CR-0002 GOAL VERSION 2 9da5916506b1',
+    'APPROVE CR-0001 GOAL VERSION 3 9da5916506b1',
     'APPROVE CR-0001 GOAL VERSION 2 ffffffffffff',
-    'approve cr-0001 goal version 2 3cbab5b6bf74',
-    ' APPROVE CR-0001 GOAL VERSION 2 3cbab5b6bf74',
+    'approve cr-0001 goal version 2 9da5916506b1',
+    ' APPROVE CR-0001 GOAL VERSION 2 9da5916506b1',
   ]) {
     const { fixture, repository } = await proposeChangeForApproval(testContext);
     await assert.rejects(
@@ -808,10 +984,10 @@ test('exact change approval rejects generic, inexact, stale, competing, and tamp
   const competing = createGoalLockFixture(testContext);
   const competingRepository = await goalRepository();
   await competingRepository.initializeGoal(competing.root, goalV1(), competing);
-  await competingRepository.lockInitialGoal(competing.root, 'APPROVE GOAL GL-ALPHA VERSION 1 92d74f6bf766', competing);
+  await competingRepository.lockInitialGoal(competing.root, 'APPROVE GOAL GL-ALPHA VERSION 1 87f66f9c59ab', competing);
   await installNonHeadProposedChangeState(competing);
   await assert.rejects(
-    competingRepository.approveGoalChange(competing.root, 'CR-0001', 'APPROVE CR-0001 GOAL VERSION 2 3cbab5b6bf74', competing),
+    competingRepository.approveGoalChange(competing.root, 'CR-0001', 'APPROVE CR-0001 GOAL VERSION 2 9da5916506b1', competing),
     (error) => error instanceof GoalLockError && error.kind === 'integrity',
   );
 
@@ -880,7 +1056,7 @@ test('selective invalidation retains unaffected task status across the new goal 
   }), fixture);
   const receipt = await repository.proposeGoalChange(fixture.root, changeProposalInput({
     affected_tasks: [],
-    affected_criteria: [],
+    criterion_impact: { affected: [], unaffected: ['AC-001'] },
   }), fixture);
 
   await repository.approveGoalChange(fixture.root, 'CR-0001', receipt.approval_required, fixture);
@@ -891,7 +1067,7 @@ test('selective invalidation retains unaffected task status across the new goal 
   assert.equal((await repository.verifyGoalRepository(fixture.root, fixture)).state, 'LOCKED');
 });
 
-test('selective invalidation preserves unaffected plan and evidence state and creates an empty revision without a prior plan', async (testContext) => {
+test('selective invalidation preserves unaffected state through derivation and rejects a goal change without a plan', async (testContext) => {
   for (const [label, affectedTasks, affectedCriteria, expectTaskStale, expectEvidenceStale] of [
     ['none', [], [], false, false],
     ['task only', ['TASK-0001'], [], true, false],
@@ -900,29 +1076,80 @@ test('selective invalidation preserves unaffected plan and evidence state and cr
   ]) {
     const { fixture, repository, receipt } = await proposeChangeForApproval(testContext, {
       affected_tasks: affectedTasks,
-      affected_criteria: affectedCriteria,
+      criterion_impact: {
+        affected: affectedCriteria,
+        unaffected: affectedCriteria.length === 0 ? ['AC-001'] : [],
+      },
     }, true);
     await repository.approveGoalChange(fixture.root, 'CR-0001', receipt.approval_required, fixture);
     const directory = join(fixture.root, '.goal-lock');
     const plan = parseCanonicalJson(await readFile(join(directory, 'plan.json')), `${label} plan`);
     assert.equal(plan.tasks.find((task) => task.id === 'TASK-0001').status, expectTaskStale ? 'stale' : 'pending', label);
-    assert.equal(existsSync(join(directory, 'evidence', 'AC-001', 'EVID-0002.json')), expectEvidenceStale, label);
+    const derived = parseCanonicalJson(
+      await readFile(join(directory, 'evidence', 'AC-001', 'EVID-0002.json')),
+      `${label} derived evidence`,
+    );
+    assert.equal(derived.state, expectEvidenceStale ? 'stale' : 'pass', label);
+    assert.equal(derived.derivation.kind, expectEvidenceStale ? 'invalidation' : 'carry-forward', label);
     assert.equal((await repository.verifyGoalRepository(fixture.root, fixture)).state, 'LOCKED', label);
   }
 
   const fixture = createGoalLockFixture(testContext);
   const repository = await goalRepository();
   await repository.initializeGoal(fixture.root, goalV1(), fixture);
-  await repository.lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 92d74f6bf766', fixture);
+  await repository.lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 87f66f9c59ab', fixture);
   const receipt = await repository.proposeGoalChange(fixture.root, changeProposalInput({
     affected_tasks: [],
-    affected_criteria: [],
+    criterion_impact: { affected: [], unaffected: ['AC-001'] },
   }), fixture);
+  await assert.rejects(
+    repository.approveGoalChange(fixture.root, 'CR-0001', receipt.approval_required, fixture),
+    /tasks.*non-empty/i,
+  );
+  assert.equal((await repository.verifyGoalRepository(fixture.root, fixture)).state, 'CHANGE_PENDING');
+});
+
+test('goal change derives current carry-forward evidence for unaffected criteria and stales affected criteria only', async (testContext) => {
+  const { fixture, repository } = await createTwoCriterionFixture(testContext);
+  await repository.recordGoalEvent(fixture.root, evidenceInput(), fixture);
+  await repository.recordGoalEvent(fixture.root, evidenceInput({
+    acceptance_criterion_id: 'AC-002',
+    task_id: 'TASK-0002',
+  }), fixture);
+  const candidate = goalV1();
+  candidate.acceptance_criteria.push({
+    id: 'AC-002',
+    outcome: 'Independent verification is retained',
+    verification: 'Inspect the second evidence chain',
+  });
+  candidate.objective = 'Ship a safely evolved lock';
+  const receipt = await repository.proposeGoalChange(fixture.root, changeProposalInput({
+    candidate: {
+      objective: candidate.objective,
+      scope: candidate.scope,
+      non_goals: candidate.non_goals,
+      constraints: candidate.constraints,
+      acceptance_criteria: candidate.acceptance_criteria,
+      authorization_boundary: candidate.authorization_boundary,
+      assumptions: candidate.assumptions,
+    },
+    changes: [{ field: 'objective', before: goalV1().objective, after: candidate.objective }],
+    affected_tasks: ['TASK-0001'],
+    criterion_impact: { affected: ['AC-001'], unaffected: ['AC-002'] },
+  }), fixture);
+
   await repository.approveGoalChange(fixture.root, 'CR-0001', receipt.approval_required, fixture);
-  const plan = parseCanonicalJson(await readFile(join(fixture.root, '.goal-lock', 'plan.json')), 'empty v2 plan');
-  assert.equal(plan.goal.goal_version, 2);
-  assert.equal(plan.plan_revision, 1);
-  assert.deepEqual(plan.tasks, []);
+
+  const evidenceRoot = join(fixture.root, '.goal-lock', 'evidence');
+  const affected = parseCanonicalJson(await readFile(join(evidenceRoot, 'AC-001', 'EVID-0002.json')), 'affected derivation');
+  const unaffected = parseCanonicalJson(await readFile(join(evidenceRoot, 'AC-002', 'EVID-0002.json')), 'unaffected derivation');
+  assert.equal(affected.state, 'stale');
+  assert.equal(affected.goal.goal_version, 2);
+  assert.equal(affected.derivation.kind, 'invalidation');
+  assert.equal(unaffected.state, 'pass');
+  assert.equal(unaffected.goal.goal_version, 2);
+  assert.equal(unaffected.supersedes, 'EVID-0001');
+  assert.equal(unaffected.derivation.kind, 'carry-forward');
   assert.equal((await repository.verifyGoalRepository(fixture.root, fixture)).state, 'LOCKED');
 });
 
@@ -957,14 +1184,14 @@ test('exact change approval rolls back the full repository at every actual insta
   }
 });
 
-const PLAN_REVISION_EVENT_DIGEST = 'bdda7b3968a011b2229bb86936f21a2d51e9a070a992dcd573c91c4bb61e4b72';
-const SECOND_PLAN_REVISION_EVENT_DIGEST = '9bcd19d7bb31cbac67b8de8749da59f6e8fb5617c4f87c6fa5574e77ce43bea1';
-const FOCUSED_RESULT_EVENT_DIGEST = 'a0e6791495980eb553a5802b0baf094c3f5ab84f52f78c6028b6762e46963093';
-const FULL_RESULT_EVENT_DIGEST = 'acf5a53569b61201d417c4463bf21149df52078ec809a94a0c33a5f679c9f142';
-const PLAN_REVISION_EVENT_LINE = '{"event_digest":"bdda7b3968a011b2229bb86936f21a2d51e9a070a992dcd573c91c4bb61e4b72","event_id":"EVT-000001","event_type":"plan-revision","evidence_refs":[],"goal":{"goal_digest":"92d74f6bf766e096e71b949ff57e2d9a12302a4519226d05cf67c2b544babaa6","goal_id":"GL-ALPHA","goal_version":1},"plan_revision":1,"previous_event_digest":null,"recorded_at":"2026-08-23T00:00:00.000Z","schema_version":1,"summary":"Recorded plan revision 1","task_id":null}\n';
-const SECOND_PLAN_REVISION_EVENT_LINE = '{"event_digest":"9bcd19d7bb31cbac67b8de8749da59f6e8fb5617c4f87c6fa5574e77ce43bea1","event_id":"EVT-000002","event_type":"plan-revision","evidence_refs":[],"goal":{"goal_digest":"92d74f6bf766e096e71b949ff57e2d9a12302a4519226d05cf67c2b544babaa6","goal_id":"GL-ALPHA","goal_version":1},"plan_revision":2,"previous_event_digest":"bdda7b3968a011b2229bb86936f21a2d51e9a070a992dcd573c91c4bb61e4b72","recorded_at":"2026-08-23T00:00:00.000Z","schema_version":1,"summary":"Recorded plan revision 2","task_id":null}\n';
-const FOCUSED_RESULT_EVENT_LINE = '{"event_digest":"a0e6791495980eb553a5802b0baf094c3f5ab84f52f78c6028b6762e46963093","event_id":"EVT-000002","event_type":"verification-result","evidence_refs":[],"goal":{"goal_digest":"92d74f6bf766e096e71b949ff57e2d9a12302a4519226d05cf67c2b544babaa6","goal_id":"GL-ALPHA","goal_version":1},"plan_revision":1,"previous_event_digest":"bdda7b3968a011b2229bb86936f21a2d51e9a070a992dcd573c91c4bb61e4b72","recorded_at":"2026-08-23T00:00:00.000Z","schema_version":1,"summary":"Focused tests passed","task_id":"TASK-0001"}\n';
-const FULL_RESULT_EVENT_LINE = '{"event_digest":"acf5a53569b61201d417c4463bf21149df52078ec809a94a0c33a5f679c9f142","event_id":"EVT-000003","event_type":"verification-result","evidence_refs":[],"goal":{"goal_digest":"92d74f6bf766e096e71b949ff57e2d9a12302a4519226d05cf67c2b544babaa6","goal_id":"GL-ALPHA","goal_version":1},"plan_revision":1,"previous_event_digest":"a0e6791495980eb553a5802b0baf094c3f5ab84f52f78c6028b6762e46963093","recorded_at":"2026-08-23T00:00:00.000Z","schema_version":1,"summary":"Full tests passed","task_id":"TASK-0001"}\n';
+const PLAN_REVISION_EVENT_DIGEST = '2937d1b8956d793ce2c6f38d260240bcb54ae4022304bbbc63aa5ba9b44b60f4';
+const SECOND_PLAN_REVISION_EVENT_DIGEST = 'e505a9fcb49930828389e5ff024e139565740ebafeb3e74585be3f2d16c8968c';
+const FOCUSED_RESULT_EVENT_DIGEST = 'b0effa1798d978d0633c726dee987b66821c4c7fe3fa0efedc7ec5b1b8dd9d84';
+const FULL_RESULT_EVENT_DIGEST = '791fd466cafb01aabd2c42de93c2cfffb6a5ee9a0b6abce2f21e8011e7ab157f';
+const PLAN_REVISION_EVENT_LINE = "{\"event_digest\":\"2937d1b8956d793ce2c6f38d260240bcb54ae4022304bbbc63aa5ba9b44b60f4\",\"event_id\":\"EVT-000001\",\"event_type\":\"plan-revision\",\"evidence_refs\":[],\"goal\":{\"goal_digest\":\"87f66f9c59ab5aa925a4844c2883ed5008ef1563a6046be74a28b4ed7c250219\",\"goal_id\":\"GL-ALPHA\",\"goal_version\":1},\"plan_revision\":1,\"previous_event_digest\":null,\"recorded_at\":\"2026-08-23T00:00:00.000Z\",\"schema_version\":2,\"summary\":\"Recorded plan v0001/r0001 sha256:949537569524a4746884b9e7185e5f99b0c64ff6df9702a3957c769d2f0ec0f9 previous:none\",\"task_id\":null}\\n";
+const SECOND_PLAN_REVISION_EVENT_LINE = "{\"event_digest\":\"e505a9fcb49930828389e5ff024e139565740ebafeb3e74585be3f2d16c8968c\",\"event_id\":\"EVT-000002\",\"event_type\":\"plan-revision\",\"evidence_refs\":[],\"goal\":{\"goal_digest\":\"87f66f9c59ab5aa925a4844c2883ed5008ef1563a6046be74a28b4ed7c250219\",\"goal_id\":\"GL-ALPHA\",\"goal_version\":1},\"plan_revision\":2,\"previous_event_digest\":\"2937d1b8956d793ce2c6f38d260240bcb54ae4022304bbbc63aa5ba9b44b60f4\",\"recorded_at\":\"2026-08-23T00:00:00.000Z\",\"schema_version\":2,\"summary\":\"Recorded plan v0001/r0002 sha256:965daea95b4a3d8e06ecec7d9dcdeb8f96c19935745461fbb2be2c6ec6c28952 previous:949537569524a4746884b9e7185e5f99b0c64ff6df9702a3957c769d2f0ec0f9\",\"task_id\":null}\\n";
+const FOCUSED_RESULT_EVENT_LINE = "{\"event_digest\":\"b0effa1798d978d0633c726dee987b66821c4c7fe3fa0efedc7ec5b1b8dd9d84\",\"event_id\":\"EVT-000002\",\"event_type\":\"verification-result\",\"evidence_refs\":[],\"goal\":{\"goal_digest\":\"87f66f9c59ab5aa925a4844c2883ed5008ef1563a6046be74a28b4ed7c250219\",\"goal_id\":\"GL-ALPHA\",\"goal_version\":1},\"plan_revision\":1,\"previous_event_digest\":\"2937d1b8956d793ce2c6f38d260240bcb54ae4022304bbbc63aa5ba9b44b60f4\",\"recorded_at\":\"2026-08-23T00:00:00.000Z\",\"schema_version\":2,\"summary\":\"Focused tests passed\",\"task_id\":\"TASK-0001\"}\\n";
+const FULL_RESULT_EVENT_LINE = "{\"event_digest\":\"791fd466cafb01aabd2c42de93c2cfffb6a5ee9a0b6abce2f21e8011e7ab157f\",\"event_id\":\"EVT-000003\",\"event_type\":\"verification-result\",\"evidence_refs\":[],\"goal\":{\"goal_digest\":\"87f66f9c59ab5aa925a4844c2883ed5008ef1563a6046be74a28b4ed7c250219\",\"goal_id\":\"GL-ALPHA\",\"goal_version\":1},\"plan_revision\":1,\"previous_event_digest\":\"b0effa1798d978d0633c726dee987b66821c4c7fe3fa0efedc7ec5b1b8dd9d84\",\"recorded_at\":\"2026-08-23T00:00:00.000Z\",\"schema_version\":2,\"summary\":\"Full tests passed\",\"task_id\":\"TASK-0001\"}\\n";
 
 function progressInput(summary = 'Focused tests passed', overrides = {}) {
   return {
@@ -981,27 +1208,32 @@ function evidenceInput(overrides = {}) {
   return {
     kind: 'evidence',
     acceptance_criterion_id: 'AC-001',
+    validation_ref: {
+      ...activeGoalReference(),
+      plan_revision: 1,
+      validation_id: 'VAL-0001',
+    },
     task_id: 'TASK-0001',
-    method: 'node --test tests/goal-lock.test.js',
     observed_result: 'Focused tests passed',
     artifact_refs: ['reports/focused.txt', 'src/goal-lock/repository.js'],
-    workspace_fingerprint: 'a'.repeat(64),
+    inventory: undefined,
     state: 'pass',
+    failure_paths: [],
     supersedes: null,
     ...overrides,
   };
 }
 
-const FIRST_EVIDENCE_DIGEST = '5bdd5f99d1f3043cd6922e97b9a15551e9dbf2c0163f57110008929c961c13cd';
-const FIRST_EVIDENCE_BYTES = '{"acceptance_criterion_id":"AC-001","artifact_refs":["reports/focused.txt","src/goal-lock/repository.js"],"evidence_id":"EVID-0001","goal":{"goal_digest":"92d74f6bf766e096e71b949ff57e2d9a12302a4519226d05cf67c2b544babaa6","goal_id":"GL-ALPHA","goal_version":1},"method":"node --test tests/goal-lock.test.js","observed_result":"Focused tests passed","plan_revision":1,"recorded_at":"2026-08-23T00:00:00.000Z","schema_version":1,"state":"pass","supersedes":null,"task_id":"TASK-0001","workspace_fingerprint":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}\n';
-const FIRST_EVIDENCE_EVENT_DIGEST = '9a5a639ffb4eabf33adaf67230359d49a89e38cac4c1c0d9f9ec58d1c7c2555c';
-const FIRST_EVIDENCE_EVENT_LINE = '{"event_digest":"9a5a639ffb4eabf33adaf67230359d49a89e38cac4c1c0d9f9ec58d1c7c2555c","event_id":"EVT-000002","event_type":"verification-result","evidence_refs":["EVID-0001"],"goal":{"goal_digest":"92d74f6bf766e096e71b949ff57e2d9a12302a4519226d05cf67c2b544babaa6","goal_id":"GL-ALPHA","goal_version":1},"plan_revision":1,"previous_event_digest":"bdda7b3968a011b2229bb86936f21a2d51e9a070a992dcd573c91c4bb61e4b72","recorded_at":"2026-08-23T00:00:00.000Z","schema_version":1,"summary":"Recorded evidence AC-001/EVID-0001 sha256:5bdd5f99d1f3043cd6922e97b9a15551e9dbf2c0163f57110008929c961c13cd as pass","task_id":"TASK-0001"}\n';
+const FIRST_EVIDENCE_DIGEST = '0c2e685f39cfbf74eebabb75cd838928fc86ee718ef72fe1268df9a1130bf1a4';
+const FIRST_EVIDENCE_BYTES = '{"acceptance_criterion_id":"AC-001","artifact_refs":["reports/focused.txt","src/goal-lock/repository.js"],"derivation":null,"evidence_id":"EVID-0001","failure_paths":[],"observed_result":"Focused tests passed","recorded_at":"2026-08-23T00:00:00.000Z","schema_version":2,"state":"pass","supersedes":null,"task_id":"TASK-0001","validation_ref":{"goal_digest":"87f66f9c59ab5aa925a4844c2883ed5008ef1563a6046be74a28b4ed7c250219","goal_id":"GL-ALPHA","goal_version":1,"plan_revision":1,"validation_id":"VAL-0001"},"workspace_fingerprint":"98841df3c49ab596c48adeced8feabd340f9017a0a8fe76940fa6faf07e967c6"}\n';
+const FIRST_EVIDENCE_EVENT_DIGEST = '7b4c3bf576d15d47595ab142a3150e05c33e6538e0b51f32a9c2149d74f77ff9';
+const FIRST_EVIDENCE_EVENT_LINE = "{\"event_digest\":\"7b4c3bf576d15d47595ab142a3150e05c33e6538e0b51f32a9c2149d74f77ff9\",\"event_id\":\"EVT-000002\",\"event_type\":\"verification-result\",\"evidence_refs\":[\"EVID-0001\"],\"goal\":{\"goal_digest\":\"87f66f9c59ab5aa925a4844c2883ed5008ef1563a6046be74a28b4ed7c250219\",\"goal_id\":\"GL-ALPHA\",\"goal_version\":1},\"plan_revision\":1,\"previous_event_digest\":\"2937d1b8956d793ce2c6f38d260240bcb54ae4022304bbbc63aa5ba9b44b60f4\",\"recorded_at\":\"2026-08-23T00:00:00.000Z\",\"schema_version\":2,\"summary\":\"Recorded evidence AC-001/EVID-0001 sha256:0c2e685f39cfbf74eebabb75cd838928fc86ee718ef72fe1268df9a1130bf1a4 as pass\",\"task_id\":\"TASK-0001\"}\\n";
 
 async function createProgressFixture(testContext) {
   const fixture = createGoalLockFixture(testContext);
   const repository = await goalRepository();
   await repository.initializeGoal(fixture.root, goalV1(), fixture);
-  await repository.lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 92d74f6bf766', fixture);
+  await repository.lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 87f66f9c59ab', fixture);
   await repository.revisePlan(fixture.root, planCandidate(), 'aligned', fixture);
   await repository.recordGoalEvent(fixture.root, progressInput(), fixture);
   await repository.recordGoalEvent(fixture.root, progressInput('Full tests passed'), fixture);
@@ -1021,7 +1253,7 @@ async function rewriteTestProgressLedger(fixture, descriptors) {
   let previousEventDigest = null;
   const events = descriptors.map((descriptor, index) => {
     const payload = {
-      schema_version: 1,
+      schema_version: 2,
       event_id: `EVT-${String(index + 1).padStart(6, '0')}`,
       recorded_at: '2026-08-23T00:00:00.000Z',
       goal: activeGoalReference(),
@@ -1065,7 +1297,7 @@ test('plan revision creates revision 1 and its automatic progress event in one s
   const fixture = createGoalLockFixture(testContext);
   const { initializeGoal, lockInitialGoal, revisePlan } = await goalRepository();
   await initializeGoal(fixture.root, goalV1(), fixture);
-  await lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 92d74f6bf766', fixture);
+  await lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 87f66f9c59ab', fixture);
   const directory = join(fixture.root, '.goal-lock');
   const currentBefore = await readFile(join(directory, 'current.json'));
   const historyBefore = await readFile(join(directory, 'history', 'goals', 'v0001.json'));
@@ -1098,7 +1330,7 @@ test('plan revision archives each replaced plan byte-for-byte and preserves earl
   const fixture = createGoalLockFixture(testContext);
   const { initializeGoal, lockInitialGoal, revisePlan, verifyGoalRepository } = await goalRepository();
   await initializeGoal(fixture.root, goalV1(), fixture);
-  await lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 92d74f6bf766', fixture);
+  await lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 87f66f9c59ab', fixture);
   const directory = join(fixture.root, '.goal-lock');
   await revisePlan(fixture.root, planCandidate('First implementation'), 'aligned', fixture);
   const revisionOneBytes = await readFile(join(directory, 'plan.json'));
@@ -1132,7 +1364,7 @@ test('plan revision rejects unsupported classifications and caller-owned envelop
   const fixture = createGoalLockFixture(testContext);
   const { initializeGoal, lockInitialGoal, revisePlan } = await goalRepository();
   await initializeGoal(fixture.root, goalV1(), fixture);
-  await lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 92d74f6bf766', fixture);
+  await lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 87f66f9c59ab', fixture);
   const directory = join(fixture.root, '.goal-lock');
 
   await assert.rejects(
@@ -1159,7 +1391,7 @@ test('plan revision task status requires every first-plan task to begin pending'
   for (const [status, nextTaskId] of cases) {
     const fixture = createGoalLockFixture(testContext);
     await initializeGoal(fixture.root, goalV1(), fixture);
-    await lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 92d74f6bf766', fixture);
+    await lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 87f66f9c59ab', fixture);
     const candidate = planCandidate();
     candidate.tasks[0].status = status;
     candidate.next_task_id = nextTaskId;
@@ -1187,7 +1419,14 @@ test('plan revision task status preserves shared tasks and requires new tasks to
         acceptance_criteria: ['AC-001'],
         dependencies: [],
         permitted_paths: ['src/goal-lock/repository.js'],
-        verification: 'Run the focused goal-lock tests',
+        validations: [{
+          id: 'VAL-0004',
+          kind: 'focused',
+          method: { type: 'deterministic-test', target: 'goal-lock-focused-tests' },
+          affected_paths: ['src/goal-lock/repository.js'],
+          criterion_ids: ['AC-001'],
+          risk_ids: [],
+        }],
         status: 'complete',
       });
     }],
@@ -1195,7 +1434,7 @@ test('plan revision task status preserves shared tasks and requires new tasks to
   for (const [label, mutate] of cases) {
     const fixture = createGoalLockFixture(testContext);
     await initializeGoal(fixture.root, goalV1(), fixture);
-    await lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 92d74f6bf766', fixture);
+    await lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 87f66f9c59ab', fixture);
     await revisePlan(fixture.root, planCandidate(), 'aligned', fixture);
     const candidate = planCandidate('Refined implementation');
     mutate(candidate);
@@ -1243,7 +1482,7 @@ test('plan revision rejects wrong bindings, skipped revisions, and changed goal 
   for (const [label, tamper] of cases) {
     const fixture = createGoalLockFixture(testContext);
     await initializeGoal(fixture.root, goalV1(), fixture);
-    await lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 92d74f6bf766', fixture);
+    await lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 87f66f9c59ab', fixture);
     await revisePlan(fixture.root, planCandidate(), 'aligned', fixture);
     const planPath = join(fixture.root, '.goal-lock', 'plan.json');
     const plan = parseCanonicalJson(await readFile(planPath), 'test plan');
@@ -1262,7 +1501,7 @@ test('plan revision rejects criteria outside the goal without changing accepted 
   const fixture = createGoalLockFixture(testContext);
   const { initializeGoal, lockInitialGoal, revisePlan } = await goalRepository();
   await initializeGoal(fixture.root, goalV1(), fixture);
-  await lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 92d74f6bf766', fixture);
+  await lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 87f66f9c59ab', fixture);
   const candidate = planCandidate();
   candidate.tasks[0].acceptance_criteria = ['AC-002'];
   const lockBefore = await readFile(join(fixture.root, '.goal-lock', 'lock.json'));
@@ -1288,7 +1527,7 @@ test('plan revision rejects draft, tampered, and change-pending repositories', a
 
   const tampered = createGoalLockFixture(testContext);
   await initializeGoal(tampered.root, goalV1(), tampered);
-  await lockInitialGoal(tampered.root, 'APPROVE GOAL GL-ALPHA VERSION 1 92d74f6bf766', tampered);
+  await lockInitialGoal(tampered.root, 'APPROVE GOAL GL-ALPHA VERSION 1 87f66f9c59ab', tampered);
   await writeFile(join(tampered.root, '.goal-lock', 'current.json'), canonicalBytes({ ...goalV1(), objective: 'Tampered objective' }));
   await assert.rejects(
     revisePlan(tampered.root, planCandidate(), 'aligned', tampered),
@@ -1297,7 +1536,7 @@ test('plan revision rejects draft, tampered, and change-pending repositories', a
 
   const pending = createGoalLockFixture(testContext);
   await initializeGoal(pending.root, goalV1(), pending);
-  await lockInitialGoal(pending.root, 'APPROVE GOAL GL-ALPHA VERSION 1 92d74f6bf766', pending);
+  await lockInitialGoal(pending.root, 'APPROVE GOAL GL-ALPHA VERSION 1 87f66f9c59ab', pending);
   await proposeGoalChange(pending.root, changeProposalInput({ affected_tasks: [] }), pending);
   await assert.rejects(
     revisePlan(pending.root, planCandidate(), 'aligned', pending),
@@ -1309,7 +1548,7 @@ test('plan revision rejects unsupported change status as tampered state', async 
   const fixture = createGoalLockFixture(testContext);
   const { initializeGoal, lockInitialGoal, revisePlan, verifyGoalRepository } = await goalRepository();
   await initializeGoal(fixture.root, goalV1(), fixture);
-  await lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 92d74f6bf766', fixture);
+  await lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 87f66f9c59ab', fixture);
   await mkdir(join(fixture.root, '.goal-lock', 'changes'));
   await writeFile(join(fixture.root, '.goal-lock', 'changes', 'CR-0001.json'), canonicalBytes({
     ...structuralChange(),
@@ -1327,7 +1566,7 @@ test('plan revision refuses a baseline replaced after semantic verification', as
   const fixture = createGoalLockFixture(testContext);
   const { initializeGoal, lockInitialGoal, revisePlan } = await goalRepository();
   await initializeGoal(fixture.root, goalV1(), fixture);
-  await lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 92d74f6bf766', fixture);
+  await lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 87f66f9c59ab', fixture);
   const directory = join(fixture.root, '.goal-lock');
   const lockBefore = await readFile(join(directory, 'lock.json'));
   let armed = false;
@@ -1363,7 +1602,7 @@ test('plan revision progress event rolls back with the plan and lock after an in
   const fixture = createGoalLockFixture(testContext);
   const { initializeGoal, lockInitialGoal, revisePlan } = await goalRepository();
   await initializeGoal(fixture.root, goalV1(), fixture);
-  await lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 92d74f6bf766', fixture);
+  await lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 87f66f9c59ab', fixture);
   const directory = join(fixture.root, '.goal-lock');
   const lockBefore = await readFile(join(directory, 'lock.json'));
   fixture.transactionFaults.install = () => { throw new Error('injected plan install failure'); };
@@ -1400,7 +1639,7 @@ test('progress ledger verification rejects a plan with no automatic plan-revisio
   const fixture = createGoalLockFixture(testContext);
   const { initializeGoal, lockInitialGoal, verifyGoalRepository } = await goalRepository();
   await initializeGoal(fixture.root, goalV1(), fixture);
-  await lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 92d74f6bf766', fixture);
+  await lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 87f66f9c59ab', fixture);
   await writeFile(join(fixture.root, '.goal-lock', 'plan.json'), canonicalBytes(structuralPlan()));
 
   assert.equal((await verifyGoalRepository(fixture.root, fixture)).state, 'TAMPERED');
@@ -1430,7 +1669,7 @@ test('progress ledger rejects caller envelope overrides and unknown task or evid
   const fixture = createGoalLockFixture(testContext);
   const { initializeGoal, lockInitialGoal, revisePlan, recordGoalEvent } = await goalRepository();
   await initializeGoal(fixture.root, goalV1(), fixture);
-  await lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 92d74f6bf766', fixture);
+  await lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 87f66f9c59ab', fixture);
   await revisePlan(fixture.root, planCandidate(), 'aligned', fixture);
   const directory = join(fixture.root, '.goal-lock');
   const ledgerBefore = await readFile(join(directory, 'progress.jsonl'));
@@ -1626,7 +1865,7 @@ async function createPlannedFixture(testContext) {
   const fixture = createGoalLockFixture(testContext);
   const repository = await goalRepository();
   await repository.initializeGoal(fixture.root, goalV1(), fixture);
-  await repository.lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 92d74f6bf766', fixture);
+  await repository.lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 87f66f9c59ab', fixture);
   await repository.revisePlan(fixture.root, planCandidate(), 'aligned', fixture);
   return { fixture, repository };
 }
@@ -1660,26 +1899,31 @@ test('evidence public API validates the fixed complete envelope without mutating
   assert.deepEqual(validated, original);
   assert.deepEqual(input, original);
   assert.equal(Object.isFrozen(validated), true);
-  assert.equal(Object.isFrozen(validated.goal), true);
+  assert.equal(Object.isFrozen(validated.validation_ref), true);
   assert.equal(Object.isFrozen(validated.artifact_refs), true);
+  assert.throws(
+    () => goalContracts.validateEvidence({ ...input, method: 'node --test' }, activeGoalReference()),
+    /exact fields|validation_ref/,
+  );
 });
 
-test('evidence contract rejects invalid envelope, bindings, method, result, artifacts, fingerprint, state, and supersedes', () => {
+test('evidence public API rejects invalid schema-v2 bindings, results, paths, state, and supersession', () => {
   const cases = [
-    ['schema', (record) => { record.schema_version = 2; }],
+    ['schema', (record) => { record.schema_version = 1; }],
     ['evidence ID', (record) => { record.evidence_id = 'EVID-1'; }],
     ['criterion ID', (record) => { record.acceptance_criterion_id = 'AC-1'; }],
-    ['goal ID', (record) => { record.goal.goal_id = 'GL-OTHER'; }],
-    ['goal version', (record) => { record.goal.goal_version = 2; }],
-    ['goal digest', (record) => { record.goal.goal_digest = 'f'.repeat(64); }],
-    ['plan revision', (record) => { record.plan_revision = 0; }],
+    ['goal ID', (record) => { record.validation_ref.goal_id = 'GL-OTHER'; }],
+    ['goal version', (record) => { record.validation_ref.goal_version = 2; }],
+    ['goal digest', (record) => { record.validation_ref.goal_digest = 'f'.repeat(64); }],
+    ['plan revision', (record) => { record.validation_ref.plan_revision = 0; }],
+    ['validation ID', (record) => { record.validation_ref.validation_id = 'VAL-1'; }],
     ['task ID', (record) => { record.task_id = 'TASK-1'; }],
-    ['method', (record) => { record.method = ' manual '; }],
     ['observed result', (record) => { record.observed_result = ''; }],
     ['unsafe artifact', (record) => { record.artifact_refs = ['../secret.txt']; }],
     ['duplicate artifact', (record) => { record.artifact_refs = ['reports/result.txt', 'reports/result.txt']; }],
     ['workspace fingerprint', (record) => { record.workspace_fingerprint = 'A'.repeat(64); }],
     ['state', (record) => { record.state = 'passed'; }],
+    ['failure path', (record) => { record.failure_paths = ['../secret.txt']; }],
     ['supersedes', (record) => { record.supersedes = 'EVID-1'; }],
     ['recorded at', (record) => { record.recorded_at = '2026-02-30T00:00:00Z'; }],
     ['unknown field', (record) => { record.digest = 'b'.repeat(64); }],
@@ -1701,6 +1945,19 @@ test('evidence contract rejects invalid envelope, bindings, method, result, arti
     ...structuralEvidence('EVID-0002'),
     supersedes: 'EVID-0001',
   }, activeGoalReference()).supersedes, 'EVID-0001');
+
+  assert.throws(
+    () => goalContracts.validateEvidence({
+      ...structuralEvidence(),
+      failure_paths: ['src/goal-lock/contracts.js'],
+    }, activeGoalReference()),
+    /failure_paths/i,
+  );
+  assert.equal(goalContracts.validateEvidence({
+    ...structuralEvidence(),
+    state: 'fail',
+    failure_paths: ['src/goal-lock/contracts.js'],
+  }, activeGoalReference()).failure_paths[0], 'src/goal-lock/contracts.js');
 });
 
 test('evidence recording creates literal canonical evidence, one linked event, and both lock heads atomically', async (testContext) => {
@@ -1767,10 +2024,9 @@ test('evidence IDs and supersession are contiguous per criterion while preservin
   const firstB = await repository.recordGoalEvent(fixture.root, evidenceInput({
     acceptance_criterion_id: 'AC-002',
     task_id: 'TASK-0002',
-    method: 'Inspect the second criterion manually',
+    validation_ref: { ...activeGoalReference(), plan_revision: 1, validation_id: 'VAL-0002' },
     observed_result: 'The independent criterion failed',
     artifact_refs: [],
-    workspace_fingerprint: 'b'.repeat(64),
     state: 'fail',
   }), fixture);
   const headBAfterFirst = parseCanonicalJson(
@@ -1778,10 +2034,8 @@ test('evidence IDs and supersession are contiguous per criterion while preservin
     'test lock',
   ).evidence_heads['AC-002'];
   const secondA = await repository.recordGoalEvent(fixture.root, evidenceInput({
-    method: 'Review the criterion without a command',
     observed_result: 'The former passing evidence is now stale',
     artifact_refs: ['reports/manual-review.txt'],
-    workspace_fingerprint: 'c'.repeat(64),
     state: 'stale',
     supersedes: 'EVID-0001',
   }), fixture);
@@ -1927,7 +2181,7 @@ test('evidence replay rejects a re-digested cross-owned task-complete reference'
   const events = ledgerBefore.toString('utf8').trimEnd().split('\n').map(JSON.parse);
   const terminal = events.at(-1);
   const payload = {
-    schema_version: 1,
+    schema_version: 2,
     event_id: 'EVT-000004',
     recorded_at: '2026-08-23T00:00:00.000Z',
     goal: terminal.goal,
@@ -2055,18 +2309,14 @@ async function createEvidenceHistoryFixture(testContext) {
   const planned = await createPlannedFixture(testContext);
   await planned.repository.recordGoalEvent(planned.fixture.root, evidenceInput(), planned.fixture);
   await planned.repository.recordGoalEvent(planned.fixture.root, evidenceInput({
-    method: 'Run the focused tests again',
     observed_result: 'Focused tests failed',
     artifact_refs: ['reports/failed.txt'],
-    workspace_fingerprint: 'b'.repeat(64),
     state: 'fail',
     supersedes: 'EVID-0001',
   }), planned.fixture);
   await planned.repository.recordGoalEvent(planned.fixture.root, evidenceInput({
-    method: 'Review the superseded result manually',
     observed_result: 'Evidence is stale after review',
     artifact_refs: [],
-    workspace_fingerprint: 'c'.repeat(64),
     state: 'stale',
     supersedes: 'EVID-0002',
   }), planned.fixture);
@@ -2314,7 +2564,7 @@ test('progress ledger append refuses a raced replacement and preserves the repla
 
 function structuralProgressEvent(eventId = 'EVT-000001', eventDigest = '1'.repeat(64)) {
   return {
-    schema_version: 1,
+    schema_version: 2,
     event_id: eventId,
     recorded_at: '2026-08-23T01:00:00.000Z',
     goal: activeGoalReference(),
@@ -2344,7 +2594,7 @@ function structuralChange(changeId = 'CR-0001', options = {}) {
   };
   const changes = [{ field: 'objective', before: baseGoal.objective, after: candidateGoal.objective }];
   const payload = {
-    schema_version: 1,
+    schema_version: 2,
     id: changeId,
     base_goal: baseReference,
     candidate_goal: candidateGoal,
@@ -2352,7 +2602,7 @@ function structuralChange(changeId = 'CR-0001', options = {}) {
     changes,
     rationale: 'Evolve the approved goal',
     affected_tasks: [],
-    affected_criteria: [],
+    criterion_impact: { affected: [], unaffected: candidateGoal.acceptance_criteria.map(({ id }) => id) },
     risks: [],
     validation: ['Run verification'],
     rollback: ['Restore version one'],
@@ -2367,21 +2617,44 @@ function structuralChange(changeId = 'CR-0001', options = {}) {
   };
 }
 
+test('change request contract requires a disjoint exhaustive schema-v2 criterion impact partition', () => {
+  const input = structuralChange();
+  const validated = goalContracts.validateChangeRequest(input);
+
+  assert.deepEqual(validated, input);
+  assert.equal(Object.isFrozen(validated.criterion_impact), true);
+  assert.throws(
+    () => goalContracts.validateChangeRequest({ ...input, schema_version: 1 }),
+    /schema_version must equal 2/,
+  );
+  assert.throws(
+    () => goalContracts.validateChangeRequest({
+      ...input,
+      criterion_impact: { affected: ['AC-001'], unaffected: ['AC-001'] },
+    }),
+    /criterion_impact|disjoint/i,
+  );
+  assert.throws(
+    () => goalContracts.validateChangeRequest({
+      ...input,
+      criterion_impact: { affected: [], unaffected: [] },
+    }),
+    /criterion_impact|every|exhaustive/i,
+  );
+  assert.throws(
+    () => goalContracts.validateChangeRequest({
+      ...input,
+      affected_criteria: [],
+    }),
+    /missing or unknown fields|exact fields|criterion_impact/i,
+  );
+});
+
 function structuralEvidence(evidenceId = 'EVID-0001', criterionId = 'AC-001') {
   return {
-    schema_version: 1,
+    ...schemaV2Evidence(),
     evidence_id: evidenceId,
     acceptance_criterion_id: criterionId,
-    goal: activeGoalReference(),
-    plan_revision: 1,
-    task_id: 'TASK-0001',
-    method: 'Run verification',
-    observed_result: 'Verification passed',
-    artifact_refs: ['reports/result.txt'],
-    workspace_fingerprint: '3'.repeat(64),
-    state: 'pass',
-    supersedes: null,
-    recorded_at: '2026-08-23T01:00:00.000Z',
   };
 }
 
@@ -2406,7 +2679,7 @@ async function optionalBytes(target) {
 test('initializes goal draft as the only initial repository record', async (testContext) => {
   const fixture = createGoalLockFixture(testContext);
   const draft = goalV1();
-  const expectedCurrent = Buffer.from('{"acceptance_criteria":[{"id":"AC-001","outcome":"State is locked","verification":"Run verification"}],"accepted_change_id":null,"assumptions":[{"confidence":"medium","statement":"Git is installed"}],"authorization_boundary":["Local workspace only"],"constraints":[{"id":"C-001","text":"Use Node.js"}],"goal_id":"GL-ALPHA","goal_version":1,"non_goals":["Remote publishing"],"objective":"Ship a safe lock","predecessor":null,"schema_version":1,"scope":{"in":["CLI"],"out":["Cloud sync"]}}\n');
+  const expectedCurrent = Buffer.from('{"acceptance_criteria":[{"id":"AC-001","outcome":"State is locked","verification":"Run verification"}],"accepted_change_id":null,"assumptions":[{"confidence":"medium","statement":"Git is installed"}],"authorization_boundary":["Local workspace only"],"constraints":[{"id":"C-001","text":"Use Node.js"}],"goal_id":"GL-ALPHA","goal_version":1,"non_goals":["Remote publishing"],"objective":"Ship a safe lock","predecessor":null,"schema_version":2,"scope":{"in":["CLI"],"out":["Cloud sync"]}}\n');
   const { initializeGoal } = await goalRepository();
 
   const result = await initializeGoal(fixture.root, draft, fixture);
@@ -2415,8 +2688,8 @@ test('initializes goal draft as the only initial repository record', async (test
     state: 'DRAFT',
     goal_id: 'GL-ALPHA',
     goal_version: 1,
-    goal_digest: '92d74f6bf766e096e71b949ff57e2d9a12302a4519226d05cf67c2b544babaa6',
-    approval_required: 'APPROVE GOAL GL-ALPHA VERSION 1 92d74f6bf766',
+    goal_digest: '87f66f9c59ab5aa925a4844c2883ed5008ef1563a6046be74a28b4ed7c250219',
+    approval_required: 'APPROVE GOAL GL-ALPHA VERSION 1 87f66f9c59ab',
   });
   assert.deepEqual(await readFile(join(fixture.root, '.goal-lock', 'current.json')), expectedCurrent);
   assert.equal(await optionalBytes(join(fixture.root, '.goal-lock', 'lock.json')), null);
@@ -2497,10 +2770,10 @@ test('version 1 lock rejects every approval other than the exact current phrase'
   await initializeGoal(fixture.root, goalV1(), fixture);
   const approvals = [
     'APPROVE GOAL',
-    'approve goal gl-alpha version 1 92d74f6bf766',
-    ' APPROVE GOAL GL-ALPHA VERSION 1 92d74f6bf766',
-    'APPROVE GOAL GL-BETA VERSION 1 92d74f6bf766',
-    'APPROVE GOAL GL-ALPHA VERSION 2 92d74f6bf766',
+    'approve goal gl-alpha version 1 87f66f9c59ab',
+    ' APPROVE GOAL GL-ALPHA VERSION 1 87f66f9c59ab',
+    'APPROVE GOAL GL-BETA VERSION 1 87f66f9c59ab',
+    'APPROVE GOAL GL-ALPHA VERSION 2 87f66f9c59ab',
     'APPROVE GOAL GL-ALPHA VERSION 1 000000000000',
   ];
 
@@ -2518,22 +2791,26 @@ test('version 1 lock records the exact approved current bytes in immutable histo
   const currentPath = join(fixture.root, '.goal-lock', 'current.json');
   const current = await readFile(currentPath);
 
-  await lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 92d74f6bf766', fixture);
+  await lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 87f66f9c59ab', fixture);
 
   const lock = parseCanonicalJson(await readFile(join(fixture.root, '.goal-lock', 'lock.json')), 'lock');
+  const scopeBytes = await readFile(join(fixture.root, '.goal-lock', 'scope.json'));
   const { record_digest, ...lockWithoutDigest } = lock;
   assert.deepEqual(lockWithoutDigest, {
-    schema_version: 1,
+    schema_version: 2,
     goal_id: 'GL-ALPHA',
     goal_version: 1,
-    goal_digest: '92d74f6bf766e096e71b949ff57e2d9a12302a4519226d05cf67c2b544babaa6',
+    goal_digest: '87f66f9c59ab5aa925a4844c2883ed5008ef1563a6046be74a28b4ed7c250219',
     approval_type: 'explicit-version-1',
-    proposal_digest: '92d74f6bf766e096e71b949ff57e2d9a12302a4519226d05cf67c2b544babaa6',
+    proposal_digest: '87f66f9c59ab5aa925a4844c2883ed5008ef1563a6046be74a28b4ed7c250219',
     approved_at: '2026-08-23T00:00:00.000Z',
     predecessor_digest: null,
     state_revision: 1,
+    scope_head: { scope_version: 1, digest: sha256(scopeBytes) },
+    plan_head: null,
     progress_head: null,
     change_head: null,
+    change_heads: {},
     evidence_heads: {},
   });
   assert.equal(record_digest, sha256(canonicalBytes(lockWithoutDigest)));
@@ -2542,7 +2819,7 @@ test('version 1 lock records the exact approved current bytes in immutable histo
   assert.deepEqual(await readFile(join(fixture.root, '.goal-lock', 'history', 'goals', 'v0001.json')), current);
 
   const lockBytes = await readFile(join(fixture.root, '.goal-lock', 'lock.json'));
-  await assert.rejects(lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 92d74f6bf766', fixture), /lock|state|initial/i);
+  await assert.rejects(lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 87f66f9c59ab', fixture), /lock|state|initial/i);
   assert.deepEqual(await readFile(join(fixture.root, '.goal-lock', 'lock.json')), lockBytes);
 });
 
@@ -2559,7 +2836,7 @@ test('version 1 lock rolls back lock and history when either installation fails'
       if (installations++ === failedInstallation) throw new Error(`install-${failedInstallation}`);
     };
 
-    await assert.rejects(lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 92d74f6bf766', fixture), new RegExp(`install-${failedInstallation}`));
+    await assert.rejects(lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 87f66f9c59ab', fixture), new RegExp(`install-${failedInstallation}`));
 
     assert.deepEqual(await readFile(currentPath), current);
     assert.equal(await optionalBytes(join(fixture.root, '.goal-lock', 'lock.json')), null);
@@ -2577,7 +2854,7 @@ test('version 1 lock rolls back when current draft ownership changes during fina
   const editedBytes = canonicalBytes(externallyEdited);
   fixture.transactionFaults.finalReadBack = async () => { await writeFile(currentPath, editedBytes); };
 
-  await assert.rejects(lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 92d74f6bf766', fixture), /ownership|current|digest|transaction/i);
+  await assert.rejects(lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 87f66f9c59ab', fixture), /ownership|current|digest|transaction/i);
 
   assert.deepEqual(await readFile(currentPath), editedBytes);
   assert.equal(await optionalBytes(join(fixture.root, '.goal-lock', 'lock.json')), null);
@@ -2754,12 +3031,12 @@ test('verifies goal history for draft and locked version one without adopting ob
   const draft = await verifyGoalRepository(draftFixture.root, draftFixture);
 
   assert.equal(draft.state, 'DRAFT');
-  assert.equal(draft.evidence.goal.goal_digest, '92d74f6bf766e096e71b949ff57e2d9a12302a4519226d05cf67c2b544babaa6');
+  assert.equal(draft.evidence.goal.goal_digest, '87f66f9c59ab5aa925a4844c2883ed5008ef1563a6046be74a28b4ed7c250219');
   assert.deepEqual(draft.evidence.inputs.map((entry) => entry.path), ['.goal-lock', '.goal-lock/current.json']);
 
   const lockedFixture = createGoalLockFixture(testContext);
   await initializeGoal(lockedFixture.root, goalV1(), lockedFixture);
-  await lockInitialGoal(lockedFixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 92d74f6bf766', lockedFixture);
+  await lockInitialGoal(lockedFixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 87f66f9c59ab', lockedFixture);
 
   const locked = await verifyGoalRepository(lockedFixture.root, lockedFixture);
 
@@ -2767,9 +3044,9 @@ test('verifies goal history for draft and locked version one without adopting ob
   assert.deepEqual(locked.evidence.goal, {
     goal_id: 'GL-ALPHA',
     goal_version: 1,
-    goal_digest: '92d74f6bf766e096e71b949ff57e2d9a12302a4519226d05cf67c2b544babaa6',
+    goal_digest: '87f66f9c59ab5aa925a4844c2883ed5008ef1563a6046be74a28b4ed7c250219',
   });
-  assert.equal(locked.evidence.inputs.find((entry) => entry.path === '.goal-lock/lock.json').digest, '748352cc02a42cbc0563e176a0a3bbf733531689dcb9aac17fa7c16b85745df5');
+  assert.equal(locked.evidence.inputs.find((entry) => entry.path === '.goal-lock/lock.json').digest, '5510b7a5714fc5a0a6697e3d70cdf75351f6ec9309af37e037f1df2f5bd20408');
 });
 
 test('verifies goal history fails closed for missing current lock or history files', async (testContext) => {
@@ -2777,7 +3054,7 @@ test('verifies goal history fails closed for missing current lock or history fil
   for (const missingPath of ['current.json', 'lock.json', 'history/goals/v0001.json']) {
     const fixture = createGoalLockFixture(testContext);
     await initializeGoal(fixture.root, goalV1(), fixture);
-    await lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 92d74f6bf766', fixture);
+    await lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 87f66f9c59ab', fixture);
     await unlink(join(fixture.root, '.goal-lock', ...missingPath.split('/')));
 
     const result = await verifyGoalRepository(fixture.root, fixture);
@@ -2796,14 +3073,14 @@ test('detects tampering in malformed, noncanonical, and mismatched current or hi
   const { initializeGoal, lockInitialGoal, verifyGoalRepository } = await goalRepository();
   const cases = [
     ['malformed current', 'current.json', Buffer.from('{not-json}\n')],
-    ['noncanonical current', 'current.json', Buffer.from('{"scope":{},"schema_version":1}\r\n')],
+    ['noncanonical current', 'current.json', Buffer.from('{"scope":{},"schema_version":2}\r\n')],
     ['changed current', 'current.json', canonicalBytes({ ...goalV1(), objective: 'Directly edited objective' })],
     ['mismatched history', 'history/goals/v0001.json', canonicalBytes({ ...goalV1(), objective: 'Different archived objective' })],
   ];
   for (const [label, relativePath, bytes] of cases) {
     const fixture = createGoalLockFixture(testContext);
     await initializeGoal(fixture.root, goalV1(), fixture);
-    await lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 92d74f6bf766', fixture);
+    await lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 87f66f9c59ab', fixture);
     await writeFile(join(fixture.root, '.goal-lock', ...relativePath.split('/')), bytes);
 
     const result = await verifyGoalRepository(fixture.root, fixture);
@@ -2825,7 +3102,7 @@ test('detects tampering in every goal-bound lock field even with a recomputed re
   for (const [field, mutate] of cases) {
     const fixture = createGoalLockFixture(testContext);
     await initializeGoal(fixture.root, goalV1(), fixture);
-    await lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 92d74f6bf766', fixture);
+    await lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 87f66f9c59ab', fixture);
     const lockPath = join(fixture.root, '.goal-lock', 'lock.json');
     const lock = parseCanonicalJson(await readFile(lockPath), 'test lock');
     delete lock.record_digest;
@@ -2843,7 +3120,7 @@ test('detects tampering in changed lock bytes including timestamp-only changes',
   const fixture = createGoalLockFixture(testContext);
   const { initializeGoal, lockInitialGoal, verifyGoalRepository } = await goalRepository();
   await initializeGoal(fixture.root, goalV1(), fixture);
-  await lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 92d74f6bf766', fixture);
+  await lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 87f66f9c59ab', fixture);
   const lockPath = join(fixture.root, '.goal-lock', 'lock.json');
   const lock = parseCanonicalJson(await readFile(lockPath), 'test lock');
   lock.approved_at = '2026-08-23T00:00:01.000Z';
@@ -2873,7 +3150,7 @@ test('verifies goal history rejects skipped filenames and content-version mismat
   for (const [label, tamper] of cases) {
     const fixture = createGoalLockFixture(testContext);
     await initializeGoal(fixture.root, goalV1(), fixture);
-    await lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 92d74f6bf766', fixture);
+    await lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 87f66f9c59ab', fixture);
     await tamper(fixture);
 
     const result = await verifyGoalRepository(fixture.root, fixture);
@@ -2886,7 +3163,7 @@ test('verifies goal history follows predecessor versions, digests, and accepted 
   const { initializeGoal, lockInitialGoal, verifyGoalRepository } = await goalRepository();
   const valid = createGoalLockFixture(testContext);
   await initializeGoal(valid.root, goalV1(), valid);
-  await lockInitialGoal(valid.root, 'APPROVE GOAL GL-ALPHA VERSION 1 92d74f6bf766', valid);
+  await lockInitialGoal(valid.root, 'APPROVE GOAL GL-ALPHA VERSION 1 87f66f9c59ab', valid);
   await installVersionTwo(valid);
   assert.equal((await verifyGoalRepository(valid.root, valid)).state, 'LOCKED');
 
@@ -2898,7 +3175,7 @@ test('verifies goal history follows predecessor versions, digests, and accepted 
   for (const [field, tamper] of cases) {
     const fixture = createGoalLockFixture(testContext);
     await initializeGoal(fixture.root, goalV1(), fixture);
-    await lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 92d74f6bf766', fixture);
+    await lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 87f66f9c59ab', fixture);
     const installed = await installVersionTwo(fixture);
     tamper(installed.goal);
     const changedBytes = canonicalBytes(installed.goal);
@@ -2928,14 +3205,14 @@ test('verifies every historical goal is backed by its exact approved change requ
   const { initializeGoal, lockInitialGoal, verifyGoalRepository } = await goalRepository();
   const invalid = createGoalLockFixture(testContext);
   await initializeGoal(invalid.root, goalV1(), invalid);
-  await lockInitialGoal(invalid.root, 'APPROVE GOAL GL-ALPHA VERSION 1 92d74f6bf766', invalid);
+  await lockInitialGoal(invalid.root, 'APPROVE GOAL GL-ALPHA VERSION 1 87f66f9c59ab', invalid);
   await installVersionThree(invalid, 'rejected');
 
   assert.equal((await verifyGoalRepository(invalid.root, invalid)).state, 'TAMPERED');
 
   const valid = createGoalLockFixture(testContext);
   await initializeGoal(valid.root, goalV1(), valid);
-  await lockInitialGoal(valid.root, 'APPROVE GOAL GL-ALPHA VERSION 1 92d74f6bf766', valid);
+  await lockInitialGoal(valid.root, 'APPROVE GOAL GL-ALPHA VERSION 1 87f66f9c59ab', valid);
   await installVersionThree(valid, 'approved');
 
   assert.equal((await verifyGoalRepository(valid.root, valid)).state, 'LOCKED');
@@ -2952,7 +3229,7 @@ test('verifies goal history preflights optional state and reports a pending chan
     verifyGoalRepository,
   } = await goalRepository();
   await initializeGoal(fixture.root, goalV1(), fixture);
-  await lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 92d74f6bf766', fixture);
+  await lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 87f66f9c59ab', fixture);
   const directory = join(fixture.root, '.goal-lock');
   await revisePlan(fixture.root, planCandidate(), 'aligned', fixture);
   await recordGoalEvent(fixture.root, evidenceInput(), fixture);
@@ -2975,7 +3252,7 @@ test('detects tampering when optional state is unsafe or noncanonical', async (t
   for (const [label, createInvalid] of cases) {
     const fixture = createGoalLockFixture(testContext);
     await initializeGoal(fixture.root, goalV1(), fixture);
-    await lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 92d74f6bf766', fixture);
+    await lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 87f66f9c59ab', fixture);
     await createInvalid(join(fixture.root, '.goal-lock'));
 
     const result = await verifyGoalRepository(fixture.root, fixture);
@@ -2988,7 +3265,7 @@ test('detects tampering in a progress ledger containing invalid UTF-8 bytes', as
   const fixture = createGoalLockFixture(testContext);
   const { initializeGoal, lockInitialGoal, verifyGoalRepository } = await goalRepository();
   await initializeGoal(fixture.root, goalV1(), fixture);
-  await lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 92d74f6bf766', fixture);
+  await lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 87f66f9c59ab', fixture);
   const prefix = Buffer.from('{"summary":"');
   const suffix = Buffer.from('"}\n');
   await writeFile(join(fixture.root, '.goal-lock', 'progress.jsonl'), Buffer.concat([prefix, Buffer.from([0xff]), suffix]));
@@ -3008,7 +3285,7 @@ test('detects tampering when lock heads declare missing lifecycle state', async 
   for (const [field, mutate] of cases) {
     const fixture = createGoalLockFixture(testContext);
     await initializeGoal(fixture.root, goalV1(), fixture);
-    await lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 92d74f6bf766', fixture);
+    await lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 87f66f9c59ab', fixture);
     const lockPath = join(fixture.root, '.goal-lock', 'lock.json');
     const lock = parseCanonicalJson(await readFile(lockPath), 'test lock');
     delete lock.record_digest;
@@ -3024,21 +3301,11 @@ test('detects tampering when lock heads declare missing lifecycle state', async 
 
 test('verifies goal history structurally preflights present plan history', async (testContext) => {
   const fixture = createGoalLockFixture(testContext);
-  const { initializeGoal, lockInitialGoal, verifyGoalRepository } = await goalRepository();
+  const { initializeGoal, lockInitialGoal, revisePlan, verifyGoalRepository } = await goalRepository();
   await initializeGoal(fixture.root, goalV1(), fixture);
-  await lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 92d74f6bf766', fixture);
-  const directory = join(fixture.root, '.goal-lock');
-  await writeFile(join(directory, 'plan.json'), canonicalBytes({ ...structuralPlan(), plan_revision: 2 }));
-  await mkdir(join(directory, 'history', 'plans'));
-  await writeFile(join(directory, 'history', 'plans', 'v0001-r0001.json'), canonicalBytes(structuralPlan()));
-  await writeFile(
-    join(directory, 'progress.jsonl'),
-    Buffer.from(PLAN_REVISION_EVENT_LINE + SECOND_PLAN_REVISION_EVENT_LINE),
-  );
-  await rewriteTestLock(fixture, (lock) => {
-    lock.state_revision = 3;
-    lock.progress_head = { event_id: 'EVT-000002', digest: SECOND_PLAN_REVISION_EVENT_DIGEST };
-  });
+  await lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 87f66f9c59ab', fixture);
+  await revisePlan(fixture.root, planCandidate(), 'aligned', fixture);
+  await revisePlan(fixture.root, planCandidate('Second accepted plan revision'), 'implementation-choice', fixture);
 
   const result = await verifyGoalRepository(fixture.root, fixture);
 
@@ -3050,7 +3317,7 @@ test('detects tampering when plan history appears after its structural preflight
   const fixture = createGoalLockFixture(testContext);
   const { initializeGoal, lockInitialGoal, proposeGoalChange, verifyGoalRepository } = await goalRepository();
   await initializeGoal(fixture.root, goalV1(), fixture);
-  await lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 92d74f6bf766', fixture);
+  await lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 87f66f9c59ab', fixture);
   const directory = join(fixture.root, '.goal-lock');
   await proposeGoalChange(fixture.root, changeProposalInput({ affected_tasks: [] }), fixture);
   let injected = false;
@@ -3089,7 +3356,7 @@ test('detects tampering when lock heads do not match their terminal records', as
   for (const [field, arrange] of cases) {
     const fixture = createGoalLockFixture(testContext);
     await initializeGoal(fixture.root, goalV1(), fixture);
-    await lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 92d74f6bf766', fixture);
+    await lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 87f66f9c59ab', fixture);
     await arrange(fixture, join(fixture.root, '.goal-lock'));
 
     const result = await verifyGoalRepository(fixture.root, fixture);
@@ -3109,7 +3376,7 @@ test('detects tampering in canonical optional objects without required envelopes
   for (const [artifact, arrange] of cases) {
     const fixture = createGoalLockFixture(testContext);
     await initializeGoal(fixture.root, goalV1(), fixture);
-    await lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 92d74f6bf766', fixture);
+    await lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 87f66f9c59ab', fixture);
     await arrange(join(fixture.root, '.goal-lock'));
 
     const result = await verifyGoalRepository(fixture.root, fixture);
@@ -3370,7 +3637,7 @@ test('transaction rejects expected-absent ownership without changing the target'
 
 test('transaction creates an expected-absent target through a cleaned same-directory stage', async (testContext) => {
   const fixture = createGoalLockFixture(testContext);
-  const content = canonicalBytes({ schema_version: 1 });
+  const content = canonicalBytes({ schema_version: 2 });
 
   const receipt = await commitGoalFiles(fixture.root, [
     { target: '.goal-lock/current.json', expected: { kind: 'absent' }, content },
@@ -3675,6 +3942,62 @@ test('transaction rejects a stale expected digest without producing stages', asy
   assert.deepEqual(await readdir(directory), ['current.json']);
 });
 
+test('durable recovery restores every target after abrupt termination at each atomic replacement boundary', async (testContext) => {
+  const transactionModule = new URL('../src/goal-lock/transaction.js', import.meta.url).href;
+  for (const [phase, failingIndex] of [
+    ['install', 0],
+    ['readBack', 0],
+    ['install', 1],
+    ['readBack', 1],
+    ['finalReadBack', -1],
+  ]) {
+    const fixture = createGoalLockFixture(testContext);
+    const directory = join(fixture.root, '.goal-lock');
+    await mkdir(directory, { recursive: true });
+    await writeFile(join(directory, 'a.json'), 'old-a');
+    await writeFile(join(directory, 'b.json'), 'old-b');
+    const childPath = join(fixture.root, `crash-${phase}-${failingIndex}.mjs`);
+    await writeFile(childPath, `
+import { commitGoalFiles, withGoalLock } from ${JSON.stringify(transactionModule)};
+const [root, phase, indexText] = process.argv.slice(2);
+const failingIndex = Number(indexText);
+const transactionFaults = {
+  [phase](details) {
+    if (failingIndex === -1 || details.index === failingIndex) process.exit(91);
+  },
+};
+await withGoalLock(root, 'abrupt-test', (ownership) => commitGoalFiles(root, [
+  { target: '.goal-lock/a.json', expected: { kind: 'sha256', digest: ${JSON.stringify(independentSha256(Buffer.from('old-a')))} }, content: Buffer.from('new-a') },
+  { target: '.goal-lock/b.json', expected: { kind: 'sha256', digest: ${JSON.stringify(independentSha256(Buffer.from('old-b')))} }, content: Buffer.from('new-b') },
+], { transactionFaults, ...ownership }), { transactionFaults });
+`);
+    const child = spawnSync(process.execPath, [childPath, fixture.root, phase, String(failingIndex)], {
+      encoding: 'utf8',
+      windowsHide: true,
+    });
+    assert.equal(child.status, 91, `${phase}/${failingIndex}: ${child.stderr}`);
+
+    for (const name of ['a.json', 'b.json']) {
+      const snapshot = await lstat(join(directory, name));
+      assert.equal(snapshot.isFile(), true, `${phase}/${failingIndex}/${name} must never be absent`);
+    }
+    const lockBytes = await readFile(join(directory, '.write-lock.json'));
+    const owner = parseCanonicalJson(lockBytes, 'abrupt writer lock');
+    await recoverGoalLock(fixture.root, {
+      owner_token: owner.token,
+      lock_digest: independentSha256(lockBytes),
+    }, { ...fixture, isProcessAlive: () => false });
+
+    assert.equal(await readFile(join(directory, 'a.json'), 'utf8'), 'old-a', `${phase}/${failingIndex}/a`);
+    assert.equal(await readFile(join(directory, 'b.json'), 'utf8'), 'old-b', `${phase}/${failingIndex}/b`);
+    assert.equal(existsSync(join(directory, '.transaction.json')), false);
+    assert.deepEqual(
+      (await readdir(directory)).filter((name) => name.includes('.stage') || name.includes('.backup')),
+      [],
+    );
+  }
+});
+
 test('recover removes an exact canonical lock only after its process is dead', async (testContext) => {
   const fixture = createGoalLockFixture(testContext);
   const directory = join(fixture.root, '.goal-lock');
@@ -3921,7 +4244,7 @@ test('goal lock fixture omits Git when explicitly disabled', (testContext) => {
 
 function goalV1() {
   return {
-    schema_version: 1,
+    schema_version: 2,
     goal_id: 'GL-ALPHA',
     goal_version: 1,
     objective: 'Ship a safe lock',
@@ -3938,7 +4261,7 @@ function goalV1() {
 
 function lockV1() {
   return {
-    schema_version: 1,
+    schema_version: 2,
     goal_id: 'GL-ALPHA',
     goal_version: 1,
     goal_digest: '1111111111111111111111111111111111111111111111111111111111111111',
@@ -3947,8 +4270,14 @@ function lockV1() {
     approved_at: '2026-08-23T00:00:00Z',
     predecessor_digest: null,
     state_revision: 1,
+    scope_head: {
+      scope_version: 1,
+      digest: '3333333333333333333333333333333333333333333333333333333333333333',
+    },
+    plan_head: null,
     progress_head: null,
     change_head: null,
+    change_heads: {},
     evidence_heads: {},
     record_digest: 'REPLACE_ME',
   };
@@ -3965,11 +4294,11 @@ test('goal contract accepts every required version-one field without mutating in
   assert.equal(input.scope.in[0], 'CLI');
 });
 
-test('goal contract permits an empty acceptance-criteria array when no criterion is declared', () => {
+test('goal contract rejects an empty acceptance-criteria array', () => {
   const input = goalV1();
   input.acceptance_criteria = [];
 
-  assert.deepEqual(validateGoalContract(input).acceptance_criteria, []);
+  assert.throws(() => validateGoalContract(input), /acceptance_criteria.*non-empty/i);
 });
 
 test('goal contract names each missing required field', () => {
@@ -3982,7 +4311,7 @@ test('goal contract names each missing required field', () => {
 
 test('goal contract validates the semantic boundary of every root field', () => {
   const cases = [
-    ['schema_version', (goal) => { goal.schema_version = 2; }],
+    ['schema_version', (goal) => { goal.schema_version = 1; }],
     ['goal_id', (goal) => { goal.goal_id = 'GL-lowercase'; }],
     ['goal_version', (goal) => { goal.goal_version = 0; }],
     ['objective', (goal) => { goal.objective = ''; }],
@@ -4052,7 +4381,8 @@ test('relative artifact paths normalize only safe repository-relative paths', ()
 
 test('lock contract validates initial heads and the digest of every field except record_digest', () => {
   const input = lockV1();
-  input.record_digest = '9829d201bd2c1d769712f66032544acc1d34f78ce92b6cc63c44305053b88f0f';
+  const { record_digest: _placeholder, ...payload } = input;
+  input.record_digest = independentSha256(canonicalBytes(payload));
   const validated = validateLockRecord(input);
 
   assert.deepEqual(validated, input);
@@ -4075,7 +4405,7 @@ test('lock contract rejects malformed enums, heads, and record digests', () => {
 
 test('lock contract validates the semantic boundary of every root field', () => {
   const cases = [
-    ['schema_version', (lock) => { lock.schema_version = 2; }],
+    ['schema_version', (lock) => { lock.schema_version = 1; }],
     ['goal_id', (lock) => { lock.goal_id = 'GL-lowercase'; }],
     ['goal_version', (lock) => { lock.goal_version = 0; }],
     ['goal_digest', (lock) => { lock.goal_digest = 'not-a-digest'; }],
@@ -4084,8 +4414,11 @@ test('lock contract validates the semantic boundary of every root field', () => 
     ['approved_at', (lock) => { lock.approved_at = 'not-a-timestamp'; }],
     ['predecessor_digest', (lock) => { lock.predecessor_digest = '1111111111111111111111111111111111111111111111111111111111111111'; }],
     ['state_revision', (lock) => { lock.state_revision = 0; }],
+    ['scope_head', (lock) => { lock.scope_head = {}; }],
+    ['plan_head', (lock) => { lock.plan_head = {}; }],
     ['progress_head', (lock) => { lock.progress_head = {}; }],
     ['change_head', (lock) => { lock.change_head = {}; }],
+    ['change_heads', (lock) => { lock.change_heads = { invalid: 'not-a-digest' }; }],
     ['evidence_heads', (lock) => { lock.evidence_heads = { invalid: {} }; }],
     ['record_digest', (lock) => { lock.record_digest = 'not-a-digest'; }],
   ];
@@ -4107,7 +4440,7 @@ test('lock contract rejects impossible RFC 3339 calendar dates and times', () =>
 
 test('approval phrase builders bind the stable identifiers and digest fingerprints', () => {
   const goal = goalV1();
-  assert.equal(approvalPhraseForGoal(goal), 'APPROVE GOAL GL-ALPHA VERSION 1 92d74f6bf766');
+  assert.equal(approvalPhraseForGoal(goal), 'APPROVE GOAL GL-ALPHA VERSION 1 87f66f9c59ab');
   assert.equal(
     approvalPhraseForChange({ id: 'CR-0001', candidate_goal: { goal_version: 2 }, proposal_digest: 'abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd' }),
     'APPROVE CR-0001 GOAL VERSION 2 abcdefabcdef',
@@ -4374,9 +4707,10 @@ async function createCompletionFixture(testContext, { git: withGit = true, evide
   const repository = await goalRepository();
   await writeDelivery(fixture.root, 'delivery.txt', 'accepted delivery\n');
   await repository.initializeGoal(fixture.root, goalV1(), fixture);
-  await repository.lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 92d74f6bf766', fixture);
+  await repository.lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 87f66f9c59ab', fixture);
   await repository.revisePlan(fixture.root, planCandidate(), 'aligned', fixture);
-  await repository.recordGoalEvent(fixture.root, evidenceInput({ state: evidenceState }), fixture);
+  const inventory = withGit ? undefined : ['delivery.txt'];
+  await repository.recordGoalEvent(fixture.root, evidenceInput({ state: evidenceState, inventory }), fixture);
   await repository.recordGoalEvent(fixture.root, progressInput('Started task one', { event_type: 'task-start' }), fixture);
   await repository.recordGoalEvent(fixture.root, progressInput('Completed task one', {
     event_type: 'task-complete',
@@ -4385,6 +4719,51 @@ async function createCompletionFixture(testContext, { git: withGit = true, evide
   await repository.recordGoalEvent(fixture.root, evidenceInput({
     task_id: 'TASK-0002',
     state: evidenceState,
+    supersedes: 'EVID-0001',
+    inventory,
+  }), fixture);
+  await repository.recordGoalEvent(fixture.root, progressInput('Started task two', {
+    event_type: 'task-start',
+    task_id: 'TASK-0002',
+  }), fixture);
+  await repository.recordGoalEvent(fixture.root, progressInput('Completed task two', {
+    event_type: 'task-complete',
+    task_id: 'TASK-0002',
+    evidence_refs: ['EVID-0002'],
+  }), fixture);
+  if (audit) {
+    await repository.recordGoalEvent(fixture.root, {
+      kind: 'final-audit',
+      semantic_summary: 'Reviewed the final semantic diff against the locked goal.',
+      inventory,
+    }, fixture);
+  }
+  return { fixture, repository, inventory };
+}
+
+test('evidence recording derives the workspace fingerprint and gate rejects evidence for stale delivery bytes', async (testContext) => {
+  const fixture = createGoalLockFixture(testContext);
+  const repository = await goalRepository();
+  const { workspaceFingerprint } = await workspaceReader();
+  await writeDelivery(fixture.root, 'delivery.txt', 'evidence workspace\n');
+  await repository.initializeGoal(fixture.root, goalV1(), fixture);
+  await repository.lockInitialGoal(fixture.root, 'APPROVE GOAL GL-ALPHA VERSION 1 87f66f9c59ab', fixture);
+  await repository.revisePlan(fixture.root, planCandidate(), 'aligned', fixture);
+  const expected = await workspaceFingerprint(fixture.root, undefined, fixture);
+  await repository.recordGoalEvent(fixture.root, evidenceInput(), fixture);
+  const record = parseCanonicalJson(
+    await readFile(join(fixture.root, '.goal-lock', 'evidence', 'AC-001', 'EVID-0001.json')),
+    'derived evidence',
+  );
+  assert.equal(record.workspace_fingerprint, expected);
+
+  await repository.recordGoalEvent(fixture.root, progressInput('Started task one', { event_type: 'task-start' }), fixture);
+  await repository.recordGoalEvent(fixture.root, progressInput('Completed task one', {
+    event_type: 'task-complete',
+    evidence_refs: ['EVID-0001'],
+  }), fixture);
+  await repository.recordGoalEvent(fixture.root, evidenceInput({
+    task_id: 'TASK-0002',
     supersedes: 'EVID-0001',
   }), fixture);
   await repository.recordGoalEvent(fixture.root, progressInput('Started task two', {
@@ -4396,16 +4775,35 @@ async function createCompletionFixture(testContext, { git: withGit = true, evide
     task_id: 'TASK-0002',
     evidence_refs: ['EVID-0002'],
   }), fixture);
-  const inventory = withGit ? undefined : ['delivery.txt'];
-  if (audit) {
-    await repository.recordGoalEvent(fixture.root, {
-      kind: 'final-audit',
-      semantic_summary: 'Reviewed the final semantic diff against the locked goal.',
-      inventory,
-    }, fixture);
-  }
-  return { fixture, repository, inventory };
-}
+  await writeDelivery(fixture.root, 'delivery.txt', 'changed after passing evidence\n');
+  await repository.recordGoalEvent(fixture.root, {
+    kind: 'final-audit',
+    semantic_summary: 'Reviewed changed delivery bytes.',
+    inventory: undefined,
+  }, fixture);
+
+  const gate = await repository.gateGoalCompletion(fixture.root, undefined, fixture);
+  assert.equal(gate.state, 'BLOCKED');
+  assert.equal(gate.checklist.find((item) => item.condition === 'evidence').passed, false);
+});
+
+test('plan creation rejects nonempty tasks that leave a measurable goal criterion uncovered', async (testContext) => {
+  const fixture = createGoalLockFixture(testContext);
+  const repository = await goalRepository();
+  const goal = goalV1();
+  goal.acceptance_criteria.push({
+    id: 'AC-002',
+    outcome: 'Second measurable outcome',
+    verification: 'Run the second check',
+  });
+  await repository.initializeGoal(fixture.root, goal, fixture);
+  await repository.lockInitialGoal(fixture.root, approvalPhraseForGoal(goal), fixture);
+
+  await assert.rejects(
+    repository.revisePlan(fixture.root, planCandidate(), 'aligned', fixture),
+    /cover every acceptance criterion/i,
+  );
+});
 
 test('final audit computes its own fingerprint and rejects caller-supplied trusted fingerprint fields', async (testContext) => {
   const completed = await createCompletionFixture(testContext, { audit: false });
@@ -4491,7 +4889,7 @@ test('completion gate passes only current audited Git and explicit-inventory wor
   }
 });
 
-test('completion gate invalidates a prior final audit after a workspace change until a new audit is recorded', async (testContext) => {
+test('completion gate invalidates audit and evidence after workspace drift until both are refreshed', async (testContext) => {
   const { fixture, repository } = await createCompletionFixture(testContext);
   assert.equal((await repository.gateGoalCompletion(fixture.root, undefined, fixture)).state, 'COMPLETE');
   await writeDelivery(fixture.root, 'delivery.txt', 'changed after audit\n');
@@ -4501,6 +4899,18 @@ test('completion gate invalidates a prior final audit after a workspace change u
   await repository.recordGoalEvent(fixture.root, {
     kind: 'final-audit',
     semantic_summary: 'Reviewed the changed final semantic diff.',
+    inventory: undefined,
+  }, fixture);
+  const auditedOnly = await repository.gateGoalCompletion(fixture.root, undefined, fixture);
+  assert.equal(auditedOnly.state, 'BLOCKED');
+  assert.equal(auditedOnly.checklist.find((item) => item.condition === 'evidence').passed, false);
+  await repository.recordGoalEvent(fixture.root, evidenceInput({
+    task_id: 'TASK-0002',
+    supersedes: 'EVID-0002',
+  }), fixture);
+  await repository.recordGoalEvent(fixture.root, {
+    kind: 'final-audit',
+    semantic_summary: 'Re-audited the refreshed current evidence.',
     inventory: undefined,
   }, fixture);
   assert.equal((await repository.gateGoalCompletion(fixture.root, undefined, fixture)).state, 'COMPLETE');
@@ -4607,7 +5017,7 @@ test('completion gate blocks every non-complete task status plus missing and old
   const missingPlan = createGoalLockFixture(testContext);
   const repository = await goalRepository();
   await repository.initializeGoal(missingPlan.root, goalV1(), missingPlan);
-  await repository.lockInitialGoal(missingPlan.root, 'APPROVE GOAL GL-ALPHA VERSION 1 92d74f6bf766', missingPlan);
+  await repository.lockInitialGoal(missingPlan.root, 'APPROVE GOAL GL-ALPHA VERSION 1 87f66f9c59ab', missingPlan);
   const noPlan = await repository.gateGoalCompletion(missingPlan.root, undefined, missingPlan);
   assert.equal(noPlan.checklist.find((item) => item.condition === 'plan').passed, false);
 
