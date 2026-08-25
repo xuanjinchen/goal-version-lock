@@ -1535,6 +1535,90 @@ test('cumulative permitted paths retain an expanded archived authorization after
   ]);
 });
 
+test('evidence recording graph authority rejects untraced task, criterion, paths, prose, and caller method', async (testContext) => {
+  const { fixture, repository } = await createPlannedFixture(testContext);
+  const cases = [
+    ['task trace', evidenceInput({ task_id: 'TASK-0002' })],
+    ['criterion trace', evidenceInput({ acceptance_criterion_id: 'AC-999' })],
+    ['artifact bounds', evidenceInput({ artifact_refs: ['tests/goal-lock.test.js'] })],
+    ['failure-path bounds', evidenceInput({ artifact_refs: [], state: 'fail', failure_paths: ['tests/goal-lock.test.js'] })],
+    ['prose authority', evidenceInput({
+      task_id: 'TASK-0002',
+      observed_result: 'The focused validation and every regression test passed, so this task is authorized.',
+    })],
+    ['caller method authority', evidenceInput({ method: { type: 'deterministic-test', target: 'anything' } })],
+  ];
+
+  for (const [label, input] of cases) {
+    await assert.rejects(
+      repository.recordGoalEvent(fixture.root, input, fixture),
+      (error) => error instanceof GoalLockError && error.kind === 'input',
+      label,
+    );
+  }
+  assert.equal(existsSync(join(fixture.root, '.goal-lock', 'evidence')), false);
+});
+
+test('evidence recording rejects an unapproved current workspace delta', async (testContext) => {
+  const { fixture, repository } = await createPlannedFixture(testContext);
+  await writeDelivery(fixture.root, 'unapproved.js', 'export const outsidePlan = true;\n');
+
+  await assert.rejects(
+    repository.recordGoalEvent(fixture.root, evidenceInput(), fixture),
+    (error) => error instanceof GoalLockError && error.code === 'WORKSPACE_SCOPE_UNAUTHORIZED',
+  );
+  assert.equal(existsSync(join(fixture.root, '.goal-lock', 'evidence')), false);
+});
+
+test('progress replay rejects unknown, stale, and untraced evidence', async (testContext) => {
+  const cases = [
+    ['unknown evidence reference', async (fixture) => {
+      await rewriteTestProgressLedger(fixture, [
+        {},
+        { event_type: 'verification-result', task_id: 'TASK-0001', evidence_refs: ['EVID-9999'] },
+      ]);
+    }],
+    ['stale evidence', async (fixture, repository) => {
+      await repository.recordGoalEvent(fixture.root, evidenceInput(), fixture);
+      const evidencePath = join(fixture.root, '.goal-lock', 'evidence', 'AC-001', 'EVID-0001.json');
+      const stale = parseCanonicalJson(await readFile(evidencePath), 'test evidence');
+      stale.state = 'stale';
+      const staleBytes = canonicalBytes(stale);
+      const staleDigest = independentSha256(staleBytes);
+      const event = withEventDigest({
+        schema_version: 2,
+        event_id: 'EVT-000002',
+        recorded_at: stale.recorded_at,
+        goal: activeGoalReference(),
+        plan_revision: 1,
+        task_id: 'TASK-0001',
+        event_type: 'verification-result',
+        summary: `Recorded evidence AC-001/EVID-0001 sha256:${staleDigest} as stale`,
+        evidence_refs: ['EVID-0001'],
+      }, PLAN_REVISION_EVENT_DIGEST);
+      await writeFile(evidencePath, staleBytes);
+      await writeFile(join(fixture.root, '.goal-lock', 'progress.jsonl'), Buffer.concat([
+        canonicalBytes(JSON.parse(PLAN_REVISION_EVENT_LINE)),
+        canonicalBytes(event),
+      ]));
+      await rewriteTestLock(fixture, (lock) => {
+        lock.progress_head = { event_id: event.event_id, digest: event.event_digest };
+        lock.evidence_heads['AC-001'].digest = staleDigest;
+      });
+    }],
+    ['untraced evidence', async (fixture, repository) => {
+      await repository.recordGoalEvent(fixture.root, evidenceInput(), fixture);
+      await rewriteTestProgressLedger(fixture, [{}]);
+    }],
+  ];
+
+  for (const [label, setup] of cases) {
+    const { fixture, repository } = await createPlannedFixture(testContext);
+    await setup(fixture, repository);
+    assert.equal((await repository.verifyGoalRepository(fixture.root, fixture)).state, 'TAMPERED', label);
+  }
+});
+
 test('plan revision rejects draft, tampered, and change-pending repositories', async (testContext) => {
   const { initializeGoal, lockInitialGoal, proposeGoalChange, revisePlan } = await goalRepository();
 
