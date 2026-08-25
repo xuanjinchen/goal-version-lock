@@ -188,6 +188,15 @@ test('admits evidence only through its exact bounded validation', () => {
 
   assert.equal(admitted.evidence_id, 'EVID-0002');
   assert.equal(admitted.validation_ref.plan_revision, 2);
+  const replayed = assertEvidenceAuthorized(buildAuthorizationGraph(history()), evidence({
+    evidence_id: 'EVID-0003',
+    validation_ref: validationRef(2, 'VAL-0003'),
+    observed_result: 'The final full gate passed',
+    state: 'pass',
+    failure_paths: [],
+    recorded_at: '2026-08-25T03:00:00.000Z',
+  }), { mode: 'replay' });
+  assert.equal(replayed.evidence_id, 'EVID-0003');
 });
 
 test('fails closed for untraced graph and evidence mutations', () => {
@@ -289,6 +298,20 @@ test('fails closed for untraced graph and evidence mutations', () => {
       }), { mode: 'write' });
     },
     want: 'Mandatory validation GL-AUTH/1/2/VAL-0003 already has an accepted result',
+  }, {
+    name: 'mandatory gate replay same-ID mutation',
+    run() {
+      const graph = buildAuthorizationGraph(history());
+      return () => assertEvidenceAuthorized(graph, evidence({
+        evidence_id: 'EVID-0003',
+        validation_ref: validationRef(2, 'VAL-0003'),
+        observed_result: 'The accepted replay bytes were changed under the same ID',
+        state: 'pass',
+        failure_paths: [],
+        recorded_at: '2026-08-25T03:00:00.000Z',
+      }), { mode: 'replay' });
+    },
+    want: 'Mandatory validation GL-AUTH/1/2/VAL-0003 does not match its accepted result',
   }, {
     name: 'malformed replay cutoff',
     run() {
