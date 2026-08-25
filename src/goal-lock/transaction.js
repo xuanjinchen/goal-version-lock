@@ -1,12 +1,17 @@
 import { randomUUID } from 'node:crypto';
-import { link, lstat, mkdir, open, realpath, rmdir, unlink } from 'node:fs/promises';
+import { link, lstat, mkdir, open, realpath, rename, rmdir, unlink } from 'node:fs/promises';
 import path from 'node:path';
 
 import { canonicalBytes, parseCanonicalJson, sha256 } from './canonical.js';
 import { GoalLockError } from './contracts.js';
 
 const LOCK_PROTOCOL = 'goal-version-lock-write-v1';
+const TRANSACTION_PROTOCOL = 'goal-version-lock-transaction-v1';
+const TRANSACTION_FILE = '.transaction.json';
+const AUTO_LOCKED_TRANSACTION = Symbol('auto-locked transaction');
+const LOCK_CAPABILITY = Symbol('goal-version-lock capability');
 const SHA256_PATTERN = /^[a-f0-9]{64}$/;
+const TRANSACTION_ID_PATTERN = /^[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*$/;
 
 function lockIntegrity(message, options = {}) {
   return new GoalLockError('LOCK_OWNERSHIP', 'integrity', 4, message, options);
@@ -55,6 +60,7 @@ function resolveGoalTarget(root, target) {
   }
   // 保留名在任意层级都代表内部所有权状态，不能借“作为目录”绕过末段检查。
   const hasInternalSegment = segments.slice(1).some((segment) => segment === '.write-lock.json'
+    || segment === TRANSACTION_FILE
     || segment.endsWith('.stage')
     || segment.endsWith('.backup')
     || segment.endsWith('.detached'));
@@ -67,6 +73,230 @@ function resolveGoalTarget(root, target) {
     throw pathIntegrity('Transaction target escaped the repository root.');
   }
   return absolute;
+}
+
+function relativeTransactionPath(root, target) {
+  return path.relative(root, target).split(path.sep).join('/');
+}
+
+function transactionArtifactPath(root, entry, transactionId, index, suffix) {
+  return path.join(
+    path.dirname(entry.absolute),
+    `.${path.basename(entry.absolute)}.${transactionId}.${index}.${suffix}`,
+  );
+}
+
+function assertTransactionId(transactionId) {
+  if (typeof transactionId !== 'string' || !TRANSACTION_ID_PATTERN.test(transactionId)) {
+    throw transactionIntegrity('Transaction IDs must use only alphanumeric tokens separated by single hyphens.');
+  }
+}
+
+function journalEntryFor(root, entry) {
+  return {
+    target: entry.target,
+    original: entry.original === null
+      ? { kind: 'absent' }
+      : { kind: 'sha256', digest: entry.original.digest },
+    intended: entry.content === null
+      ? { kind: 'absent' }
+      : { kind: 'sha256', digest: sha256(entry.content) },
+    stage: entry.stage ? relativeTransactionPath(root, entry.stage) : null,
+    backup: entry.backup ? relativeTransactionPath(root, entry.backup) : null,
+  };
+}
+
+async function writeDurableFile(target, bytes) {
+  const handle = await open(target, 'wx', 0o600);
+  try {
+    await handle.writeFile(bytes);
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
+
+async function installJournal(goalLockDirectory, journal, replace = false, context = {}) {
+  const target = path.join(goalLockDirectory, TRANSACTION_FILE);
+  const stage = path.join(goalLockDirectory, `.${TRANSACTION_FILE}.${journal.transaction_id}.${journal.state}.stage`);
+  await writeDurableFile(stage, canonicalBytes(journal));
+  try {
+    if (!replace && await optionalLstat(target)) {
+      throw transactionIntegrity('A durable transaction journal already exists.');
+    }
+    await rename(stage, target);
+    await invokeFault(context, replace ? 'afterJournalStateReplace' : 'afterJournalPreparedInstall', {
+      journal: target,
+      state: journal.state,
+    });
+  } catch (error) {
+    await unlink(stage).catch(() => {});
+    throw error;
+  }
+  return target;
+}
+
+async function validateJournalObject(value, root, owner, journalDigest) {
+  const fields = ['protocol', 'transaction_id', 'state', 'owner_token', 'lock_digest', 'entries'];
+  if (value === null
+    || typeof value !== 'object'
+    || Array.isArray(value)
+    || Object.keys(value).length !== fields.length
+    || fields.some((field) => !Object.hasOwn(value, field))
+    || value.protocol !== TRANSACTION_PROTOCOL
+    || typeof value.transaction_id !== 'string'
+    || !TRANSACTION_ID_PATTERN.test(value.transaction_id)
+    || !['prepared', 'committed'].includes(value.state)
+    || value.owner_token !== owner.token
+    || value.lock_digest !== owner.transaction?.lock_digest
+    || !Array.isArray(value.entries)
+    || value.entries.length === 0
+    || owner.transaction?.transaction_id !== value.transaction_id
+    || owner.transaction?.lock_digest !== value.lock_digest
+    || owner.transaction?.[`${value.state}_digest`] !== journalDigest) {
+    throw transactionIntegrity('Durable transaction journal is malformed or belongs to another writer.');
+  }
+  const seenTargets = new Set();
+  const entries = [];
+  for (const [index, entry] of value.entries.entries()) {
+    const entryFields = ['target', 'original', 'intended', 'stage', 'backup'];
+    if (entry === null
+      || typeof entry !== 'object'
+      || Array.isArray(entry)
+      || Object.keys(entry).length !== entryFields.length
+      || entryFields.some((field) => !Object.hasOwn(entry, field))) {
+      throw transactionIntegrity('Durable transaction journal entry is malformed.');
+    }
+    validateExpected(entry.original);
+    validateExpected(entry.intended);
+    const absolute = resolveGoalTarget(root, entry.target);
+    const targetKey = comparablePath(absolute);
+    if (seenTargets.has(targetKey)) {
+      throw transactionIntegrity(`Durable transaction journal repeats target: ${entry.target}`);
+    }
+    seenTargets.add(targetKey);
+    await assertSafeAncestors(root, absolute);
+    const expectedStage = entry.intended.kind === 'sha256'
+      ? transactionArtifactPath(root, { absolute }, value.transaction_id, index, 'stage')
+      : null;
+    const expectedBackup = entry.original.kind === 'sha256'
+      ? transactionArtifactPath(root, { absolute }, value.transaction_id, index, 'backup')
+      : null;
+    const stage = entry.stage === null ? null : path.resolve(root, ...entry.stage.split('/'));
+    const backup = entry.backup === null ? null : path.resolve(root, ...entry.backup.split('/'));
+    if ((expectedStage === null ? stage !== null : comparablePath(stage) !== comparablePath(expectedStage))
+      || (expectedBackup === null ? backup !== null : comparablePath(backup) !== comparablePath(expectedBackup))) {
+      throw transactionIntegrity('Durable transaction journal artifact paths do not match their target.');
+    }
+    // 目标与每个派生工件都独立验证祖先，避免有效目标借工件路径绕过链接检查。
+    if (stage) await assertSafeAncestors(root, stage);
+    if (backup) await assertSafeAncestors(root, backup);
+    entries.push({ ...entry, absolute, stage, backup });
+  }
+  return { ...value, entries };
+}
+
+async function readDurableJournal(root, goalLockDirectory, owner) {
+  const target = path.join(goalLockDirectory, TRANSACTION_FILE);
+  const input = await optionalTransactionFile(target, 'Durable transaction journal');
+  if (!input) return null;
+  let value;
+  try {
+    value = parseCanonicalJson(input.bytes, 'durable transaction journal');
+  } catch (error) {
+    throw transactionIntegrity('Durable transaction journal is malformed.', { cause: error });
+  }
+  return { target, input, value: await validateJournalObject(value, root, owner, input.digest) };
+}
+
+async function removeOwnedArtifact(target, expectedDigest, label) {
+  if (target === null) return;
+  const actual = await optionalTransactionFile(target, label);
+  if (!actual) return;
+  if (actual.digest !== expectedDigest) throw transactionIntegrity(`${label} digest changed.`);
+  await unlink(target);
+}
+
+async function rollbackDurableJournal(journal, context = {}) {
+  for (const [reverseIndex, entry] of journal.value.entries.toReversed().entries()) {
+    const index = journal.value.entries.length - 1 - reverseIndex;
+    await invokeFault(context, 'rollback', { index, target: entry.target });
+    const target = await optionalTransactionFile(entry.absolute, 'Transaction recovery target');
+    let backup = null;
+    if (entry.original.kind === 'sha256') {
+      backup = await optionalTransactionFile(entry.backup, 'Transaction recovery backup');
+      if (!target || entry.intended.kind === 'sha256' && target.digest === entry.intended.digest) {
+        if (!backup || backup.digest !== entry.original.digest) {
+          throw transactionIntegrity(`Transaction recovery backup is missing or changed: ${entry.target}`);
+        }
+        // rename 将旧 inode 原子放回权威名称，恢复过程中不会再次暴露缺失目标窗口。
+        await rename(entry.backup, entry.absolute);
+        await invokeFault(context, 'afterRollbackRestore', { index, target: entry.target });
+      } else if (target.digest === entry.original.digest) {
+        if (backup) {
+          if (backup.digest !== entry.original.digest) {
+            throw transactionIntegrity(`Transaction recovery backup is changed: ${entry.target}`);
+          }
+          await unlink(entry.backup);
+          await invokeFault(context, 'afterRollbackBackupRemove', { index, target: entry.target });
+        }
+      } else {
+        throw transactionIntegrity(`Transaction recovery refused to overwrite an unknown target: ${entry.target}`);
+      }
+      const restored = await readTransactionFile(entry.absolute, 'Restored transaction target');
+      if (restored.digest !== entry.original.digest) {
+        throw transactionIntegrity(`Transaction recovery restore verification failed: ${entry.target}`);
+      }
+    } else if (target) {
+      if (entry.intended.kind !== 'sha256' || target.digest !== entry.intended.digest) {
+        throw transactionIntegrity(`Transaction recovery refused to remove an unknown target: ${entry.target}`);
+      }
+      await unlink(entry.absolute);
+      await invokeFault(context, 'afterRollbackTargetRemove', { index, target: entry.target });
+    }
+    if (entry.stage) {
+      const stage = await optionalTransactionFile(entry.stage, 'Transaction recovery stage');
+      if (stage) {
+        const currentTarget = await optionalTransactionFile(entry.absolute, 'Transaction recovery target');
+        const remainingBackup = entry.backup
+          ? await optionalTransactionFile(entry.backup, 'Transaction recovery backup')
+          : null;
+        const targetIsOriginal = entry.original.kind === 'sha256'
+          ? currentTarget?.digest === entry.original.digest && !remainingBackup
+          : currentTarget === null;
+        // 已绑定 journal 而尚未写入的独占空 stage 没有业务字节；只在权威目标仍是原态时允许清理。
+        if (stage.digest !== entry.intended.digest && !(stage.snapshot.size === 0n && targetIsOriginal)) {
+          throw transactionIntegrity('Transaction recovery stage digest changed.');
+        }
+        await unlink(entry.stage);
+        await invokeFault(context, 'afterRollbackStageRemove', { index, target: entry.target });
+      }
+    }
+  }
+  await unlink(journal.target);
+  await invokeFault(context, 'afterRollbackJournalRemove', { journal: journal.target });
+}
+
+async function finishCommittedJournal(journal, context = {}) {
+  for (const entry of journal.value.entries) {
+    const target = await optionalTransactionFile(entry.absolute, 'Committed recovery target');
+    if (entry.intended.kind === 'absent' ? target !== null : !target || target.digest !== entry.intended.digest) {
+      throw transactionIntegrity(`Committed transaction target does not match the journal: ${entry.target}`);
+    }
+  }
+  for (const [reverseIndex, entry] of journal.value.entries.toReversed().entries()) {
+    const index = journal.value.entries.length - 1 - reverseIndex;
+    if (entry.backup && await optionalTransactionFile(entry.backup, 'Committed transaction backup')) {
+      await removeOwnedArtifact(entry.backup, entry.original.digest, 'Committed transaction backup');
+      await invokeFault(context, 'afterCommittedBackupRemove', { index, target: entry.target });
+    }
+    if (entry.stage && await optionalTransactionFile(entry.stage, 'Committed transaction stage')) {
+      await removeOwnedArtifact(entry.stage, entry.intended.digest, 'Committed transaction stage');
+      await invokeFault(context, 'afterCommittedStageRemove', { index, target: entry.target });
+    }
+  }
+  await unlink(journal.target);
+  await invokeFault(context, 'afterCommittedJournalRemove', { journal: journal.target });
 }
 
 async function optionalLstat(target) {
@@ -320,6 +550,17 @@ export async function recoverGoalLock(root, proof, context = {}) {
     throw recoveryIntegrity('RECOVERY_PROCESS_ACTIVE', 'Lock owner process is active or cannot be proven dead.');
   }
 
+  const journal = await readDurableJournal(canonicalRoot, goalLockDirectory, {
+    token: owner.token,
+    digest: initial.digest,
+    transaction: owner.transaction,
+  });
+  if (journal) {
+    // stale-lock 恢复必须先收敛事务，再移除写锁；反向顺序会把部分安装状态暴露成可接受仓库。
+    if (journal.value.state === 'prepared') await rollbackDurableJournal(journal, context);
+    else await finishCommittedJournal(journal, context);
+  }
+
   await invokeFault(context, 'beforeRecoveryDetach', { lockPath });
   const recoveryPath = path.join(goalLockDirectory, `.write-lock.json.${(context.randomToken ?? randomUUID)()}.recovery.backup`);
   await link(lockPath, recoveryPath);
@@ -385,6 +626,25 @@ export async function commitGoalFiles(root, entries, context = {}) {
   if (!Array.isArray(entries)) {
     throw new GoalLockError('INVALID_TRANSACTION', 'input', 2, 'Transaction entries must be an array.');
   }
+  if (context[AUTO_LOCKED_TRANSACTION] !== true && !context[LOCK_CAPABILITY]) {
+    const goalLockDirectory = path.join(canonicalRoot, '.goal-lock');
+    const directoryWasAbsent = !(await optionalLstat(goalLockDirectory));
+    try {
+      return await withGoalLock(canonicalRoot, 'transaction', (ownership) => commitGoalFiles(canonicalRoot, entries, {
+        ...context,
+        [AUTO_LOCKED_TRANSACTION]: true,
+        ...ownership,
+      }), context);
+    } finally {
+      if (directoryWasAbsent) await rmdir(goalLockDirectory).catch((error) => {
+        if (!['ENOENT', 'ENOTEMPTY', 'EEXIST'].includes(error?.code)) throw error;
+      });
+    }
+  }
+
+  const goalLockDirectory = path.join(canonicalRoot, '.goal-lock');
+  const lockPath = path.join(goalLockDirectory, '.write-lock.json');
+  const lock = await requireLockCapability(lockPath, context);
 
   const prepared = [];
   const seenTargets = new Set();
@@ -427,15 +687,59 @@ export async function commitGoalFiles(root, entries, context = {}) {
   }
 
   const transactionId = (context.randomToken ?? randomUUID)();
+  assertTransactionId(transactionId);
   const createdDirectories = [];
+  const mutable = prepared.filter((entry) => !entry.readOnly);
+  let journal = null;
+  let journalBinding = null;
   try {
-    for (const [index, entry] of prepared.entries()) {
-      if (entry.content === null || entry.readOnly) continue;
+    for (const [transactionIndex, entry] of mutable.entries()) {
+      entry.transactionIndex = transactionIndex;
+      if (entry.content !== null) {
+        entry.stage = transactionArtifactPath(canonicalRoot, entry, transactionId, transactionIndex, 'stage');
+      }
+      if (entry.original) {
+        entry.backup = transactionArtifactPath(canonicalRoot, entry, transactionId, transactionIndex, 'backup');
+      }
+    }
+
+    if (mutable.length > 0) {
+      const journalValue = {
+        protocol: TRANSACTION_PROTOCOL,
+        transaction_id: transactionId,
+        state: 'prepared',
+        owner_token: lock.owner.token,
+        // 该摘要固定写入者最初持有的锁；绑定记录再把两个精确 journal 字节摘要固定到当前锁。
+        lock_digest: lock.input.digest,
+        entries: mutable.map((entry) => journalEntryFor(canonicalRoot, entry)),
+      };
+      const committedValue = { ...journalValue, state: 'committed' };
+      const transaction = {
+        transaction_id: transactionId,
+        lock_digest: lock.input.digest,
+        prepared_digest: sha256(canonicalBytes(journalValue)),
+        committed_digest: sha256(canonicalBytes(committedValue)),
+      };
+      const bound = await replaceOwnedLock(lockPath, lock.expected, lock.owner, transaction, context);
+      lock.input = bound.input;
+      lock.owner = bound.owner;
+      journalBinding = transaction;
+      const target = await installJournal(goalLockDirectory, journalValue, false, context);
+      journal = {
+        target,
+        raw: journalValue,
+        value: await validateJournalObject(journalValue, canonicalRoot, lock.owner, transaction.prepared_digest),
+      };
+    }
+
+    for (const entry of mutable) {
+      const index = prepared.indexOf(entry);
+      if (entry.content === null) continue;
       await ensureParentDirectories(canonicalRoot, entry.absolute, createdDirectories);
-      entry.stage = path.join(path.dirname(entry.absolute), `.${path.basename(entry.absolute)}.${transactionId}.${index}.stage`);
       const handle = await open(entry.stage, 'wx', 0o600);
       try {
         entry.stageIdentity = await handle.stat({ bigint: true });
+        await invokeFault(context, 'afterStageCreate', { index, target: entry.target, stage: entry.stage });
         await invokeFault(context, 'stageWrite', { index, target: entry.target, stage: entry.stage });
         await handle.writeFile(entry.content);
         await handle.sync();
@@ -449,11 +753,11 @@ export async function commitGoalFiles(root, entries, context = {}) {
       }
     }
 
-    for (const [index, entry] of prepared.entries()) {
-      if (entry.readOnly) continue;
+    for (const entry of mutable) {
+      const index = prepared.indexOf(entry);
       if (entry.original) {
-        entry.backup = path.join(path.dirname(entry.absolute), `.${path.basename(entry.absolute)}.${transactionId}.${index}.backup`);
         await link(entry.absolute, entry.backup);
+        await invokeFault(context, 'afterBackupCreate', { index, target: entry.target, backup: entry.backup });
         const backedUp = await readTransactionFile(entry.backup, 'Transaction backup');
         const current = await readTransactionFile(entry.absolute, 'Transaction target');
         if (!sameIdentity(backedUp.snapshot, entry.original.snapshot)
@@ -462,22 +766,29 @@ export async function commitGoalFiles(root, entries, context = {}) {
           || current.digest !== entry.original.digest) {
           throw transactionIntegrity(`Transaction target ownership changed before detach: ${entry.target}`);
         }
+      }
+    }
+
+    for (const entry of mutable) {
+      const index = prepared.indexOf(entry);
+      if (entry.original) {
         await invokeFault(context, 'detach', { index, target: entry.target, backup: entry.backup });
-        // 备份硬链接先固定原始 inode，再删除目标名；不协作写入者仍可能制造标准库无法封闭的最后竞态。
-        await unlink(entry.absolute);
-        entry.detached = true;
       }
       if (entry.content !== null) {
         await invokeFault(context, 'install', { index, target: entry.target, stage: entry.stage });
-        await link(entry.stage, entry.absolute);
+        // 同文件系统 rename 是权威名称的唯一替换边界；原目标在任何可观察时刻都有旧或新 inode。
+        await rename(entry.stage, entry.absolute);
         entry.installed = true;
         await invokeFault(context, 'readBack', { index, target: entry.target });
         const installed = await readTransactionFile(entry.absolute, 'Installed transaction target');
         if (!sameIdentity(installed.snapshot, entry.staged.snapshot) || installed.digest !== entry.staged.digest) {
           throw transactionIntegrity(`Transaction install verification failed: ${entry.target}`);
         }
-        await unlink(entry.stage);
-        entry.stage = null;
+      } else {
+        await invokeFault(context, 'install', { index, target: entry.target, stage: null });
+        await unlink(entry.absolute);
+        entry.installed = true;
+        await invokeFault(context, 'readBack', { index, target: entry.target });
       }
     }
 
@@ -491,9 +802,50 @@ export async function commitGoalFiles(root, entries, context = {}) {
         throw transactionIntegrity(`Final transaction verification failed: ${entry.target}`);
       }
     }
+    if (journal) {
+      const committedValue = { ...journal.raw, state: 'committed' };
+      await installJournal(goalLockDirectory, committedValue, true, context);
+      journal = {
+        target: journal.target,
+        raw: committedValue,
+        value: await validateJournalObject(committedValue, canonicalRoot, lock.owner, journalBinding.committed_digest),
+      };
+      await finishCommittedJournal(journal, context);
+      journal = null;
+      const unbound = await replaceOwnedLock(lockPath, lock.expected, lock.owner, null, context);
+      lock.input = unbound.input;
+      lock.owner = unbound.owner;
+      journalBinding = null;
+    }
   } catch (originalError) {
-    const rollbackFailures = await rollbackEntries(prepared, context);
-    const artifactFailures = await cleanupPreparedArtifacts(prepared);
+    const rollbackFailures = [];
+    if (journal) {
+      try {
+        const durable = await readDurableJournal(canonicalRoot, goalLockDirectory, {
+          token: lock.owner.token,
+          digest: lock.input.digest,
+          transaction: lock.owner.transaction,
+        });
+        if (!durable || durable.value.state !== 'prepared') {
+          throw transactionIntegrity('Prepared transaction journal disappeared during rollback.');
+        }
+        await rollbackDurableJournal(durable, context);
+        journal = null;
+      } catch (error) {
+        rollbackFailures.push(error);
+      }
+    }
+    if (journal === null && journalBinding !== null) {
+      try {
+        const unbound = await replaceOwnedLock(lockPath, lock.expected, lock.owner, null, context);
+        lock.input = unbound.input;
+        lock.owner = unbound.owner;
+        journalBinding = null;
+      } catch (error) {
+        rollbackFailures.push(error);
+      }
+    }
+    const artifactFailures = journal === null ? [] : await cleanupPreparedArtifacts(prepared);
     const directoryFailures = await cleanupCreatedDirectories(createdDirectories);
     const failures = [...rollbackFailures, ...artifactFailures, ...directoryFailures];
     if (failures.length > 0) {
@@ -501,10 +853,7 @@ export async function commitGoalFiles(root, entries, context = {}) {
     }
     throw originalError;
   }
-
-  // 备份保留到所有目标完成最终复核，确保较晚目标失败时仍可恢复较早目标。
-  const backupFailures = await cleanupBackups(prepared);
-  return { warnings: backupFailures.map((error) => `Transaction cleanup retained recovery evidence: ${error.message}`) };
+  return { warnings: [] };
 }
 
 function sameIdentity(left, right) {
@@ -571,7 +920,8 @@ function parseOwner(actual) {
   } catch (error) {
     throw lockIntegrity('Cooperative lock bytes are malformed or noncanonical.', { cause: error });
   }
-  const fields = ['protocol', 'token', 'pid', 'command', 'created_at'];
+  const baseFields = ['protocol', 'token', 'pid', 'command', 'created_at'];
+  const fields = owner?.transaction === undefined ? baseFields : [...baseFields, 'transaction'];
   if (owner === null
     || typeof owner !== 'object'
     || Array.isArray(owner)
@@ -585,10 +935,72 @@ function parseOwner(actual) {
     || typeof owner.command !== 'string'
     || owner.command.length === 0
     || owner.command.trim() !== owner.command
-    || !isUtcTimestamp(owner.created_at)) {
+    || !isUtcTimestamp(owner.created_at)
+    || (owner.transaction !== undefined && (owner.transaction === null
+      || typeof owner.transaction !== 'object'
+      || Array.isArray(owner.transaction)
+      || Object.keys(owner.transaction).length !== 4
+      || !Object.hasOwn(owner.transaction, 'transaction_id')
+      || !Object.hasOwn(owner.transaction, 'lock_digest')
+      || !Object.hasOwn(owner.transaction, 'prepared_digest')
+      || !Object.hasOwn(owner.transaction, 'committed_digest')
+      || !TRANSACTION_ID_PATTERN.test(owner.transaction.transaction_id)
+      || !SHA256_PATTERN.test(owner.transaction.lock_digest)
+      || !SHA256_PATTERN.test(owner.transaction.prepared_digest)
+      || !SHA256_PATTERN.test(owner.transaction.committed_digest)))) {
     throw lockIntegrity('Cooperative lock owner record does not match the protocol.');
   }
   return owner;
+}
+
+function lockCapabilityFor(expected) {
+  return { [LOCK_CAPABILITY]: expected };
+}
+
+async function requireLockCapability(lockPath, context) {
+  const expected = context?.[LOCK_CAPABILITY];
+  if (!expected || typeof expected !== 'object') {
+    throw lockIntegrity('Transaction writes require the non-forgeable capability supplied by withGoalLock.');
+  }
+  const actual = await readRegularFile(lockPath, 'Cooperative lock');
+  assertOwner(actual, expected);
+  return { input: actual, owner: parseOwner(actual), expected };
+}
+
+async function replaceOwnedLock(lockPath, expected, owner, transaction, context) {
+  const nextOwner = transaction === null ? {
+    protocol: owner.protocol,
+    token: owner.token,
+    pid: owner.pid,
+    command: owner.command,
+    created_at: owner.created_at,
+  } : { ...owner, transaction };
+  const bytes = canonicalBytes(nextOwner);
+  const stage = `${lockPath}.${randomUUID()}.binding.stage`;
+  await writeDurableFile(stage, bytes);
+  try {
+    const current = await readRegularFile(lockPath, 'Cooperative lock');
+    assertOwner(current, expected);
+    await rename(stage, lockPath);
+  } catch (error) {
+    await unlink(stage).catch(() => {});
+    throw error;
+  }
+  const input = await readRegularFile(lockPath, 'Bound cooperative lock');
+  const parsed = parseOwner(input);
+  const transactionMatches = transaction === null
+    ? parsed.transaction === undefined
+    : parsed.transaction?.transaction_id === transaction.transaction_id
+      && parsed.transaction.lock_digest === transaction.lock_digest
+      && parsed.transaction.prepared_digest === transaction.prepared_digest
+      && parsed.transaction.committed_digest === transaction.committed_digest;
+  if (parsed.token !== owner.token || !transactionMatches) {
+    throw lockIntegrity('Cooperative lock journal binding changed during replacement.');
+  }
+  const nextExpected = { digest: input.digest, snapshot: input.snapshot, token: owner.token };
+  expected.digest = nextExpected.digest;
+  expected.snapshot = nextExpected.snapshot;
+  return { input, owner: parsed, expected };
 }
 
 function assertOwner(actual, expected) {
@@ -694,13 +1106,20 @@ export async function withGoalLock(root, command, operation, context = {}) {
         && currentDirectory.isDirectory()
         && sameIdentity(currentDirectory, createdDirectoryIdentity);
     }
-    result = await operation({ goalLockDirectoryCreated, goalLockDirectoryIdentity: createdDirectoryIdentity });
+    result = await operation({
+      goalLockDirectoryCreated,
+      goalLockDirectoryIdentity: createdDirectoryIdentity,
+      ...lockCapabilityFor(lockExpected),
+    });
   } catch (error) {
     operationError = error;
   }
 
   let releaseError;
   try {
+    if (await optionalLstat(path.join(goalLockDirectory, TRANSACTION_FILE))) {
+      throw lockIntegrity('Cooperative lock cannot be released while durable transaction recovery is pending.');
+    }
     const actual = await readRegularFile(lockPath, 'Cooperative lock');
     assertOwner(actual, lockExpected);
     // Node 无条件 unlink 无法消除不协作同用户的最后竞态；协议安全依赖所有写入者共同持有此锁。
