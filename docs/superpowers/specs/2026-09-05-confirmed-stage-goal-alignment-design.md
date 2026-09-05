@@ -1,7 +1,7 @@
 # Confirmed Stage Goal Alignment Design
 
 **Date:** 2026-09-05
-**Status:** Design sections approved; written specification awaiting user review
+**Status:** Approved on 2026-09-06
 **Requirements:** version 3
 **Audience:** implementers and reviewers of `goal-version-lock`
 
@@ -147,7 +147,7 @@ least four digits.
   "candidate": {},
   "changes": [],
   "proposal_digest": "64 lowercase hexadecimal characters",
-  "approval_phrase": "APPROVE GOAL VERSION 1 <proposal_digest>"
+  "approval_phrase": "APPROVE GOAL VERSION 1 followed by the exact proposal digest"
 }
 ```
 
