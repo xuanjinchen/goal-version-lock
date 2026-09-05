@@ -89,3 +89,10 @@ export function parseCanonicalJson(bytes, label = 'document') {
 export function sha256(bytes) {
   return createHash('sha256').update(bytes).digest('hex');
 }
+
+export function shortFingerprint(digest) {
+  if (!/^[a-f0-9]{64}$/.test(digest)) {
+    throw canonicalError('digest must be 64 lowercase hexadecimal characters');
+  }
+  return digest.slice(0, 12);
+}
