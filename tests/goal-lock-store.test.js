@@ -56,6 +56,21 @@ test('detects both valid interrupted approval positions', async (t) => {
   assert.equal(snapshot.active, null);
 });
 
+test('rejects transition whose proposal candidate is not the latest history record', async (t) => {
+  const fixture = await activeFixture(t);
+  const proposal = await installVersionTwoProposal(fixture);
+  await createHistoryRecord(fixture.root, proposal.candidate);
+  const later = createGoalRecord(goalInput({ objective: 'Deliver the reviewed archive export' }), {
+    version: 3,
+    predecessor: { version: 2, digest: proposal.candidate.digest },
+  });
+  await createHistoryRecord(fixture.root, later);
+
+  await assert.rejects(inspectGoalStore(fixture.root), (error) => (
+    error.code === 'INTEGRITY_FAILURE' && error.exitCode === 4
+  ));
+});
+
 test('fails closed for current tamper, missing history, broken predecessor, and stale proposal', async (t) => {
   for (const arrange of [tamperCurrent, removeHistoryVersion, breakPredecessor, staleProposal]) {
     await t.test(arrange.name, async (subtest) => {

@@ -252,7 +252,8 @@ function deriveSnapshot({ current, proposal, history }) {
   if (proposal !== null) {
     const candidateVersion = proposal.proposal.candidate.version;
     const candidateHistory = history[candidateVersion - 1] ?? null;
-    const candidateInstalled = candidateHistory !== null
+    const candidateInstalled = candidateVersion === history.length
+      && candidateHistory === head
       && sameRecordBytes(proposal.proposal.candidate, candidateHistory);
     const predecessor = candidateVersion > 1 ? history[candidateVersion - 2] ?? null : null;
     if (candidateInstalled) {
