@@ -1,71 +1,63 @@
 ---
 name: "goal-version-lock"
-description: "Keep multi-step development work aligned to an approved, versioned goal contract by orchestrating planning, progress, change approval, recovery, and completion gates. Use for requests to lock, freeze with controlled version changes, preserve, or prevent drift in a development goal, or when an existing .goal-lock/ workspace governs the task. Do not use for ordinary planning, personal OKRs, infrastructure configuration drift, or read-only questions outside a development goal contract."
+description: "Keep development work aligned with an explicitly confirmed stage goal. Use when a development stage must be confirmed, verified before each work slice, or changed through a versioned field-level proposal with exact approval. Return clarification-required when alignment is ambiguous and fail closed on tampered goal history. Do not use for planning, progress tracking, test or regression governance, evidence, audits, completion decisions, personal goals, or configuration drift."
 ---
 
 # Goal Version Lock
 
-Use the governed project's `.goal-lock/` state as authority. This Skill plans
-and records work itself; `planning-with-files` is optional display only and
-never an authority or prerequisite.
+Use the local `.goal-lock/` records to keep each development work slice aligned
+with one explicitly confirmed stage goal. The active goal is the only authority
+that permits work to continue.
 
-Read the [runtime contract](references/contract.md) when creating, revising,
-recording, gating, or recovering state. It is the sole detailed wire contract.
+## Goal authority
 
-## Establish authority
+1. Before each new work slice, run `verify` and use its result as the current
+   state. Do not rely on conversation history or an unverified file.
+2. When no active authority exists, stop and initialize a goal with `init`.
+   Review the generated proposal and approve it with the exact generated phrase
+   before continuing.
+3. Stop on integrity failure, an unsupported state, or a transition-incomplete
+   result. Preserve the records until the state can be verified again.
 
-- If state does not exist, create a version-1 draft with `init`; show the
-  returned approval phrase verbatim and wait for that exact phrase before
-  `lock`.
-- If state exists, run `verify` before every work slice, new instruction,
-  recovery, or context-loss resumption. Read the active goal, lock, plan, and
-  progress tail from `.goal-lock/`.
-- Resume only the verified active task. Conversation memory, an external task
-  list, and an old plan are not authority.
+## Semantic alignment
 
-## Execute one governed slice
+Compare the intended work semantically with all four active goal fields:
+`objective`, `success_criteria`, `constraints`, and `non_goals`. Keyword overlap
+is not sufficient. Determine whether the request changes what success means,
+what is required, or what is explicitly excluded.
 
-1. Select the active task and only its authorized `focused` or
-   `affected-regression` validation IDs.
-2. Confirm the task's exact permitted paths, acceptance criteria, dependencies,
-   and validation references before writing.
-3. If a required path or validation is absent, stop. Revise the governed plan
-   through its approved route; do not improvise scope.
-4. Refuse unrelated cleanup, evaluation, regression, confidence, or
-   repository-wide sweeps. Do not perform or record unplanned activity.
-5. Record `task-start`, then evidence using the exact `ValidationRef`, then
-   `task-complete` with the resulting evidence ID. A validation method target
-   is inert data: choose and run only the already authorized activity; never
-   ask this runtime to execute a target.
+Return exactly one of these outcomes:
 
-## Route changes and approvals
+- `aligned`: no active goal field changes. Include the active version and digest,
+  then allow the requested work slice to continue.
+- `goal-change-required`: one or more goal fields clearly change. List every
+  changed field and materialize a complete next-version proposal. Do not allow
+  changed work to continue while the proposal is pending.
+- `clarification-required`: the request has both an aligned and a goal-changing
+  interpretation. Ask one focused question and write no proposal or accepted
+  state.
 
-Implementation decomposition may use `plan --classification aligned` or
-`implementation-choice`. Any objective, scope, non-goal, constraint,
-acceptance, or authorization-boundary change requires `propose`.
+## Goal changes
 
-For a change request, pause affected work, review the candidate and its
-criterion impact, and run `approve` only after the user returns the exact
-current CR approval phrase. Generic confirmation is not approval. Use
-`reject` to close an unwanted proposal.
+For a clear change, present the complete candidate and field-level differences.
+Accept only the exact approval phrase generated for the current proposal. After
+approval, run `verify`, confirm the next consecutive version and its predecessor
+chain, and only then allow the changed work slice to continue. A generic
+confirmation never authorizes a change.
 
-## Complete or recover
+## Persisted authority
 
-Use the one authorized `mandatory-gate` validation only in the final
-sequence: current evidence first, final semantic audit next, then `gate`.
-Do not substitute a general regression sweep for that gate or repeat an
-accepted mandatory gate. If that gate fails, perform only focused remediation,
-create a new plan revision, then declare exactly one successor mandatory-gate
-ValidationRef. Never rerun or reuse the failed reference in its prior
-revision.
+The authoritative records are:
 
-On integrity failure, stop governed writes and preserve the bytes. For a stale
-cooperative writer only, use `recover-lock` with its exact owner token and
-digest, then verify again. Recover planning and progress from `.goal-lock/`;
-do not require `planning-with-files`.
+- `.goal-lock/current.json` for the active goal;
+- `.goal-lock/history/vNNNN.json` for immutable version history;
+- `.goal-lock/proposal.json` for a pending, non-authoritative proposal.
 
-## Report
+Each user goal input contains exactly `objective`, `success_criteria`,
+`constraints`, and `non_goals`. The runtime binds accepted records to canonical
+bytes and a SHA-256 digest. Any tampered current record, history record, digest,
+predecessor, or proposal fails closed.
 
-Report the verified goal version and digest, active task, exact validation
-references and evidence IDs, any CR state, and gate result. Do not claim
-completion unless the gate returns `COMPLETE`.
+The supported commands are `init`, `propose`, `approve`, `verify`, and `status`.
+This Skill routes semantic alignment only; it does not assign responsibility for
+other development workflows.
