@@ -310,6 +310,10 @@ export async function runGoalLockCli(argv, context = {}) {
       throw new CliError('WORKSPACE_ROOT_REQUIRED', 6, 'The governed project root is unavailable.');
     }
     const result = await dispatchCommand(parsed, context);
+    // transition-incomplete 仍然没有执行权；对外沿用 3 号无效转移失败，避免把半完成状态当成功返回。
+    if ((command === 'verify' || command === 'status') && result?.state === 'transition-incomplete') {
+      throw new CliError('INVALID_TRANSITION', 3, 'The goal-lock state transition is incomplete.');
+    }
     context.onExitCode?.(0);
     return { ok: true, command, result };
   } catch (error) {

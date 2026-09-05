@@ -12,6 +12,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
+import { approveGoal, initializeGoal } from '../src/goal-lock/state-machine.js';
 import { formatGoalLockHelp, parseGoalLockArgs } from '../src/goal-lock/cli.js';
 
 const SCRIPT_PATH = fileURLToPath(new URL('../scripts/goal-lock.js', import.meta.url));
@@ -151,6 +152,26 @@ test('real process runs the five-command lifecycle with one-line JSON envelopes'
   assert.deepEqual((await readdir(path.join(root, '.goal-lock'))).sort(), ['current.json', 'history']);
   assert.deepEqual((await readdir(path.join(root, '.goal-lock', 'history'))).sort(), ['v0001.json', 'v0002.json']);
   await assert.rejects(lstat(path.join(root, '.goal-lock', 'proposal.json')));
+});
+
+test('real process rejects verify and status from a transition-incomplete store', async (t) => {
+  const root = await createCliFixture(t);
+  const initialized = await initializeGoal(root, goalInput());
+  await assert.rejects(
+    approveGoal(root, initialized.proposal.approval_phrase, {
+      storeFaults: { afterHistoryCreate() { throw new Error('stop after history'); } },
+    }),
+  );
+
+  for (const command of ['verify', 'status']) {
+    await t.test(command, async () => {
+      const result = await runProcess(root, [command]);
+      const error = parseFailure(result, 3, command);
+      assert.equal(error.code, 'INVALID_TRANSITION');
+      assert.equal(error.message, 'The requested goal-lock state transition was rejected.');
+      assert.doesNotMatch(result.stderr, /transition-incomplete/);
+    });
+  }
 });
 
 test('real process redacts JSON input text, paths, and supplied approval phrases from failures', async (t) => {

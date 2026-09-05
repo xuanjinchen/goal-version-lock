@@ -45,7 +45,7 @@ Requirements version: 3
     {
       "id": "REQ-004",
       "requirement": "Modification of current goal bytes or any missing, invalid, or broken history link must fail closed.",
-      "verification": "Store integrity tests and deterministic tamper cases pass, and EVAL-003 confirms fail-closed handling of altered goal history.",
+      "verification": "Deterministic store/tamper tests prove altered-history fail-closed behavior, while EVAL-003 proves valid predecessor-chain verification.",
       "status": "pass"
     },
     {
