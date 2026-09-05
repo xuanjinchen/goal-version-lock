@@ -63,7 +63,7 @@ Requirements version: 3
     },
     "scripts": {
       "status": "enabled",
-      "evidence": "Planned deterministic runtime support is required for canonical JSON, SHA-256 goal binding, immutable version transitions, integrity verification, and atomic single-file replacement.",
+      "evidence": "artifact:src/goal-lock/state-machine.js#sha256:0e3ea568f7b556e6c474e8e1daa2b63998cd713a0d4bbbc0f8f6bdce1c95c262",
       "unblock_condition": ""
     },
     "assets": {
@@ -93,9 +93,9 @@ Requirements version: 3
     }
   },
   "prompt_budget": {
-    "limit_tokens": null,
-    "measured_tokens": null,
-    "evidence": ""
+    "limit_tokens": 882,
+    "measured_tokens": 626,
+    "evidence": "artifact:evals/results/prompt-budget.txt#sha256:986da96e50beaa5ca4e45834d080331fd674f731fb6599878484cc95573d7d70"
   }
 }
 ```

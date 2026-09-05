@@ -1,0 +1,26 @@
+Prompt budget measurement: confirmed-stage-goal default load
+Measured at: 2026-09-06 (Asia/Shanghai)
+Status: measured
+
+Tokenizer:
+- Package: js-tiktoken
+- Version: 1.0.21
+- Encoding: o200k_base
+- Model basis: GPT-4o-compatible o200k_base proxy
+
+Source digests:
+- SKILL.md: 0b8a80f7c2ed173de25d1549efefb408a45a6249d52a176f5042c2e2f6acdd20
+
+Layer measurements:
+| Layer | Source | Applicable | Input SHA-256 | UTF-8 bytes | Unicode characters | Tokens |
+| --- | --- | --- | --- | ---: | ---: | ---: |
+| description | parsed SKILL.md frontmatter description scalar | yes | 98dea84fd5ad0780d2f1b28c559c98235b7222d920658a9ff6d75795dc2e4106 | 479 | 479 | 83 |
+| Skill body/default load | SKILL.md bytes after the closing frontmatter delimiter | yes | 2c9eeec7dd2379574499a3791fb50bee765f90a932f7499b4f47ae27d8d69497 | 2,645 | 2,645 | 543 |
+| standing rules | none; implicit-trigger track disabled | no | e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 | 0 | 0 | 0 |
+| on-demand resource | none; references track disabled | no | e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 | 0 | 0 | 0 |
+
+Measured total: 626 tokens
+Maintenance margin: 256 tokens (max of 256 or 12.5% rounded up)
+Limit: 882 tokens
+
+The measurement counts only the parsed frontmatter description and Skill body. Disabled implicit-trigger and references tracks contribute zero tokens.

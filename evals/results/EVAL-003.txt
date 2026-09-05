@@ -1,17 +1,14 @@
 Evaluation: EVAL-003
 Status: pass
-Selected causal run: run-2
 Assertions: 2/2
-Matched baseline: 1/2
-Model: gpt-5.6-terra (reasoning: high; total tokens unavailable)
-Implementation commit: 85a90babef6ccfb0052f8ef308840b5957f7bd35
-Skill SHA-256: 7add6de3d87a71b3b49213fe73033697da9bfc0ada64b03fd8c93212927a9d69
-Fixture commit: a3328611e309a73aaf27b7b5d5ecd9b2c9aee2ad
-Fixture manifest SHA-256: de76199f524729c6abeeada31ed2eede29f3102a2db5b416c5f0e0f12f377791
-Prompt SHA-256: 801b50cfdad431afb38ffd7186d0a506cdfdb26b39ef8249e554be498fadb084
-Transcript SHA-256: da313e1c7ebbc7f2b6b7a86fe5efdbaacd1f8b1d22cf7192924f2258f42fd1e1
-Final output SHA-256: 893cf31fa076dbb40dd26d7079552782b8baba7832401c231b00c5190fc37cde
-Grading SHA-256: 9f32df0411b3a74e4838fd082d1b21dae350f308f5779a1f19596945602e6600
+Matched baseline: 2/2
+Model: gpt-5.5 (reasoning: high)
+Implementation commit: a17d414d89e7231c971584c7edf232305cf454c7
+Skill SHA-256: 0b8a80f7c2ed173de25d1549efefb408a45a6249d52a176f5042c2e2f6acdd20
+Fixture SHA-256: e8d57e14072c46d511b6599e415994ebb47c6895adb86aa4111315a753cb7473
+Prompt SHA-256: e23cc9baab300a733ce792e31882156eab537ef10f99ed6bf60d81e8d56e7d9e
+Transcript SHA-256: a3ba29f7ea71e0df8f4c4faea11384bb5cd80dbd2ea62a926394752517cc3a44
+Final output SHA-256: 7836e656b018fc699a5144a118d9e18f7126754ef37d16a31722663ebe737fb6
 Observed:
-- CR-0001 recorded field-level acceptance impact, affected AC-001 and TASK-0001, and paused the governed work in CHANGE_PENDING.
-- Generic confirmation was rejected; independent state inspection kept goal version 1 and the proposal open.
+- The with-Skill run applied the exact current proposal phrase and created the next consecutive accepted record at version 2.
+- Post-approval verification confirmed current.json equals history/v0002.json and the version-2 predecessor points to version 1 and its digest.

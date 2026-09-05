@@ -1,17 +1,14 @@
 Evaluation: EVAL-001
 Status: pass
-Selected causal run: run-3
-Assertions: 1/1
-Matched baseline: 1/1
-Model: gpt-5.6-terra (reasoning: high; total tokens unavailable)
-Implementation commit: 85a90babef6ccfb0052f8ef308840b5957f7bd35
-Skill SHA-256: 7add6de3d87a71b3b49213fe73033697da9bfc0ada64b03fd8c93212927a9d69
-Fixture commit: 10f586417b4b76dcce8ff0df9d7fb2a74bccdc11
-Fixture manifest SHA-256: d6f3eae9741d442e181ac929145e9c9b70bba1f01b39a3f77f6198955203995c
-Prompt SHA-256: 60a88487180664b9940c1e7ddb935231c19080126dfb1c78fcf9375280961a89
-Transcript SHA-256: c6649236200fcecf45682ab5726207b26d6b0c3aa5e8e343037346f4f2d0d7cd
-Final output SHA-256: cb217c8962b4df60e65135337c4a239224578d25f2ca9e32071401ee25ffb8c1
-Grading SHA-256: 5a37964cce9f00270e3840c74055873a3053604dd1ca9579a318314717ca2cf6
+Assertions: 2/2
+Matched baseline: 1/2
+Model: gpt-5.5 (reasoning: high)
+Implementation commit: a17d414d89e7231c971584c7edf232305cf454c7
+Skill SHA-256: 0b8a80f7c2ed173de25d1549efefb408a45a6249d52a176f5042c2e2f6acdd20
+Fixture SHA-256: 933fcaca111b21efbfdfb905a1c3b8b87ed6b713d3acd97850a248c3a1d1213d
+Prompt SHA-256: 881ba9ce9cdf6ae8414eb75dd3772b313810aa1a89c405a2dfdf215774decc2f
+Transcript SHA-256: 2e283138c6769b567a8a6bcf2b4ffd85cf1c5af0aaa28ece277f9d041f93c393
+Final output SHA-256: 2dbabed142ce59c7684c254f94fde2c07316a01559587d5da0a8633514b4961a
 Observed:
-- Independent verification returned DRAFT for the new local goal contract.
-- No lock, plan, or progress ledger existed, and the response requested the exact version-1 approval phrase bound to the draft digest.
+- The with-Skill run verified active version 1 and classified the CSV final-row repair as aligned before allowing continuation.
+- The accepted goal remained version 1 with the same digest, and current.json stayed byte-identical to history/v0001.json.
