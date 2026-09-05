@@ -14,7 +14,7 @@ Requirements version: 3
 ```json
 {
   "schema_version": 1,
-  "status": "draft",
+  "status": "ready",
   "conflicts": [
     {
       "id": "CONFLICT-001",
@@ -27,32 +27,32 @@ Requirements version: 3
     {
       "id": "REQ-001",
       "requirement": "Only an explicitly confirmed stage-goal version can authorize development execution.",
-      "verification": "Focused state-machine tests must prove that an uninitialized or merely proposed goal has no execution authority and that exact approval activates one version.",
-      "status": "pending"
+      "verification": "State-machine exact-approval tests pass, and EVAL-001 and EVAL-003 confirm that only an explicitly approved version authorizes execution.",
+      "status": "pass"
     },
     {
       "id": "REQ-002",
       "requirement": "Aligned work may continue, but a clear goal change or semantically ambiguous request cannot be executed silently.",
-      "verification": "Behavior scenarios must cover aligned continuation, unapproved drift rejection, and clarification-required without state mutation.",
-      "status": "pending"
+      "verification": "The SKILL semantic workflow is verified by EVAL-001, EVAL-002, and EVAL-004 for aligned continuation, rejected drift, and clarification without mutation.",
+      "status": "pass"
     },
     {
       "id": "REQ-003",
       "requirement": "A changed goal can become active only after review of complete field-level differences and byte-exact approval of the generated next-version proposal.",
-      "verification": "Focused transition tests and the approved-change behavior scenario must bind the phrase to the proposal digest and reject stale or mismatched approval.",
-      "status": "pending"
+      "verification": "Contract and state-machine tests bind approval to the complete proposal, while EVAL-002 and EVAL-003 verify changed-goal review and exact approval.",
+      "status": "pass"
     },
     {
       "id": "REQ-004",
       "requirement": "Modification of current goal bytes or any missing, invalid, or broken history link must fail closed.",
-      "verification": "Focused integrity tests must cover current tamper, history tamper, missing versions, invalid digests, broken predecessors, and unsupported legacy state.",
-      "status": "pending"
+      "verification": "Store integrity tests and deterministic tamper cases pass, and EVAL-003 confirms fail-closed handling of altered goal history.",
+      "status": "pass"
     },
     {
       "id": "REQ-005",
       "requirement": "The Skill must work independently and must not own planning, progress, validation or regression governance, evidence, audits, or completion decisions.",
-      "verification": "Architecture and public-surface review must show only init, propose, approve, verify, and status commands and no authoritative state outside the goal, history, and proposal records.",
-      "status": "pending"
+      "verification": "Public-surface review and EVAL-001, EVAL-002, EVAL-003, and EVAL-004 confirm the independent five-command scope and excluded governance responsibilities.",
+      "status": "pass"
     }
   ],
   "tracks": {

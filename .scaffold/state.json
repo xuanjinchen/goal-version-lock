@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "scaffold_version": "0.1.0",
-  "status": "draft",
+  "status": "ready",
   "skill": {
     "name": "goal-version-lock",
     "description": "Keep development work aligned with an explicitly confirmed stage goal. Use when a development stage must be confirmed, verified before each work slice, or changed through a versioned field-level proposal with exact approval. Return clarification-required when alignment is ambiguous and fail closed on tampered goal history. Do not use for planning, progress tracking, test or regression governance, evidence, audits, completion decisions, personal goals, or configuration drift.",

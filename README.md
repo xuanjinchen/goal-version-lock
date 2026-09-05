@@ -1,4 +1,4 @@
-# goal-version-lock
+# goal\-version\-lock
 
 Goal Version Lock keeps each development work slice aligned with one explicitly
 confirmed stage goal. It is a local Node.js 22+ Skill with no runtime
